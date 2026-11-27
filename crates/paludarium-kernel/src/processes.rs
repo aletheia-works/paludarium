@@ -647,6 +647,28 @@ impl Processes {
             _ => Err(Errno::EINVAL),
         }
     }
+    /// The processes thread `tid` of process `pid` made that are not yet
+    /// reaped (Linux's `children` list of the thread), by PID: those whose
+    /// maker it is and, if it is the first live thread of its process,
+    /// those whose maker has ended, as `forget_original_parent` gives them
+    /// to the first live thread (`find_alive_thread`). Linux's list is in
+    /// the order they came to it, which PIDs follow until they wrap and
+    /// orphans given to the process later do not.
+    pub(crate) fn children_of_thread(&self, pid: u32, tid: u32) -> Vec<u32> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = entries.get(&pid) else {
+            return Vec::new();
+        };
+        let live: Vec<u32> = entry.group.threads().iter().map(|&(t, _)| t).collect();
+        let first = live.first() == Some(&tid);
+        entries
+            .iter()
+            .filter(|(_, child)| {
+                child.parent == pid && (child.maker == tid || first && !live.contains(&child.maker))
+            })
+            .map(|(&child, _)| child)
+            .collect()
+    }
     /// The `oom_score_adj` of process `pid`, and whether it is a `vfork`
     /// child that has neither exec'd nor exited (Linux's `in_vfork`).
     pub(crate) fn oom(&self, pid: u32) -> Option<(i16, bool)> {
@@ -2958,6 +2980,18 @@ impl Kernel {
                 );
                 return Ok(0);
             }
+            // PR_SET_TIMERSLACK, which leaves a real-time or deadline
+            // thread's as it is, and PR_GET_TIMERSLACK, of the calling
+            // thread.
+            29 => {
+                self.group.change_sched(thread.tid, |sched| {
+                    if !sched.real_time_or_deadline() {
+                        sched.set_slack(a[1]);
+                    }
+                });
+                return Ok(0);
+            }
+            30 => return Ok(self.group.sched(thread.tid).slack),
             // PR_GET_SECCOMP, PR_SET_SECCOMP
             21 => return Ok(crate::seccomp::mode(&thread.state)),
             22 => {
@@ -3096,13 +3130,15 @@ impl Kernel {
             {
                 return Err(Errno::EPERM);
             }
-            let mut sched = found.group.sched(found.tid);
-            sched.io = Some(ioprio as u16);
-            // set_task_ioprio gives a thread without an I/O context one.
-            if sched.io_context == 0 {
-                sched.io_context = scheduling::new_io_context();
-            }
-            found.group.set_sched(found.tid, sched);
+            // Under the lock, so that no other change of the thread's
+            // attributes (its timer slack) is lost.
+            found.group.change_sched(found.tid, |sched| {
+                sched.io = Some(ioprio as u16);
+                // set_task_ioprio gives a thread without an I/O context one.
+                if sched.io_context == 0 {
+                    sched.io_context = scheduling::new_io_context();
+                }
+            });
             result = Ok(0);
         }
         result
@@ -3258,8 +3294,8 @@ impl Kernel {
                     .is_some_and(|word| word >> (cpu % 64) & 1 != 0)
             })
         });
-        let decided = scheduling::Target {
-            sched: target.group.sched(target.tid),
+        let mut decided = scheduling::Target {
+            sched: scheduling::Sched::default(),
             nice: target.nice,
             nice_limit: target.nice_limit,
             rtprio_limit: target.rtprio_limit,
@@ -3269,14 +3305,22 @@ impl Kernel {
         };
         let per_cpu = scheduling::ratio(1_000_000_000, 950_000_000)
             - scheduling::ratio(1_000_000_000, 50_000_000);
-        let change = scheduling::set(
-            &decided,
-            attr,
-            caller.capable(crate::credentials::CAP_SYS_NICE),
-            self.processes.deadline_bandwidth(&target.group, target.tid),
-            per_cpu * cpus as u64,
-        )?;
-        target.group.set_sched(target.tid, change.sched);
+        let others_bandwidth = self.processes.deadline_bandwidth(&target.group, target.tid);
+        let may_nice = caller.capable(crate::credentials::CAP_SYS_NICE);
+        // Decided and made under the lock, so that no other change of the
+        // thread's attributes (a write of its timer slack) comes between.
+        let change = target.group.change_sched(target.tid, |sched| {
+            decided.sched = *sched;
+            let change = scheduling::set(
+                &decided,
+                attr,
+                may_nice,
+                others_bandwidth,
+                per_cpu * cpus as u64,
+            )?;
+            *sched = change.sched;
+            Ok::<_, Errno>(change)
+        })?;
         if let Some(nice) = change.nice {
             target.group.update_nice(target.tid, nice);
         }
@@ -3781,6 +3825,7 @@ impl Kernel {
             group.set_nice(pid, if reset_nice { 0 } else { value });
         }
         group.set_sched(pid, sched);
+        group.set_login(pid, self.group.login(parent.tid));
         if let Some(mask) = self.group.affinity(parent.tid) {
             group.set_affinity(pid, mask);
         }

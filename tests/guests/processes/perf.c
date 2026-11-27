@@ -900,6 +900,35 @@ static void fault_row(const char *what, void (*touch)(void *), void *at) {
         (long)(now.faults - was.faults), (long)(now.minor - was.minor));
 }
 
+/* A system call `what` with a byte of `at` that fails, its write from
+   `at` to a pipe or its read from one into `at`, and what it counts: its
+   fault is the kernel's, which the events of user mode leave out. */
+static void efault_row(const char *what, int write_from, void *at) {
+    int pipes[2];
+    char byte = 1;
+    if (pipe2(pipes, O_NONBLOCK) != 0) return;
+    if (!write_from && write(pipes[1], &byte, 1) != 1) return;
+    /* Written first, so that the kernel's writes to them take no fault. */
+    struct rusage was, now;
+    memset(&was, 0, sizeof was);
+    memset(&now, 0, sizeof now);
+    touch_frames();
+    int faults = open_software(2, EXCLUDE_USER | EXCLUDE_HV), minor = open_software(5, EXCLUDE_USER | EXCLUDE_HV);
+    getrusage(RUSAGE_THREAD, &was);
+    long got = write_from ? TRY(write(pipes[1], at, 1)) : TRY(read(pipes[0], at, 1));
+    getrusage(RUSAGE_THREAD, &now);
+    uint64_t counts[2] = {(uint64_t)-1, (uint64_t)-1};
+    if (read(faults, &counts[0], 8) != 8 || read(minor, &counts[1], 8) != 8) counts[0] = counts[1] = (uint64_t)-1;
+    /* The byte a failed read leaves in the pipe. */
+    long left = write_from ? 0 : TRY(read(pipes[0], &byte, 1));
+    say("%s: %ld left %ld minflt %ld kernel page-faults %ld minor-faults %ld", what, got, left,
+        now.ru_minflt - was.ru_minflt, (long)counts[0], (long)counts[1]);
+    close(faults);
+    close(minor);
+    close(pipes[0]);
+    close(pipes[1]);
+}
+
 /* Faults that end in a signal: Linux counts page-faults as a fault of a
    user address starts (do_user_addr_fault), the vsyscall page's among
    them, and no min_flt or minor-faults for one that ends in an error
@@ -951,6 +980,13 @@ static int case_fault_signals(void) {
     fault_row("non-canonical", read_byte, (void *)0x8000000000000000UL);
     fault_row("vsyscall read", read_byte, (void *)0xffffffffff600000UL);
     fault_row("vsyscall time", vsyscall_time, NULL);
+    /* A system call's copy that faults and fails with EFAULT counts in
+       page-faults too, as do_user_addr_fault starts; one past user space
+       fails access_ok first and counts nothing. */
+    efault_row("write(2) from unmapped", 1, gone);
+    efault_row("read(2) into unmapped", 0, gone);
+    efault_row("read(2) into read-only", 0, read_only);
+    efault_row("read(2) into a kernel address", 0, (void *)-4096L);
     return 0;
 }
 

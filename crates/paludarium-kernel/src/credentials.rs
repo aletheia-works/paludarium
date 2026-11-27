@@ -24,6 +24,7 @@ const CAP_SYS_PACCT: u64 = 1 << 20;
 pub(crate) const CAP_SYS_ADMIN: u64 = 1 << 21;
 pub(crate) const CAP_SYS_NICE: u64 = 1 << 23;
 pub(crate) const CAP_SYS_RESOURCE: u64 = 1 << 24;
+pub(crate) const CAP_AUDIT_CONTROL: u64 = 1 << 30;
 const CAP_SYS_TTY_CONFIG: u64 = 1 << 26;
 pub(crate) const CAP_WAKE_ALARM: u64 = 1 << 35;
 pub(crate) const CAP_CHECKPOINT_RESTORE: u64 = 1 << 40;

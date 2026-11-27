@@ -2840,6 +2840,25 @@ fn sigtimedwait_takes_blocked_process_signals_and_times_out() {
     );
 }
 #[test]
+fn prctl_timer_slack_is_the_threads_and_a_real_time_one_has_none() {
+    let mut f = fixture();
+    assert_eq!(f.ret(157, &[30]), 50_000); // PR_GET_TIMERSLACK
+    assert_eq!(f.ret(157, &[29, 1234]), 0); // PR_SET_TIMERSLACK
+    assert_eq!(f.ret(157, &[30]), 1234);
+    assert_eq!(f.ret(157, &[29, 0]), 0);
+    assert_eq!(f.ret(157, &[30]), 50_000);
+    // SCHED_FIFO 1 takes it away, PR_SET_TIMERSLACK leaves it so, and
+    // SCHED_OTHER gives the default back.
+    f.mem.write(GuestAddr(DATA), &1u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(144, &[0, 1, DATA]), 0);
+    assert_eq!(f.ret(157, &[30]), 0);
+    assert_eq!(f.ret(157, &[29, 99]), 0);
+    assert_eq!(f.ret(157, &[30]), 0);
+    f.mem.write(GuestAddr(DATA), &0u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(144, &[0, 0, DATA]), 0);
+    assert_eq!(f.ret(157, &[30]), 50_000);
+}
+#[test]
 fn prctl_keeps_death_signal_dumpable_and_no_new_privs() {
     let mut f = fixture();
     assert_eq!(f.ret(157, &[2, DATA]), 0); // PR_GET_PDEATHSIG
@@ -5129,7 +5148,7 @@ mod mprotect_order {
             let was = f.thread.state.cpu.used.counts();
             f.kernel.handle(&mut f.thread, &f.mem, reason);
             let now = f.thread.state.cpu.used.counts();
-            // [minor, kernel, switches, migrations, major, unfinished]
+            // [minor, kernel, switches, migrations, major, unfinished, kernel unfinished]
             assert_eq!(
                 (now[0] - was[0], now[5] - was[5]),
                 (0, counted),
@@ -15337,6 +15356,154 @@ fn the_first_thread_keeps_the_signals_the_host_started_with_ignored() {
         ignored(&shared.lock().unwrap_or_else(PoisonError::into_inner)),
         [2, 3]
     );
+}
+
+/// The calls that make, remove or rename a name in `/proc` and `/dev` give
+/// Linux's errors in its order: the lookup (`ENOENT` in `/proc`), the
+/// trailing slash, the permission to write the directory (`EACCES` for
+/// another user; a process's directory is immutable, `EPERM`, its `fd` its
+/// own, and `/proc/sys` writable by nobody), then `EPERM` (no such
+/// operation) or `EXDEV` between file systems, as root and as nobody.
+#[test]
+fn the_name_calls_give_linux_s_errors_in_the_generated_directories() {
+    const EXDEV: i64 = 18;
+    let mut f = fixture();
+    let file = put(&mut f, 0x80, b"/tmp/file");
+    let fd = f.ret(2, &[file, 0o101, 0o666]);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    let other = put(&mut f, 0xa0, b"/tmp/other");
+    // [unlink, rmdir, mkdir, mknod, creat, link-to, link-from, rename-out,
+    // rename-within] of each name, as root then as nobody.
+    let rows: [(&[u8], [i64; 9], [i64; 9]); 12] = [
+        (
+            b"/proc/x8",
+            [2, 2, 2, 2, 2, 2, 2, EXDEV, 2],
+            [2, 2, 2, 2, 2, 2, 2, EXDEV, 2],
+        ),
+        (
+            b"/proc/uptime",
+            [1, 20, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/sys",
+            [21, 1, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/self/comm",
+            [1, 1, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [1, 1, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/self/fd/0",
+            [1, 20, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [1, 20, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/sys/kernel/ostype",
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/uptime/",
+            [20, 20, 17, 17, 21, 17, 20, EXDEV, 20],
+            [20, 13, 17, 17, 21, 17, 20, EXDEV, 20],
+        ),
+        (
+            b"/proc/x8/",
+            [2, 2, 2, 2, 21, 2, 2, EXDEV, 2],
+            [2, 2, 2, 2, 21, 2, 2, EXDEV, 2],
+        ),
+        (
+            b"/proc/.",
+            [21, 22, 17, 17, 17, 17, EXDEV, EXDEV, 16],
+            [21, 22, 17, 17, 17, 17, EXDEV, EXDEV, 16],
+        ),
+        (
+            b"/proc/self/..",
+            [21, 39, 17, 17, 17, 17, EXDEV, EXDEV, 16],
+            [21, 39, 17, 17, 17, 17, EXDEV, EXDEV, 16],
+        ),
+        (
+            b"/dev/null",
+            [1, 20, 17, 17, 17, 17, EXDEV, EXDEV, 1],
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 13],
+        ),
+        (
+            b"/dev/x8",
+            [2, 2, 2, 2, 2, EXDEV, 2, EXDEV, 2],
+            [2, 2, 13, 13, 13, EXDEV, 2, EXDEV, 2],
+        ),
+    ];
+    let run = |f: &mut Fixture, nobody: bool| {
+        for (name, root, user) in rows {
+            let p = put(f, 0x100, name);
+            let mut sibling = name.to_vec();
+            if let Some(at) = sibling.iter().rposition(|&b| b == b'/')
+                && at + 1 < sibling.len()
+            {
+                sibling.truncate(at + 1);
+                sibling.extend_from_slice(b"y8");
+            }
+            let q = put(f, 0x200, &sibling);
+            let call = |f: &mut Fixture, n: u64, args: &[u64]| -(f.ret(n, args) as i64).min(0);
+            let opened = f.ret(2, &[p, 0o301, 0o644]) as i64;
+            let got = [
+                call(f, 87, &[p]),
+                call(f, 84, &[p]),
+                call(f, 83, &[p, 0o755]),
+                call(f, 133, &[p, 0o10644, 0]),
+                -opened.min(0),
+                call(f, 86, &[file, p]),
+                call(f, 86, &[p, other]),
+                call(f, 82, &[p, other]),
+                call(f, 82, &[p, q]),
+            ];
+            let want = if nobody { user } else { root };
+            assert_eq!(
+                got,
+                want,
+                "{} as {}",
+                String::from_utf8_lossy(name),
+                if nobody { "nobody" } else { "root" }
+            );
+        }
+    };
+    run(&mut f, false);
+    // /proc and /dev themselves, in the root's directory: mount points.
+    let proc_dir = put(&mut f, 0x300, b"/proc");
+    assert_eq!(f.ret(87, &[proc_dir]), errno(Errno::EISDIR));
+    assert_eq!(f.ret(84, &[proc_dir]), errno(Errno(16)));
+    assert_eq!(f.ret(133, &[proc_dir, 0o10644, 0]), errno(Errno::EEXIST));
+    assert_eq!(f.ret(86, &[file, proc_dir]), errno(Errno::EEXIST));
+    // The mounts in /dev are mount points there: EBUSY to remove or
+    // rename, EISDIR to unlink, EEXIST to make.
+    let y8 = put(&mut f, 0x340, b"/dev/y8");
+    for mount in [&b"/dev/shm"[..], b"/dev/mqueue", b"/dev/pts"] {
+        let p = put(&mut f, 0x300, mount);
+        let label = String::from_utf8_lossy(mount);
+        assert_eq!(f.ret(84, &[p]), errno(Errno(16)), "{label}");
+        assert_eq!(f.ret(82, &[p, y8]), errno(Errno(16)), "{label}");
+        assert_eq!(f.ret(87, &[p]), errno(Errno::EISDIR), "{label}");
+        assert_eq!(f.ret(83, &[p, 0o755]), errno(Errno::EEXIST), "{label}");
+    }
+    // A thread's directory, by `self/task` too, is immutable;
+    // `thread-self` itself is a link (ENOTDIR to rmdir).
+    let tid = f.ret(186, &[]);
+    for (path, call, want) in [
+        (format!("/proc/self/task/{tid}"), 84, Errno::EPERM),
+        (format!("/proc/self/task/{tid}/comm"), 87, Errno::EPERM),
+        ("/proc/thread-self/comm".to_owned(), 87, Errno::EPERM),
+        ("/proc/thread-self".to_owned(), 84, Errno::ENOTDIR),
+    ] {
+        let p = put(&mut f, 0x300, path.as_bytes());
+        assert_eq!(f.ret(call, &[p]), errno(want), "{path}");
+    }
+    // setresgid(65534, ..), setresuid(65534, ..).
+    assert_eq!(f.ret(119, &[65534, 65534, 65534]), 0);
+    assert_eq!(f.ret(117, &[65534, 65534, 65534]), 0);
+    run(&mut f, true);
 }
 
 /// In a mount namespace of a less privileged owner, where `/dev/shm` is

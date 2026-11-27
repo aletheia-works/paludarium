@@ -17,6 +17,24 @@ use std::{
     },
 };
 
+/// A thread's audit login user and session, as Linux's `task_struct` keeps
+/// them (`loginuid`, `sessionid`): passed on by `clone` and kept across
+/// `execve`; [`crate::users::INVALID`] for none (`AUDIT_UID_UNSET`,
+/// `AUDIT_SID_UNSET`), as the first task has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Login {
+    /// A kernel user ID.
+    pub user: u32,
+    pub session: u32,
+}
+impl Default for Login {
+    fn default() -> Self {
+        Self {
+            user: crate::users::INVALID,
+            session: crate::users::INVALID,
+        }
+    }
+}
 pub struct ThreadGroup {
     exec_owner: AtomicU32,
     retired: Mutex<BTreeSet<u32>>,
@@ -34,6 +52,9 @@ pub struct ThreadGroup {
     /// Each thread's scheduling attributes and I/O priority, kept as its
     /// nice value is; one without has the defaults.
     sched: Mutex<BTreeMap<u32, crate::scheduling::Sched>>,
+    /// Each thread's audit login user and session ([`Login`]), kept as its
+    /// scheduling attributes are; one without has neither.
+    login: Mutex<BTreeMap<u32, Login>>,
     /// The CPU mask `sched_setaffinity` gave each thread, which Linux keeps
     /// per thread; one without lets every CPU run it.
     affinity: Mutex<BTreeMap<u32, Vec<u64>>>,
@@ -252,6 +273,7 @@ impl Default for ThreadGroup {
             nice: Mutex::default(),
             started: Mutex::default(),
             sched: Mutex::default(),
+            login: Mutex::default(),
             affinity: Mutex::default(),
             affinity_changes: std::sync::atomic::AtomicU64::new(0),
             numa: crate::mempolicy::Numa::default(),
@@ -598,6 +620,12 @@ impl ThreadGroup {
         }
         sched.retain(|&tid, _| tid == pid);
         drop(sched);
+        let mut login = self.login.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(value) = login.remove(&old_tid) {
+            login.insert(pid, value);
+        }
+        login.retain(|&tid, _| tid == pid);
+        drop(login);
         // So is the record of the thread that ran it, until it publishes
         // what the new program shows.
         let mut public = self.public.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1559,6 +1587,36 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(tid, value);
     }
+    /// Changes the scheduling attributes of thread `tid` with `change`,
+    /// which no other change of them comes between.
+    pub(crate) fn change_sched<T>(
+        &self,
+        tid: u32,
+        change: impl FnOnce(&mut crate::scheduling::Sched) -> T,
+    ) -> T {
+        change(
+            self.sched
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(tid)
+                .or_default(),
+        )
+    }
+    /// The audit login user and session of thread `tid`.
+    pub(crate) fn login(&self, tid: u32) -> Login {
+        self.login
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .copied()
+            .unwrap_or_default()
+    }
+    pub(crate) fn set_login(&self, tid: u32, value: Login) {
+        self.login
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, value);
+    }
     /// The bandwidth the group's deadline threads take, but `except`'s.
     pub(crate) fn deadline_bandwidth(&self, except: Option<u32>) -> u64 {
         self.sched
@@ -1813,6 +1871,10 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
         self.sched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tid);
+        self.login
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
@@ -3047,6 +3109,7 @@ impl Kernel {
         let nice = self.group.nice(parent.tid);
         let (sched, reset_nice) = forked;
         self.group.set_sched(tid, sched);
+        self.group.set_login(tid, self.group.login(parent.tid));
         if let Some(value) = nice {
             self.group.set_nice(tid, if reset_nice { 0 } else { value });
         }

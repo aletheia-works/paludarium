@@ -414,7 +414,9 @@ int main(int argc, char **argv) {
     address(RTM_NEWADDR, VA, "2001:db8:1::5", 64, "va's 2001:db8:1::5/64");
     address(RTM_NEWADDR, VA, "2001:db8:2::5", 127, "va's 2001:db8:2::5/127");
     address(RTM_NEWADDR, VA, "2001:db8:1::6", 64, "va's 2001:db8:1::6/64");
-    await_anycast("20010db8000100000000000000000000", 1, "va's addresses");
+    /* Linux joins the subnet-router address once for each /64 address,
+       from its work queue, so the case waits until both have. */
+    await_anycast("20010db8000100000000000000000000     2", 1, "va's addresses");
     join(s, VA, "2001:db8:9::1", "a router's 2001:db8:9::1");
     join(s, 0, "2001:db8:9::2", "a router's without a route, all hosts");
     join(s, VB, "2001:db8:1::77", "a host's of va's prefix on vb");

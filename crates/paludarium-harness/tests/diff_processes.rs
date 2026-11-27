@@ -442,6 +442,7 @@ mod linux {
                     | "veth-multicast"
                     | "veth-ipv6-multicast"
                     | "multicast-sources"
+                    | "multicast-groups"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -697,6 +698,7 @@ mod linux {
         veth_multicast => ("veth-multicast","veth-multicast"),
         veth_ipv6_multicast => ("veth-ipv6-multicast","veth-ipv6-multicast"),
         multicast_sources => ("multicast-sources","multicast-sources"),
+        multicast_groups => ("multicast-groups","multicast-groups"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),

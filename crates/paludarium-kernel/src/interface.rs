@@ -774,6 +774,9 @@ pub(crate) enum Event {
     /// naming the request's port.
     NewNeighbour(Neighbour),
     DelNeighbour(Neighbour),
+    /// A group a device has joined anew or left for good
+    /// (`inet_ifmcaddr_notify`).
+    Group4(crate::multicast::Told4),
 }
 /// A neighbour of the loopback or of a veth end, as `___neigh_create`
 /// makes one for the next hop of a packet out through it, or for a
@@ -1869,18 +1872,24 @@ impl Addresses {
     /// (`addrconf_permanent_addr`); and `::1` with its route. With `v6`
     /// false (`disable_ipv6`) IPv6 does none of it ([`Self::up6`]).
     pub(crate) fn up(&mut self, now: u64, v6: bool) -> Vec<Event> {
-        let mut events = Vec::new();
+        let (mut events, rest) = self.up_parts(now, v6);
+        events.extend(rest);
+        events
+    }
+    /// What [`Self::up`] tells, in two: `127.0.0.1/8`'s, before which
+    /// `inetdev_event` joins the loopback to its group (`ip_mc_up`), and
+    /// the rest.
+    pub(crate) fn up_parts(&mut self, now: u64, v6: bool) -> (Vec<Event>, Vec<Event>) {
         let loopback = V4::new(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 8, SCOPE_HOST);
         // The kernel's own, which reports nothing when it is there.
         let added = extack::quietly(|| self.add_v4(loopback, Lifetimes::FOREVER, false, true, now));
-        if let Ok(added) = added {
-            events.extend(added);
-        }
+        let first = added.unwrap_or_default();
+        let mut events = Vec::new();
         events.extend(self.device_up4(LOOPBACK_INDEX));
         if v6 {
             events.extend(self.up6(now));
         }
-        events
+        (first, events)
     }
     /// IPv4's part of a device of `index` coming up (`fib_netdev_event`'s
     /// `NETDEV_UP`): the routes each of its addresses has then that are not
@@ -4571,6 +4580,7 @@ mod tests {
                 Event::DelMultipath6(hops) => format!("-multipath {}", via6(hops)),
                 Event::NewNeighbour(n) => format!("+neigh {} {:#x}", n.ip, n.state),
                 Event::DelNeighbour(n) => format!("-neigh {}", n.ip),
+                Event::Group4(t) => format!("group {} {}", t.group, t.joined),
             })
             .collect()
     }

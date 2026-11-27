@@ -1222,8 +1222,10 @@ verified.
   joining one there without naming a device is `ENODEV`.
   No IGMP or MLD packet is sent: nothing in the guest would see one, as
   raw sockets are `EPERM` and there are no packet sockets (`AF_PACKET`).
-  Source filters (`IP_ADD_SOURCE_MEMBERSHIP`, `IP_MSFILTER`, `MCAST_*`) and
-  anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`. ICMP's port unreachable is not rate limited
+  Anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`. `RTM_GETMULTICAST`
+  lists IPv4's groups alone: IPv6's (`inet6_dump_ifmcaddr`) and Linux
+  master's link-layer ones (`AF_PACKET`, `dev_mc_dump`) are `EOPNOTSUPP`,
+  and nothing is told to `RTNLGRP_IPV6_MCADDR`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,

@@ -1024,9 +1024,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   カウンタを動かしません。名前空間は別の名前空間へ転送しません。マルチキャストのグループはゲストの名前空間の中だけのものです。最初の名前空間には
   ホストのネットワークへのデバイスがなく、グループへの経路もないので、デバイスを指さずに
   入ろうとすると `ENODEV` です。IGMP と MLD のパケットは送りません。raw ソケットは `EPERM` で、パケット
-  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。送り元のフィルター
-  （`IP_ADD_SOURCE_MEMBERSHIP`、`IP_MSFILTER`、`MCAST_*`）とエニーキャストのグループ
-  （`IPV6_JOIN_ANYCAST`）は `ENOPROTOOPT` です。ICMP の port unreachable の頻度を
+  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。エニーキャストの
+  グループ（`IPV6_JOIN_ANYCAST`）は `ENOPROTOOPT` です。`RTM_GETMULTICAST` が返すのは
+  IPv4 のグループだけで、IPv6 のもの（`inet6_dump_ifmcaddr`）と Linux の master の
+  リンク層のもの（`AF_PACKET`、`dev_mc_dump`）は `EOPNOTSUPP`、`RTNLGRP_IPV6_MCADDR`
+  には何も伝えません。ICMP の port unreachable の頻度を
   抑えないので（`icmpv4_xrlim_allow`、`icmpv6_xrlim_allow`）、相手の閉じたポートへのデータグラムのたびに、
   接続したソケットの次の送信は `ECONNREFUSED` になります。組を通る接続は、端が
   落ちても、消えても、移っても、使っていたアドレスや経路が消えても続きます。Linux では

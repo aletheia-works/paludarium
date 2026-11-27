@@ -389,7 +389,8 @@ impl Network {
                 // Its loopback is up, and so in this group (`ip_mc_up`).
                 let mut devices = crate::netdev::Devices::new();
                 if let Some(lo) = devices.by_index_mut(crate::netdev::LOOPBACK_INDEX) {
-                    lo.groups4.join(crate::multicast::ALL_HOSTS, Mode::Exclude);
+                    lo.groups4
+                        .join(crate::multicast::ALL_HOSTS, Mode::Exclude, 0);
                 }
                 Mutex::new(devices)
             },
@@ -1555,17 +1556,25 @@ impl Network {
         if up == self.is_up() {
             return None;
         }
-        let events = if up {
+        let (first, rest) = if up {
             self.ever_up.store(true, Ordering::SeqCst);
-            addresses.up(now, v6)
+            addresses.up_parts(now, v6)
         } else {
-            addresses.down()
+            (Vec::new(), addresses.down())
         };
         self.up.store(up, Ordering::SeqCst);
         drop(addresses);
-        // `ip_mc_up` and `ip_mc_down`.
+        // `ip_mc_up`, after `inetdev_event` has given the loopback its
+        // address, and `ip_mc_down`, before the routes go.
         let lo = crate::netdev::LOOPBACK_INDEX;
-        self.change_group4(lo, crate::multicast::ALL_HOSTS, up);
+        self.change_group4(lo, crate::multicast::ALL_HOSTS, up, now);
+        let mut events = first;
+        events.extend(
+            self.groups_told4()
+                .into_iter()
+                .map(crate::interface::Event::Group4),
+        );
+        events.extend(rest);
         Some(events)
     }
     /// Turns the loopback's IPv6 off or on, as a change of its
@@ -4850,6 +4859,7 @@ impl Drop for InetSocket {
         let abort = self.options().linger == Some(0);
         let s = std::mem::take(&mut *self.lock());
         self.network.drop4(&s.groups4);
+        crate::netlink::tell_groups(&self.network);
         self.network.drop6(&s.groups6);
         // Its connection's tries go with it.
         if let Some(stream) = &s.stream
@@ -6217,8 +6227,19 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 socket.network.leave6(&mut s.groups6, asked)?;
             }
         }
-        (0, 32..=36 | 49) => set_multicast4(c, socket, name, (at, len))?,
-        (0, 37..=48) => sources::set4(c, socket, name, (at, len))?,
+        // A device that joins a group anew or leaves it for good is told
+        // of as it does (`inet_ifmcaddr_notify`), whatever the option
+        // returns.
+        (0, 32..=36 | 49) => {
+            let result = set_multicast4(c, socket, name, (at, len));
+            crate::netlink::tell_groups(&socket.network);
+            result?;
+        }
+        (0, 37..=48) => {
+            let result = sources::set4(c, socket, name, (at, len));
+            crate::netlink::tell_groups(&socket.network);
+            result?;
+        }
         (41, 42..=48) if socket.family == Family::V6 => {
             option6_int(c, at, len)?;
             sources::set6(c, socket, name, (at, len))?;

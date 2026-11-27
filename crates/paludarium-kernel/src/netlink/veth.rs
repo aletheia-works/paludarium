@@ -630,7 +630,7 @@ fn switch(
             }
         });
         // `ip_mc_up`, of `NETDEV_UP`.
-        network.change_group4(index, crate::multicast::ALL_HOSTS, true);
+        network.change_group4(index, crate::multicast::ALL_HOSTS, true, now);
         if peer_up && let Some((n, i)) = &peer {
             change(n, *i, |v| carrier(v, true));
             let list = super::device_changed4(n, *i, true, true);
@@ -638,7 +638,11 @@ fn switch(
         }
         let list = told(network, index, RTM_NEWLINK, IFF_UP, false);
         tell(own, network, notices, list);
-        // `NETDEV_UP`, after `__dev_notify_flags` has told of the change.
+        // `NETDEV_UP`, after `__dev_notify_flags` has told of the change:
+        // `inetdev_event` joins the group, then `fib_netdev_event` adds
+        // the routes.
+        let list = super::groups_told(network);
+        tell(own, network, notices, list);
         let list = super::device_up4(network, index, peer_up);
         tell(own, network, notices, list);
         // IPv6's `NETDEV_UP`.
@@ -665,7 +669,7 @@ fn switch(
             carrier(v, false);
         });
         // `ip_mc_down`, of `NETDEV_DOWN`.
-        network.change_group4(index, crate::multicast::ALL_HOSTS, false);
+        network.change_group4(index, crate::multicast::ALL_HOSTS, false, now);
         // `__dev_notify_flags` tells of the change before `NETDEV_DOWN`
         // flushes the end's neighbours; the peer's go as the link watch
         // finds its carrier gone, before it tells of that
@@ -682,6 +686,10 @@ fn switch(
             super::device_changed4(n, *i, true, false)
         });
         let list = told(network, index, RTM_NEWLINK, told_change, false);
+        tell(own, network, notices, list);
+        // `inetdev_event` leaves the group before `fib_netdev_event`
+        // flushes the rest.
+        let list = super::groups_told(network);
         tell(own, network, notices, list);
         tell(own, network, notices, own_list);
         // IPv6's `addrconf_ifdown`.
@@ -719,8 +727,11 @@ fn unregister(
                 }
                 let list = told_of(network, device, RTM_NEWLINK, CLOSED, false);
                 tell(own, network, notices, list);
-                // `NETDEV_DOWN`: its neighbours go (`arp_ifdown`), and
-                // IPv6's routes and addresses (`addrconf_ifdown`).
+                // `NETDEV_DOWN`: it leaves its group (`ip_mc_down`), its
+                // neighbours go (`arp_ifdown`), and IPv6's routes and
+                // addresses (`addrconf_ifdown`).
+                let list = left_all_hosts(device);
+                tell(own, network, notices, list);
                 let list = super::device_changed4(network, device.index, false, false);
                 tell(own, network, notices, list);
                 let list = super::device_down6(network, device.index);
@@ -728,14 +739,34 @@ fn unregister(
             }
         }
     }
-    for (network, device) in &gone {
-        // `NETDEV_UNREGISTER`: IPv4 takes its addresses first.
+    for (network, device) in &mut gone {
+        // `NETDEV_UNREGISTER`: IPv4's `ip_mc_destroy_dev` leaves the group
+        // once more (`ip_mc_down`) and forgets the rest, then takes its
+        // addresses.
+        let list = left_all_hosts(device);
+        tell(own, network, notices, list);
         let list = super::addresses_gone(network, device.index);
         tell(own, network, notices, list);
         tell_netconf(own, network, notices, crate::netconf::unregistered(device));
         let list = told_of(network, device, RTM_DELLINK, u32::MAX, true);
         tell(own, network, notices, list);
     }
+}
+/// What `device`, out of its namespace, tells as it leaves the all-hosts
+/// group once (`ip_mc_down`): the group, if it leaves it for good.
+fn left_all_hosts(device: &mut Device) -> Vec<Notice> {
+    let index = device.index;
+    let told = crate::multicast::leave_all_hosts(&mut device.groups4, index);
+    super::told(
+        told.into_iter()
+            .map(crate::interface::Event::Group4)
+            .collect(),
+        0,
+        0,
+        false,
+        false,
+        0,
+    )
 }
 /// `RTM_DELLINK` of `network`'s veth end `index` (`veth_dellink`): it
 /// goes, and its peer with it, each told of in its namespace.
@@ -877,10 +908,14 @@ pub(super) fn move_to(
         }
     };
     switch(own, network, index, false, CLOSED, 0, notices);
+    // `NETDEV_UNREGISTER` in the old namespace: IPv4's `ip_mc_destroy_dev`
+    // leaves the group once more, then IPv4 takes its addresses.
+    network.change_group4(index, crate::multicast::ALL_HOSTS, false, 0);
+    let list = super::groups_told(network);
+    tell(own, network, notices, list);
     let Some(mut device) = network.devices().by_index(index).cloned() else {
         return Err(super::ENODEV);
     };
-    // `NETDEV_UNREGISTER` in the old namespace: IPv4 takes its addresses.
     let list = super::addresses_gone(network, index);
     tell(own, network, notices, list);
     let mut list = super::devconf::notices(crate::netconf::unregistered(&device));

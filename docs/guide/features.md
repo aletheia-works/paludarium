@@ -3688,6 +3688,24 @@ kernel.
     discovery's of `lo` and the ends with IPv6 (`ipv6_add_dev`). Strictly, an
     `ndtmsg` short, with padding or with attributes after it is `EINVAL`
     (`neightbl_valid_dump_info`).
+  - **Multicast groups:** an `RTM_GETMULTICAST` dump of `AF_INET`, as
+    `inet_dump_ifmcaddr`, gives the IPv4 groups of each device, by index,
+    each's the newest first, in messages of that type: a permanent
+    address of 32 bits and the universe's scope, the group
+    (`IFA_MULTICAST`), its users (`IFA_MC_USERS`, of Linux master; 7.0's
+    has none) and endless lifetimes from when the device joined it
+    (`inet_fill_ifmcaddr`). Its request is checked as an address dump's: a
+    device it names is `ENODEV` for none and marks the messages
+    `NLM_F_DUMP_FILTERED`, and a namespace it names (`IFA_TARGET_NETNSID`)
+    shows its groups without the ID. `NLMSG_DONE` comes in the last
+    messages' read. A device that joins a group anew, or leaves it for
+    good, tells `RTNLGRP_IPV4_MCADDR` (37) with `RTM_NEWMULTICAST` or
+    `RTM_DELMULTICAST` (`inet_ifmcaddr_notify`): as a socket's membership
+    is its first or its last, with a source filter's first source and
+    last too; and the all-hosts group as the device comes up, after
+    `lo`'s address and before the routes (`ip_mc_up`), and as it goes
+    down, before the routes and neighbours go, closes, or goes
+    (`ip_mc_down`, `ip_mc_destroy_dev`), which forgets the rest unsaid.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the

@@ -3162,6 +3162,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     持つ端のもの（`ipv6_add_dev`）です。
     それぞれ、その近隣が持つ参照を数えます。厳しく調べるときは、短い `ndtmsg`、詰め物のある
     もの、後ろに属性のあるものは `EINVAL` です（`neightbl_valid_dump_info`）。
+  - **マルチキャストのグループ:** `AF_INET` の `RTM_GETMULTICAST` のダンプは、
+    `inet_dump_ifmcaddr` と同じく、デバイスごとの IPv4 のグループを、インデックスの順に、
+    それぞれ新しいものから、その種類のメッセージで返します。32 ビットの永続のアドレスで
+    スコープはユニバース、グループ（`IFA_MULTICAST`）、ユーザーの数（`IFA_MC_USERS`。
+    Linux の master のもので、7.0 にはありません）、デバイスが入ったときからの無期限の
+    有効期間を持ちます（`inet_fill_ifmcaddr`）。要求はアドレスのダンプと同じく調べます。
+    指したデバイスがなければ `ENODEV` で、あればメッセージに `NLM_F_DUMP_FILTERED` が
+    付きます。指した名前空間（`IFA_TARGET_NETNSID`）のグループは ID なしで返します。
+    `NLMSG_DONE` は最後のメッセージと同じ読み出しで来ます。デバイスがグループに新しく
+    入るか、すっかり抜けると、`RTNLGRP_IPV4_MCADDR`（37）に `RTM_NEWMULTICAST` か
+    `RTM_DELMULTICAST` を伝えます（`inet_ifmcaddr_notify`）。ソケットのメンバーシップが
+    最初か最後のとき（送り元のフィルターの最初と最後の送り元でも）、デバイスが上がるとき
+    の全ホストのグループ（`lo` のアドレスのあと、経路の前。`ip_mc_up`）、下がるとき
+    （経路と近隣が消える前）、閉じるとき、なくなるときです（`ip_mc_down`、
+    `ip_mc_destroy_dev`。ほかのグループは伝えずに忘れます）。
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
     `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
     1 から 39 で（0 とそれを超えるものは `EINVAL`、マルチキャストの経路の 30 と 31 には

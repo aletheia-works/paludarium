@@ -351,6 +351,29 @@ pub(crate) fn queue(process: &mut ThreadState, signal: PendingSignal) {
         process.arrivals = process.arrivals.wrapping_add(1);
     }
 }
+/// The standard signals pending for `process`'s thread alone, as
+/// [`crate::targets::Tif::queues`] reads them: not one Linux would have
+/// dropped as ignored, which waits here until delivery drops it.
+pub(crate) fn own_set(process: &ThreadState) -> u64 {
+    process
+        .pending
+        .iter()
+        .filter(|s| {
+            s.target == PendingTarget::Thread && (1..32).contains(&s.number) && wakes(process, s)
+        })
+        .fold(0, |set, s| set | 1 << (s.number - 1))
+}
+/// Removes `process`'s pending signal at `index`, as its thread takes it,
+/// and tells its [`crate::targets::Tif`] that it is no longer pending, so
+/// that one sent next is counted as it is sent, not only at the thread's
+/// next drain.
+pub(crate) fn take_pending(process: &mut ThreadState, index: usize) -> PendingSignal {
+    let signal = process.pending.remove(index);
+    if let Some(tif) = process.seat.tif() {
+        tif.set_own(own_set(process));
+    }
+    signal
+}
 /// Whether Linux would queue `signal` for `process`, and so wake a signal
 /// file (`signalfd_notify`): not when it is unblocked and ignored, which
 /// `prepare_signal` drops as it is sent.

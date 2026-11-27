@@ -220,7 +220,7 @@ fn take(c: &mut Context<'_>, mask: u64) -> Option<signals::PendingSignal> {
     c.group.drain_process(c.process);
     c.inbox.drain(c.process);
     signals::lowest_in(&c.process.pending, mask)
-        .map(|index| c.process.pending.remove(index))
+        .map(|index| signals::take_pending(c.process, index))
         .or_else(|| c.group.take_process_signal(mask))
 }
 

@@ -532,19 +532,7 @@ impl SignalInbox {
                 true
             }
         });
-        self.tif.set_own(
-            process
-                .pending
-                .iter()
-                // Not one Linux would have dropped as ignored, which waits
-                // here until delivery drops it.
-                .filter(|s| {
-                    s.target == signals::PendingTarget::Thread
-                        && (1..32).contains(&s.number)
-                        && signals::wakes(process, s)
-                })
-                .fold(0, |set, s| set | 1 << (s.number - 1)),
-        );
+        self.tif.set_own(signals::own_set(process));
         self.publish(process);
         // Sender stores while holding this same mutex, preventing a lost wake.
         // A process signal still queued keeps it until it is dispatched.
@@ -655,6 +643,34 @@ mod signals_time_tests {
         two.send_thread(41, 0).unwrap();
         two.drain(&mut state);
         assert_eq!(one.others_arrivals(), 4);
+    }
+
+    /// A standard signal its thread has taken, by delivery or a wait, is no
+    /// longer pending for it: one sent next counts as it is sent, before
+    /// the thread's next drain.
+    #[test]
+    fn a_signal_taken_without_a_drain_is_pending_no_more() {
+        let count = Arc::<AtomicU64>::default();
+        let actions = crate::threads::ActionSlot::default();
+        let [one, two] = [SignalInbox::default(), SignalInbox::default()];
+        for inbox in [&one, &two] {
+            inbox.attach(Arc::default(), Arc::clone(&count));
+            inbox.follow_actions(Arc::clone(&actions));
+        }
+        let mut state = ThreadState::default();
+        state.seat.take(two.tif(), 0);
+        two.send_thread(10, 0).unwrap();
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 1);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 1);
+        two.drain(&mut state);
+        let index = signals::lowest_in(&state.pending, 1 << 9).unwrap();
+        assert_eq!(signals::take_pending(&mut state, index).number, 10);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 2);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 2);
     }
 
     #[test]

@@ -1826,7 +1826,7 @@ impl Kernel {
         }
         let mut delivered = false;
         while let Some(index) = signals::next_pending(&thread.state, false) {
-            let mut signal = thread.state.pending.remove(index);
+            let mut signal = signals::take_pending(&mut thread.state, index);
             // A traced thread reports each signal but SIGKILL and one whose
             // action is `SA_IMMUTABLE` to its tracer first, which may cancel
             // or change it (`ptrace_signal`).

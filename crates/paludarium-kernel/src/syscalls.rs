@@ -1716,7 +1716,7 @@ fn sys_rt_sigtimedwait(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             c.inbox.drain(c.process);
             // The thread's own queue first, then the process's shared one.
             let found = signals::lowest_in(&c.process.pending, set)
-                .map(|index| c.process.pending.remove(index))
+                .map(|index| signals::take_pending(c.process, index))
                 .or_else(|| {
                     std::mem::take(&mut looks)
                         .then(|| c.group.take_process_signal(set))

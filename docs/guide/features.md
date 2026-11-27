@@ -2127,8 +2127,9 @@ kernel.
   With `IORING_ACCEPT_MULTISHOT` and `IORING_RECV_MULTISHOT`, an accept and
   a receive post a completion with `IORING_CQE_F_MORE` for each
   connection or each buffer filled, and wait for the next: until an error,
-  the end, a receive's limit (`optlen`), no buffer (`ENOBUFS`) or no room in
-  the queue. It goes on at once while its socket has more
+  the end, an `IORING_OP_RECV`'s limit (`optlen`, which an `IORING_OP_RECVMSG`
+  refuses with `EINVAL`), no buffer (`ENOBUFS`) or no room in the queue.
+  It goes on at once while its socket has more
   (`IORING_CQE_F_SOCK_NONEMPTY`) or does not say, as an AF_UNIX listener
   does not, and otherwise waits for the socket first, so a receive whose
   last buffer went fails with `ENOBUFS` only when more bytes come. An

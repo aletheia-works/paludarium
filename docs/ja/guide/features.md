@@ -1850,7 +1850,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EMSGSIZE`）、待つ要求にはもう要りません。`MSG_WAITALL` の受信は、メッセージや補助データが
   切り詰められるとリンクを失敗させます。`IORING_ACCEPT_MULTISHOT` と `IORING_RECV_MULTISHOT` では、
   accept と受信が、接続ごと、または埋めたバッファーごとに `IORING_CQE_F_MORE` 付きの
-  完了を投稿して次を待ちます。エラー、終わり、受信の上限（`optlen`）、バッファー切れ（`ENOBUFS`）、
+  完了を投稿して次を待ちます。エラー、終わり、`IORING_OP_RECV` の上限（`optlen`。`IORING_OP_RECVMSG` に渡せば
+  `EINVAL`）、バッファー切れ（`ENOBUFS`）、
   キューの空き切れで終わります。ソケットにまだあるとき（`IORING_CQE_F_SOCK_NONEMPTY`）や、
   AF_UNIX の待ち受けのように分からないときはすぐ続け、そうでなければまずソケットを待ちます。
   そのため、最後のバッファーを使った受信が `ENOBUFS` で終わるのは、次のバイトが来たときです。

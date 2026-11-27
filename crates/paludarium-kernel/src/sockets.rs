@@ -1408,6 +1408,103 @@ pub(crate) fn with_header<T>(at: u64, header: &MessageHeader, f: impl FnOnce() -
     let _restore = Restore(READ_BEFORE.with(|read| read.replace(now)));
     f()
 }
+thread_local! {
+    /// The `msghdr` at an address that a receive reads and writes in place
+    /// of the caller's memory ([`with_shadow_header`]).
+    static SHADOW: std::cell::RefCell<Option<(u64, [u8; MSGHDR])>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+/// `struct user_msghdr`'s size.
+const MSGHDR: usize = 56;
+/// Runs `f` as [`with_header`] does, but with the lengths and flags a
+/// receive writes back to the `msghdr` at `at` kept apart, and gives them:
+/// an io_uring multishot receive of messages has the kernel's own `msghdr`
+/// and writes them to its buffer (`io_recvmsg_multishot`). Its
+/// `msg_namelen` is `name_room` as the receive starts.
+pub(crate) fn with_shadow_header<T>(
+    at: u64,
+    header: &MessageHeader,
+    name_room: u32,
+    f: impl FnOnce() -> T,
+) -> (T, [u8; MSGHDR]) {
+    struct Restore(Option<(u64, [u8; MSGHDR])>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SHADOW.with(|shadow| shadow.replace(self.0.take()));
+        }
+    }
+    let mut raw = [0; MSGHDR];
+    raw[0..8].copy_from_slice(&header.name_at.to_le_bytes());
+    raw[8..12].copy_from_slice(&name_room.to_le_bytes());
+    raw[32..40].copy_from_slice(&header.control.to_le_bytes());
+    raw[40..48].copy_from_slice(&header.control_len.to_le_bytes());
+    let restore = Restore(SHADOW.with(|shadow| shadow.replace(Some((at, raw)))));
+    let result = with_header(at, header, f);
+    let raw = SHADOW
+        .with(|shadow| shadow.borrow().map(|(_, raw)| raw))
+        .unwrap_or([0; MSGHDR]);
+    drop(restore);
+    (result, raw)
+}
+/// Where `[addr, addr + len)` falls in the shadowed `msghdr`, if it does.
+fn shadowed(addr: u64, len: usize) -> Option<usize> {
+    SHADOW.with(|shadow| {
+        let (at, _) = (*shadow.borrow())?;
+        let start = usize::try_from(addr.checked_sub(at)?).ok()?;
+        (start + len <= MSGHDR).then_some(start)
+    })
+}
+/// Writes a field of a receive's `msghdr` (`EFAULT`), or of the one it was
+/// given in place of it ([`with_shadow_header`]).
+pub(crate) fn header_write(c: &Context<'_>, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
+    if let Some(start) = shadowed(addr, bytes.len()) {
+        SHADOW.with(|shadow| {
+            if let Some((_, raw)) = shadow.borrow_mut().as_mut() {
+                raw[start..start + bytes.len()].copy_from_slice(bytes);
+            }
+        });
+        return Ok(());
+    }
+    c.mem
+        .write(GuestAddr(addr), bytes)
+        .map_err(|_| Errno::EFAULT)
+}
+/// Reads a field of a receive's `msghdr`, as [`header_write`] writes it.
+fn header_read(c: &Context<'_>, addr: u64, bytes: &mut [u8]) -> Result<(), Errno> {
+    if let Some(start) = shadowed(addr, bytes.len()) {
+        SHADOW.with(|shadow| {
+            if let Some((_, raw)) = shadow.borrow().as_ref() {
+                bytes.copy_from_slice(&raw[start..start + bytes.len()]);
+            }
+        });
+        return Ok(());
+    }
+    c.mem
+        .read(GuestAddr(addr), bytes)
+        .map_err(|_| Errno::EFAULT)
+}
+impl MessageHeader {
+    /// A receive's `msghdr` with a name of `name_room` bytes at `name` (none
+    /// for 0), the bytes at `iov`, and `control_len` bytes of control at
+    /// `control`.
+    pub(crate) fn of_buffer(
+        name: u64,
+        name_room: usize,
+        iov: (u64, usize),
+        control: u64,
+        control_len: u64,
+    ) -> Self {
+        Self {
+            name: (name_room != 0).then_some((name, name_room.min(128))),
+            has_name: name_room != 0,
+            name_at: if name_room != 0 { name } else { 0 },
+            iov: vec![iov],
+            control,
+            control_len,
+        }
+    }
+}
 /// Reads the `msghdr` at `at` (EFAULT): a negative `msg_namelen` with a name
 /// is EINVAL, a longer one counts as `sockaddr_storage`'s 128 bytes, and
 /// more than 1024 iovecs are EMSGSIZE.
@@ -1706,9 +1803,7 @@ fn put_address(
         address.extend(name);
     }
     let mut raw = [0; 4];
-    c.mem
-        .read(GuestAddr(len_at), &mut raw)
-        .map_err(|_| Errno::EFAULT)?;
+    header_read(c, len_at, &mut raw)?;
     let room = usize::try_from(i32::from_le_bytes(raw)).map_err(|_| Errno::EINVAL)?;
     let room = room.min(address.len());
     if room != 0 {
@@ -1716,9 +1811,7 @@ fn put_address(
             .write(GuestAddr(at), &address[..room])
             .map_err(|_| Errno::EFAULT)?;
     }
-    c.mem
-        .write(GuestAddr(len_at), &(address.len() as u32).to_le_bytes())
-        .map_err(|_| Errno::EFAULT)
+    header_write(c, len_at, &(address.len() as u32).to_le_bytes())
 }
 /// What a send of `len` bytes to `address` checks before the data is copied:
 /// a connected stream socket takes no address (EISCONN) and
@@ -1982,12 +2075,8 @@ fn receive_message_file(
     if let Some(at) = header.has_name.then_some(header.name_at) {
         put_address(c, from.as_ref(), at, a[1] + 8)?;
     }
-    c.mem
-        .write(GuestAddr(a[1] + 48), &flags.to_le_bytes())
-        .map_err(|_| Errno::EFAULT)?;
-    c.mem
-        .write(GuestAddr(a[1] + 40), &used.to_le_bytes())
-        .map_err(|_| Errno::EFAULT)?;
+    header_write(c, a[1] + 48, &flags.to_le_bytes())?;
+    header_write(c, a[1] + 40, &used.to_le_bytes())?;
     Ok(returned)
 }
 /// Sends `bytes` for sendto or sendmsg with their `flags`. With `MSG_OOB` on

@@ -627,7 +627,7 @@ verified.
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
   Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
-  socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
+  socket requests, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
   one are not there yet (`EINVAL`). A multishot receive whose socket keeps

@@ -522,8 +522,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
   `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
-  だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
-  `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
+  だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、
+  バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
   （`MULTISHOT_MAX_RETRY`）続くとキューに戻し、ほかのタスクワークを先に動かします。

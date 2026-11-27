@@ -57,6 +57,11 @@ const MSG_DONTWAIT: u32 = 0x40;
 const MSG_WAITALL: u32 = 0x100;
 const MSG_ERRQUEUE: u32 = 0x2000;
 const MSG_NOSIGNAL: u32 = 0x4000;
+const MSG_CMSG_COMPAT: u32 = 0x8000_0000;
+/// `struct io_uring_recvmsg_out`: the lengths of the name, the control and
+/// the message, and its flags.
+const RECVMSG_OUT: u64 = 16;
+const EOVERFLOW: Errno = Errno(75);
 const SOCK_NONBLOCK: u32 = 0o4000;
 const SOCK_CLOEXEC: u32 = 0o2_000_000;
 /// `O_NONBLOCK` of a file's flags.
@@ -88,13 +93,20 @@ pub(super) struct Net {
     /// as far as it knew, which waits for its socket before it goes on
     /// (`IOU_RETRY`).
     wait: bool,
+    /// A multishot receive of messages: the name's and the control's room
+    /// its `msghdr` gives, which each buffer starts with after a
+    /// `struct io_uring_recvmsg_out` (`io_recvmsg_mshot_prep`).
+    layout: Option<(u32, u64)>,
+    /// A multishot receive of messages that found the end, which posts its
+    /// last completion (`io_recvmsg_multishot`'s `finished`).
+    ended: bool,
 }
 
 impl Net {
     /// Whether it goes on after `res`, which it posts: an accept after any
     /// connection, a receive after any bytes but the last it may take.
     pub(super) fn goes_on(&mut self, res: i32) -> bool {
-        if !self.multishot {
+        if !self.multishot || self.ended {
             return false;
         }
         if matches!(self.op, Op::Accept { .. }) {
@@ -171,9 +183,9 @@ enum Op {
 /// Prepares a socket request from its entry (`io_shutdown_prep`,
 /// `io_socket_prep`, `io_accept_prep`, `io_connect_prep` and
 /// `io_sendmsg_prep` or `io_recvmsg_prep` with `io_send_setup`), but for
-/// what it reads of the caller's memory ([`prepare_memory`]). The
-/// operations of multishot receives of messages, bundles and vectored
-/// sends, and a send's selected buffer, are not there yet (`EINVAL`).
+/// what it reads of the caller's memory ([`prepare_memory`]). Bundles,
+/// vectored sends and a send's selected buffer are not there yet
+/// (`EINVAL`).
 pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Errno> {
     let fixed = sqe_flags & super::IOSQE_FIXED_FILE != 0;
     let select = sqe_flags & super::IOSQE_BUFFER_SELECT != 0;
@@ -270,8 +282,8 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 if !select || msg_flags & MSG_WAITALL != 0 {
                     return Err(Errno::EINVAL);
                 }
-                // A message's are not there yet.
-                if message {
+                // A message's limit is its buffers'.
+                if message && file_index != 0 {
                     return Err(Errno::EINVAL);
                 }
                 multishot = true;
@@ -319,6 +331,8 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
         multishot,
         limit,
         wait: false,
+        layout: None,
+        ended: false,
     })))
 }
 
@@ -344,6 +358,9 @@ pub(super) fn prepare_memory(c: &Context<'_>, net: &mut Net) -> Result<(), Errno
             if let Some(message) = message {
                 **message = read_message(c, buf, send, group.is_some())?;
                 *len = message.iov.first().map_or(0, |&(_, len)| len as u32);
+                if net.multishot {
+                    net.layout = Some(layout(c, buf)?);
+                }
                 return Ok(());
             }
             if let Some((at, to_len)) = to {
@@ -389,6 +406,25 @@ fn read_message(
         header.iov = vec![(0, len as u32 as usize)];
     }
     Ok(header)
+}
+
+/// The name's and the control's room in each buffer of a multishot receive
+/// of the `msghdr` at `at`, as `io_recvmsg_mshot_prep` takes them: a
+/// negative `msg_namelen`, or a header longer than an `int`, is
+/// `EOVERFLOW`.
+fn layout(c: &Context<'_>, at: u64) -> Result<(u32, u64), Errno> {
+    let mut raw = [0; 4];
+    c.mem
+        .read(GuestAddr(at + 8), &mut raw)
+        .map_err(|_| Errno::EFAULT)?;
+    let name = i32::from_le_bytes(raw);
+    let [control] = crate::syscalls::read_words::<1>(c.mem, at + 40)?;
+    let name = u32::try_from(name).map_err(|_| EOVERFLOW)?;
+    let whole = (RECVMSG_OUT + u64::from(name)).checked_add(control);
+    if whole.is_none_or(|whole| whole > i32::MAX as u64) {
+        return Err(EOVERFLOW);
+    }
+    Ok((name, control))
 }
 
 /// What issuing a request came to: a result with its completion's flags
@@ -464,7 +500,14 @@ pub(super) fn run(
         }
         Op::Accept { .. } => accept(c, ring, net.polled, &net.op, &file),
         Op::Connect { .. } => connect(c, &mut net.op, &file),
-        Op::Transfer { .. } => transfer(c, ring, net.polled, &mut net.op, &file),
+        Op::Transfer { .. } => match net.layout {
+            Some(layout) => {
+                let (issued, ended) = receive_messages(c, ring, net.polled, &net.op, layout, &file);
+                net.ended = ended;
+                issued
+            }
+            None => transfer(c, ring, net.polled, &mut net.op, &file),
+        },
         Op::Socket { .. } => unreachable!(),
     };
     match issued {
@@ -855,6 +898,100 @@ fn transfer(
         cflags |= CQE_F_SOCK_NONEMPTY;
     }
     Issued::Done(res, cflags, failed)
+}
+
+/// A multishot receive of a message (`io_recvmsg` with
+/// `io_recvmsg_prep_multishot` and `io_recvmsg_multishot`), and whether it
+/// ended: the buffer it selects (`ENOBUFS`) has its name, its control and
+/// its bytes after a `struct io_uring_recvmsg_out` (`EFAULT` for a buffer
+/// shorter than all but the bytes), which tells their lengths, the
+/// message's whole one, and its flags. The caller's `msghdr` is not
+/// written. Its result is the buffer's bytes used; the end of the stream
+/// (no bytes) or an error ends it.
+fn receive_messages(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    polled: bool,
+    op: &Op,
+    (name_room, control_len): (u32, u64),
+    file: &Arc<dyn FileHandle>,
+) -> (Issued, bool) {
+    let &Op::Transfer {
+        buf,
+        len,
+        msg_flags,
+        flags,
+        group: Some(bgid),
+        ..
+    } = op
+    else {
+        unreachable!()
+    };
+    let mask = if msg_flags & MSG_ERRQUEUE != 0 {
+        POLL_IN_EVENTS & !POLLIN
+    } else {
+        POLL_IN_EVENTS
+    };
+    if !crate::sockets::is_socket(file) {
+        return (Issued::Done(-Errno(88).0, 0, true), true);
+    }
+    if !polled && flags & RECVSEND_POLL_FIRST != 0 {
+        return (Issued::Again(mask), false);
+    }
+    let chosen = match select(c, ring, bgid, len, true) {
+        Ok(chosen) => chosen,
+        Err(e) => return (Issued::Done(-e.0, 0, true), true),
+    };
+    let room = u64::from(chosen.len.min(crate::files::MAX_RW_COUNT as u32));
+    let head = RECVMSG_OUT + u64::from(name_room) + control_len;
+    if room < head {
+        recycle(ring, &chosen);
+        return (Issued::Done(-Errno::EFAULT.0, 0, true), true);
+    }
+    let name = chosen.addr + RECVMSG_OUT;
+    let control = name + u64::from(name_room);
+    let payload = room - head;
+    let header = MessageHeader::of_buffer(
+        name,
+        name_room as usize,
+        (control + control_len, payload as usize),
+        if control_len == 0 { 0 } else { control },
+        control_len,
+    );
+    let a = [0, buf, u64::from(msg_flags | MSG_DONTWAIT), 0, 0, 0];
+    let (result, raw) = crate::sockets::with_shadow_header(buf, &header, name_room, || {
+        crate::sockets::route_file(c, 47, a, file)
+    });
+    let written = result.and_then(|n| {
+        let word = |at: usize| u32::from_le_bytes(raw[at..at + 4].try_into().unwrap_or_default());
+        let out = [
+            if name_room == 0 { 0 } else { word(8) },
+            word(40),
+            n as u32,
+            word(48) & !MSG_CMSG_COMPAT,
+        ];
+        let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+        c.mem
+            .write(GuestAddr(chosen.addr), &bytes)
+            .map_err(|_| Errno::EFAULT)?;
+        Ok(n)
+    });
+    let n = match written {
+        Ok(n) => n,
+        Err(e) => {
+            recycle(ring, &chosen);
+            if e == Errno::EAGAIN {
+                return (Issued::Again(mask), false);
+            }
+            return (Issued::Done(-e.0, 0, true), true);
+        }
+    };
+    let res = head + n.min(payload);
+    let mut cflags = give_back(c, ring, &chosen, &Ok(res));
+    if crate::sockets::inq_hint(file).is_some_and(|inq| inq > 0) {
+        cflags |= CQE_F_SOCK_NONEMPTY;
+    }
+    (Issued::Done(res as i32, cflags, false), n == 0)
 }
 
 /// What is left of a message after `n` bytes of it, a send's without its

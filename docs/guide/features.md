@@ -2125,13 +2125,20 @@ kernel.
   `EMSGSIZE`), so one that waits needs them no more. A receive with
   `MSG_WAITALL` whose message or ancillary data was cut fails its link.
   With `IORING_ACCEPT_MULTISHOT` and `IORING_RECV_MULTISHOT`, an accept and
-  an `IORING_OP_RECV` post a completion with `IORING_CQE_F_MORE` for each
+  a receive post a completion with `IORING_CQE_F_MORE` for each
   connection or each buffer filled, and wait for the next: until an error,
   the end, a receive's limit (`optlen`), no buffer (`ENOBUFS`) or no room in
   the queue. It goes on at once while its socket has more
   (`IORING_CQE_F_SOCK_NONEMPTY`) or does not say, as an AF_UNIX listener
   does not, and otherwise waits for the socket first, so a receive whose
-  last buffer went fails with `ENOBUFS` only when more bytes come. Each is
+  last buffer went fails with `ENOBUFS` only when more bytes come. An
+  `IORING_OP_RECVMSG`'s buffer starts with a `struct io_uring_recvmsg_out`
+  (the name's length, the control's, the message's whole one and its
+  flags), then the room its `msghdr` gives the name and the control, then
+  the bytes, as `io_recvmsg_multishot` puts them; a buffer shorter than all
+  but the bytes fails with `EFAULT`, and the `msghdr` is not written. Its
+  result is the bytes of the buffer it used, and the end of the stream
+  posts the last with none. Each is
   prepared as Linux prepares it, which checks its entry
   (`EINVAL`), then reads a connect's or a send's address
   (`move_addr_to_kernel`: `EINVAL` past 128 bytes, `EFAULT`) and checks a

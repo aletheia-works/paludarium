@@ -1849,11 +1849,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `msghdr` とその iovec を準備のときに読むので（`io_msg_copy_hdr`。`EFAULT`、`EINVAL`、
   `EMSGSIZE`）、待つ要求にはもう要りません。`MSG_WAITALL` の受信は、メッセージや補助データが
   切り詰められるとリンクを失敗させます。`IORING_ACCEPT_MULTISHOT` と `IORING_RECV_MULTISHOT` では、
-  accept と `IORING_OP_RECV` が、接続ごと、または埋めたバッファーごとに `IORING_CQE_F_MORE` 付きの
+  accept と受信が、接続ごと、または埋めたバッファーごとに `IORING_CQE_F_MORE` 付きの
   完了を投稿して次を待ちます。エラー、終わり、受信の上限（`optlen`）、バッファー切れ（`ENOBUFS`）、
   キューの空き切れで終わります。ソケットにまだあるとき（`IORING_CQE_F_SOCK_NONEMPTY`）や、
   AF_UNIX の待ち受けのように分からないときはすぐ続け、そうでなければまずソケットを待ちます。
   そのため、最後のバッファーを使った受信が `ENOBUFS` で終わるのは、次のバイトが来たときです。
+  `IORING_OP_RECVMSG` のバッファーは、`io_recvmsg_multishot` と同じく、`struct io_uring_recvmsg_out`
+  （名前の長さ、制御データの長さ、メッセージ全体の長さ、フラグ）、`msghdr` が名前と制御データに
+  与える場所、バイトの順に並びます。バイトのほかが入らないバッファーは `EFAULT` で失敗し、`msghdr`
+  には書きません。結果は使ったバッファーのバイト数で、ストリームの終わりはバイトのない最後の完了を
+  投稿します。
   どれも Linux と同じく準備し、
   エントリーを調べ（`EINVAL`）、次に接続や送信のアドレスを読み（`move_addr_to_kernel`。128 バイトを
   超えれば `EINVAL`、読めなければ `EFAULT`）、バッファーがユーザー空間にあるかを調べます

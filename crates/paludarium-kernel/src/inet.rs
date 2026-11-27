@@ -5956,9 +5956,7 @@ pub(crate) fn dispatch(
                         .write(GuestAddr(at), &address[..n])
                         .map_err(|_| Errno::EFAULT)?;
                 }
-                c.mem
-                    .write(GuestAddr(a[1] + 8), &(address.len() as u32).to_le_bytes())
-                    .map_err(|_| Errno::EFAULT)?;
+                crate::sockets::header_write(c, a[1] + 8, &(address.len() as u32).to_le_bytes())?;
             }
             // A datagram's timestamps, as `udp_recvmsg` gives them
             // (`sock_recv_timestamp`); with no control buffer, only
@@ -5972,12 +5970,8 @@ pub(crate) fn dispatch(
                 }
                 used = header.control_len - room.1;
             }
-            c.mem
-                .write(GuestAddr(a[1] + 40), &used.to_le_bytes())
-                .map_err(|_| Errno::EFAULT)?;
-            c.mem
-                .write(GuestAddr(a[1] + 48), &flags.to_le_bytes())
-                .map_err(|_| Errno::EFAULT)?;
+            crate::sockets::header_write(c, a[1] + 40, &used.to_le_bytes())?;
+            crate::sockets::header_write(c, a[1] + 48, &flags.to_le_bytes())?;
             Ok(returned(&received, a[2], socket.datagram) as u64)
         }
         _ => Err(Errno::ENOSYS),

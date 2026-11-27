@@ -7139,9 +7139,7 @@ pub(crate) fn dispatch(
                         .write(GuestAddr(at), &name[..n])
                         .map_err(|_| Errno::EFAULT)?;
                 }
-                c.mem
-                    .write(GuestAddr(a[1] + 8), &(name.len() as u32).to_le_bytes())
-                    .map_err(|_| Errno::EFAULT)?;
+                crate::sockets::header_write(c, a[1] + 8, &(name.len() as u32).to_le_bytes())?;
             }
             // `____sys_recvmsg` starts the flags with `MSG_CMSG_CLOEXEC`.
             let mut flags = (a[2] & MSG_CMSG_CLOEXEC) as u32;
@@ -7185,12 +7183,8 @@ pub(crate) fn dispatch(
             } else {
                 header.control_len - room.1
             };
-            c.mem
-                .write(GuestAddr(a[1] + 40), &used.to_le_bytes())
-                .map_err(|_| Errno::EFAULT)?;
-            c.mem
-                .write(GuestAddr(a[1] + 48), &flags.to_le_bytes())
-                .map_err(|_| Errno::EFAULT)?;
+            crate::sockets::header_write(c, a[1] + 40, &used.to_le_bytes())?;
+            crate::sockets::header_write(c, a[1] + 48, &flags.to_le_bytes())?;
             Ok(returned(n, length, a[2]))
         }
         _ => Err(Errno::ENOSYS),

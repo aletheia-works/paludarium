@@ -12740,7 +12740,7 @@ static int io_uring_message_case(void) {
 }
 
 /* io_uring's multishot requests: IORING_ACCEPT_MULTISHOT and
-   IORING_RECV_MULTISHOT. */
+   IORING_RECV_MULTISHOT, on IORING_OP_RECV and _RECVMSG. */
 static int um_connect(struct sockaddr_un *name, socklen_t len) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     printf("connect %d\n", connect(fd, (struct sockaddr *)name, len));
@@ -12834,6 +12834,54 @@ static int io_uring_multishot_case(void) {
     um_run(&u, 2, 0, "receive-linked");
     close(pair[0]);
     um_run(&u, 0, 2, "receive-end");
+
+    /* Receives of messages: each buffer has a struct io_uring_recvmsg_out,
+       then the room the msghdr gives a name and control, then the bytes. A
+       datagram socket does not tell what is left, so it goes on at once. */
+    unsigned char mpool[2][48];
+    memset(mpool, 0, sizeof mpool);
+    int gram[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, gram)) return 83;
+    struct sockaddr_un from;
+    struct msghdr mh = {.msg_name = &from, .msg_namelen = 8, .msg_controllen = 8};
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    um_run(&u, 1, 1, "message-no-buffer");
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    sqe[44] = 1;
+    um_run(&u, 1, 1, "message-limit");
+    unet_push(&u, 31, 99, 2, 0, (long)mpool, 48, 0, 0)[40] = 4;
+    um_run(&u, 1, 1, "message-provide");
+    write(gram[0], "hello", 5);
+    write(gram[0], "a longer message than fits", 26);
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    um_run(&u, 1, 3, "messages");
+    for (int i = 0; i < 2; i++) {
+        unsigned out[4];
+        memcpy(out, mpool[i], sizeof out);
+        printf("message %d: name %u control %u payload %u flags %#x %.16s\n", i, out[0], out[1],
+               out[2], out[3], (char *)mpool[i] + 32);
+    }
+    printf("msghdr %u %zu %#x\n", mh.msg_namelen, mh.msg_controllen, mh.msg_flags);
+    unet_push(&u, 31, 99, 1, 0, (long)mpool, 20, 0, 0)[40] = 4;
+    um_run(&u, 1, 1, "message-provide-short");
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    um_run(&u, 1, 1, "message-short");
+    mh.msg_namelen = -1;
+    mh.msg_name = NULL;
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    um_run(&u, 1, 1, "message-overflow");
+    close(gram[0]);
+    close(gram[1]);
     close(first);
     close(second);
     close(u.fd);

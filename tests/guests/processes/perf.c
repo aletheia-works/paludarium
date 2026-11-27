@@ -1060,7 +1060,6 @@ static int case_output(void) {
 }
 
 #define SAMPLE_IP (1ULL << 0)
-#define SAMPLE_TIME (1ULL << 2)
 #define SAMPLE_ADDR (1ULL << 3)
 #define SAMPLE_CALLCHAIN (1ULL << 5)
 #define SAMPLE_ID (1ULL << 6)
@@ -2320,33 +2319,37 @@ static int case_side_band_exec(const char *self) {
     return 0;
 }
 
-/* The samples of a clock, each at its own time and in order. */
+/* The samples of a clock, and those whose instruction and registers are
+   the last one's. */
 struct clock_samples {
-    int samples, repeats, backwards;
-    uint64_t last;
+    int samples, repeats;
+    uint64_t last[19];
 };
+
+/* rax to rip, and r8 to r15 (PERF_REG_X86_*). */
+#define CLOCK_REGS (0x1ffULL | 0xffULL << 16)
 
 static void see_clock_sample(const uint64_t *record, void *with) {
     struct clock_samples *c = with;
-    if ((uint32_t)record[0] != RECORD_SAMPLE) return;
-    /* SAMPLE_IP, then SAMPLE_TIME. */
-    uint64_t time = record[2];
-    if (c->samples > 0 && time == c->last) c->repeats++;
-    if (c->samples > 0 && time < c->last) c->backwards++;
-    c->last = time;
+    if ((uint32_t)record[0] != RECORD_SAMPLE || record[0] >> 48 != 8 * 20) return;
+    /* SAMPLE_IP, then SAMPLE_REGS_USER: the ABI and 17 registers. */
+    if (c->samples > 0 && !memcmp(record + 1, c->last, sizeof c->last)) c->repeats++;
+    memcpy(c->last, record + 1, sizeof c->last);
     c->samples++;
 }
 
 /* cpu-clock every 100 us, for 20 ms of the thread's time: each sample is
-   taken as its hrtimer fires, so no two have the same time. The emulator
-   takes them at its checkpoints, which come about as often as the period
-   while the clock samples, but those of a system call's time share one:
-   at most a third may share a time (most did with runs of 100,000
-   instructions). */
+   taken as its hrtimer interrupts the loop, so none has the instruction
+   and registers of the one before. The emulator takes them at its
+   checkpoints, which come about as often as the period while the clock
+   samples, but those of a system call's time share one: at most a third
+   may (most did with runs of 100,000 instructions). The time of a sample
+   is not looked at: the harness's clock does not pass as the guest runs. */
 static int case_clock_samples(void) {
     struct attr a = software(0);
     a.sample_period = 100000;
-    a.sample_type = SAMPLE_IP | SAMPLE_TIME;
+    a.sample_type = SAMPLE_IP | SAMPLE_REGS_USER;
+    a.sample_regs_user = CLOCK_REGS;
     a.flags |= DISABLED;
     void *page;
     int fd = (int)open_event(&a, 0, -1, -1, 0);
@@ -2364,7 +2367,7 @@ static int case_clock_samples(void) {
     struct clock_samples c = {0};
     uint64_t tail = 0;
     each_record(page, &tail, see_clock_sample, &c);
-    say("samples>=100 %d in order %d own times %d", c.samples >= 100, c.backwards == 0, c.repeats * 3 <= c.samples);
+    say("samples>=100 %d own registers %d", c.samples >= 100, c.repeats * 3 <= c.samples);
     return 0;
 }
 

@@ -76,10 +76,11 @@ const SETUP_TASKRUN_FLAG: u32 = 1 << 9;
 const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
 const SETUP_DEFER_TASKRUN: u32 = 1 << 13;
 const SETUP_NO_SQARRAY: u32 = 1 << 16;
-/// Every flag Linux 6.12 knows: `IORING_SETUP_IOPOLL` to `_NO_SQARRAY`.
-const SETUP_KNOWN: u32 = (1 << 17) - 1;
+/// Every flag Linux 7.0 knows: `IORING_SETUP_IOPOLL` to `_SQ_REWIND`.
+const SETUP_KNOWN: u32 = (1 << 21) - 1;
 /// The flags implemented. `IOPOLL`, `SQPOLL`, `SQ_AFF`, `ATTACH_WQ`,
-/// `SQE128`, `CQE32`, `NO_MMAP` and `REGISTERED_FD_ONLY` are not.
+/// `SQE128`, `CQE32`, `NO_MMAP`, `REGISTERED_FD_ONLY`, `HYBRID_IOPOLL`,
+/// `CQE_MIXED`, `SQE_MIXED` and `SQ_REWIND` are not.
 const SETUP_IMPLEMENTED: u32 = SETUP_CQSIZE
     | SETUP_CLAMP
     | SETUP_R_DISABLED
@@ -97,8 +98,10 @@ const ENTER_GETEVENTS: u32 = 1 << 0;
 const ENTER_EXT_ARG: u32 = 1 << 3;
 const ENTER_REGISTERED_RING: u32 = 1 << 4;
 const ENTER_ABS_TIMER: u32 = 1 << 5;
-/// `IORING_ENTER_GETEVENTS` to `_ABS_TIMER`.
-const ENTER_KNOWN: u32 = (1 << 6) - 1;
+const ENTER_EXT_ARG_REG: u32 = 1 << 6;
+/// `IORING_ENTER_GETEVENTS` to `_NO_IOWAIT`, Linux 7.0's. A wait counts as
+/// no I/O wait anyway, so `_NO_IOWAIT` changes nothing.
+const ENTER_KNOWN: u32 = (1 << 8) - 1;
 /// How many ring descriptors a task may register.
 const RINGFD_REG_MAX: u32 = 16;
 
@@ -183,8 +186,8 @@ const OPS: [u8; 28] = [
 fn supported(opcode: u8) -> bool {
     OPS.contains(&opcode) || fs::OPS.contains(&opcode)
 }
-/// `IORING_OP_LAST` of Linux 6.12, after `IORING_OP_LISTEN`.
-const OP_LAST: u8 = 58;
+/// `IORING_OP_LAST` of Linux 7.0, after `IORING_OP_URING_CMD128`.
+const OP_LAST: u8 = 65;
 
 /// `IOSQE_*`: what every operation takes, then what only some do.
 const IOSQE_FIXED_FILE: u8 = 1 << 0;
@@ -283,8 +286,8 @@ const MAX_REG_BUFFERS: u64 = 1 << 14;
 const MAX_BUFFER: u64 = 1 << 30;
 /// `CAP_IPC_LOCK`, which spares a ring's buffers from RLIMIT_MEMLOCK.
 const CAP_IPC_LOCK: u64 = 1 << 14;
-/// `IORING_REGISTER_LAST` of Linux 6.12, after `_CLONE_BUFFERS`.
-const REGISTER_LAST: u64 = 31;
+/// `IORING_REGISTER_LAST` of Linux 7.0, after `_BPF_FILTER`.
+const REGISTER_LAST: u64 = 38;
 const REGISTER_USE_REGISTERED_RING: u64 = 1 << 31;
 /// `IO_URING_OP_SUPPORTED`.
 const OP_SUPPORTED: u16 = 1;
@@ -3524,6 +3527,16 @@ fn wait_arg(c: &Context<'_>, flags: u32, argp: u64, argsz: u64) -> Result<WaitAr
             sigsz: argsz,
             min_time: 0,
             timeout: None,
+        });
+    }
+    // A wait region's (`io_get_ext_arg_reg`): `IORING_REGISTER_MEM_REGION`
+    // is not there, so the argument is never in one (`EFAULT`).
+    if flags & ENTER_EXT_ARG_REG != 0 {
+        // struct io_uring_reg_wait.
+        return Err(if argsz != 64 {
+            Errno::EINVAL
+        } else {
+            Errno::EFAULT
         });
     }
     // struct io_uring_getevents_arg.

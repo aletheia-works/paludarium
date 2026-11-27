@@ -5317,7 +5317,8 @@ mod io_uring {
     fn enter_and_register_check_their_arguments() {
         let mut f = fixture();
         let r = ring(&mut f);
-        assert_eq!(f.ret(426, &[r.fd, 0, 0, 1 << 6]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(426, &[r.fd, 0, 0, 1 << 8]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(426, &[r.fd, 0, 0, 1 << 7]), 0);
         assert_eq!(f.ret(426, &[99, 0, 0, 0]), errno(Errno::EBADF));
         assert_eq!(f.ret(426, &[0, 0, 0, 0]), errno(Errno(95)));
         assert_eq!(f.ret(426, &[3, 0, 0, 1 << 4]), errno(Errno::EBADF));
@@ -5341,14 +5342,19 @@ mod io_uring {
             f.ret(426, &[r.fd, 0, 1, GETEVENTS | 1 << 3, arg, 16]),
             errno(Errno::EINVAL)
         );
-        // The probe: NOP, the transfers and EPOLL_CTL, of 58 operations.
+        // An argument in a wait region, which none can be registered for.
+        let reg = GETEVENTS | 1 << 3 | 1 << 6;
+        assert_eq!(f.ret(426, &[r.fd, 0, 1, reg, 0, 24]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(426, &[r.fd, 0, 1, reg, 0, 64]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(426, &[r.fd, 0, 0, 1 << 6, 0, 0]), 0);
+        // The probe: NOP, the transfers and EPOLL_CTL, of 65 operations.
         let probe = DATA + 0x400;
-        f.mem.write(GuestAddr(probe), &[0; 16 + 8 * 64]).unwrap();
-        assert_eq!(f.ret(427, &[r.fd, 8, probe, 64]), 0);
+        f.mem.write(GuestAddr(probe), &[0; 16 + 8 * 65]).unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 8, probe, 70]), 0);
         let mut head = [0; 2];
         f.mem.read(GuestAddr(probe), &mut head).unwrap();
-        assert_eq!(head, [57, 58]);
-        let supported: Vec<u64> = (0..58)
+        assert_eq!(head, [64, 65]);
+        let supported: Vec<u64> = (0..65)
             .filter(|op| u32_at(&f, probe + 16 + 8 * op) >> 16 & 1 == 1)
             .collect();
         assert_eq!(
@@ -8104,11 +8110,14 @@ mod io_uring {
         assert_eq!(f.ret(427, &[r.fd, 11, 0, 0]), einval);
         assert_eq!(f.ret(427, &[r.fd, 11, DATA, 1000]), einval);
         assert_eq!(f.ret(427, &[r.fd, 11, 8, 1]), errno(Errno::EFAULT));
-        for bad in [(4, 0), (0, 200), (1, 200)] {
+        // Linux 7.0's last are `IORING_REGISTER_BPF_FILTER` (37) and
+        // `IORING_OP_URING_CMD128` (64).
+        for bad in [(4, 0), (0, 200), (1, 200), (0, 38), (1, 65)] {
             assert_eq!(restrict(&mut f, &r, &[(1, 0), bad]), einval);
         }
         // NOPs, with a link and never without one, and unregistering files.
-        assert_eq!(restrict(&mut f, &r, &[(0, 3), (1, 0), (2, 16), (3, 4)]), 0);
+        let list = [(0, 3), (0, 37), (1, 0), (1, 64), (2, 16), (3, 4)];
+        assert_eq!(restrict(&mut f, &r, &list), 0);
         assert_eq!(restrict(&mut f, &r, &[(1, 1)]), errno(EBUSY));
         // A disabled ring still takes any registration.
         assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);

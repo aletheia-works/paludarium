@@ -1875,7 +1875,8 @@ kernel.
 - io_uring is Linux 6.12's, but for its registered files, its groups of
   buffers and a NOP's flags, which are Linux 7.0's (`io_uring/rsrc.c`,
   `kbuf.c` and `nop.c`, with master's `IOSQE_FIXED_FILE` for a NOP), the
-  kernel the differential tests run on. Its
+  kernel the differential tests run on, and so are the operations,
+  registrations and setup and `io_uring_enter` flags it knows of. Its
   operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
@@ -1888,9 +1889,9 @@ kernel.
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
   `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
-  `_RECV`, `_SENDMSG` and `_RECVMSG`. Linux 6.12's other operations
-  complete with `EOPNOTSUPP`, as on a Linux built without them, and later
-  ones with `EINVAL`, as on 6.12, and `IORING_REGISTER_PROBE` reports only these. The
+  `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations, up to Linux
+  7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`, as on a Linux
+  built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
   as `anon_inode_create_getfile` makes one: `fstat` gives a new inode

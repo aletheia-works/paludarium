@@ -9635,11 +9635,17 @@ static int io_uring_case(void) {
     unsigned long arg[3] = {0, 0, (unsigned long)ts};
     uring_show("enter-timeout", uring_enter(u.fd, 0, 1, 1 | 1 << 3, arg, 24));
     uring_show("enter-arg-size", uring_enter(u.fd, 0, 1, 1 | 1 << 3, arg, 16));
+    /* Linux 7.0's: no wait region is registered, and no I/O wait. */
+    uring_show("enter-region-size", uring_enter(u.fd, 0, 1, 1 | 1 << 3 | 1 << 6, NULL, 24));
+    uring_show("enter-region", uring_enter(u.fd, 0, 1, 1 | 1 << 3 | 1 << 6, NULL, 64));
+    uring_show("enter-no-iowait", uring_enter(u.fd, 0, 0, 1 << 7, NULL, 0));
+    uring_show("enter-unknown-flag", uring_enter(u.fd, 0, 0, 1 << 8, NULL, 0));
     uring_show("register-unknown", syscall(427, u.fd, 255, NULL, 0));
     uring_show("register-not-ring", syscall(427, efd, 8, NULL, 0));
     unsigned char probe[16 + 8 * 64];
     memset(probe, 0, sizeof probe);
     uring_show("probe", syscall(427, u.fd, 8, probe, 64));
+    printf("probe-last: %d ops: %d\n", probe[0], probe[1]);
     printf("probe-nop: %d epoll: %d\n", probe[16 + 2] & 1, probe[16 + 8 * 29 + 2] & 1);
     uring_show("probe-dirty", syscall(427, u.fd, 8, probe, 1));
     close(efd);

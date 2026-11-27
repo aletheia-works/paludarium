@@ -610,10 +610,9 @@ verified.
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
   `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
-  `_RECV`, `_SENDMSG` and `_RECVMSG` run; Linux 6.12's other operations
-  complete with `EOPNOTSUPP`, and those Linux 7.0 adds after them (from
-  `IORING_OP_RECV_ZC`) fail with `EINVAL`, as on 6.12. Of the socket
-  requests, a multishot `IORING_OP_RECVMSG`, a bundle
+  `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
+  Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
+  socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
   one are not there yet (`EINVAL`). A multishot receive whose socket keeps
@@ -639,10 +638,11 @@ verified.
   waiting, where Linux cancels them, and a ring polled by a request of its
   own stays until that request ends. The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`,
-  `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY`, and those
-  Linux 7.0 adds after `_NO_SQARRAY` (from `_HYBRID_IOPOLL`), give
-  `EINVAL`, as do the `io_uring_enter` flags it adds after
-  `IORING_ENTER_ABS_TIMER` (`_EXT_ARG_REG` and `_NO_IOWAIT`),
+  `_SQE128`, `_CQE32`, `_NO_MMAP`, `_REGISTERED_FD_ONLY`,
+  `_HYBRID_IOPOLL`, `_CQE_MIXED`, `_SQE_MIXED` and `_SQ_REWIND` give
+  `EINVAL`. No wait region can be registered (`IORING_REGISTER_MEM_REGION`),
+  so a wait with `IORING_ENTER_EXT_ARG_REG` fails with `EFAULT` (`EINVAL`
+  for a size other than `struct io_uring_reg_wait`'s),
   and `io_uring_register` has only `IORING_REGISTER_PROBE`,
   `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
   `IORING_REGISTER_BUFFERS2`, `IORING_REGISTER_BUFFERS_UPDATE`,
@@ -672,7 +672,8 @@ verified.
   Linux master's `io_uring_get_unmapped_area` gives `EINVAL`. This follows
   master once the test runners' kernel does.
   The features are Linux
-  6.12's. A pseudo-terminal's read waits in
+  6.12's, so `IORING_FEAT_RW_ATTR` and `_NO_IOWAIT` are not reported,
+  though `IORING_ENTER_NO_IOWAIT` is taken. A pseudo-terminal's read waits in
   `io_uring_enter` instead of waiting for its file as a pipe's read does. A file that is never read (an epoll instance, a ring)
   fails with `EINVAL` at once, where Linux first waits for it to be ready.
   An `IORING_OP_ASYNC_CANCEL` with `IORING_ASYNC_CANCEL_OP` and an

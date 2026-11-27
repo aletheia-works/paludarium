@@ -507,8 +507,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
   `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
-  だけです。Linux 6.12 のほかの操作は `EOPNOTSUPP` で完了し、Linux 7.0 がそのあとに加えた操作
-  （`IORING_OP_RECV_ZC` から）は 6.12 と同じく `EINVAL` で失敗します。ソケットの要求のうち、マルチショットの
+  だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
   `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
@@ -528,9 +527,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   残します（Linux は取り消します）。自分の要求にポーリングされるリングは、その要求が終わるまで
   残ります。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
-  `_REGISTERED_FD_ONLY` と、Linux 7.0 が `_NO_SQARRAY` のあとに加えたフラグ（`_HYBRID_IOPOLL` から）は
-  `EINVAL` です。`io_uring_enter` のフラグも、`IORING_ENTER_ABS_TIMER` のあとに 7.0 が加えたもの
-  （`_EXT_ARG_REG` と `_NO_IOWAIT`）は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
+  `_REGISTERED_FD_ONLY`、`_HYBRID_IOPOLL`、`_CQE_MIXED`、`_SQE_MIXED`、`_SQ_REWIND` は
+  `EINVAL` です。待つための領域は登録できない（`IORING_REGISTER_MEM_REGION`）ので、
+  `IORING_ENTER_EXT_ARG_REG` で待つと `EFAULT` で失敗します（大きさが `struct io_uring_reg_wait`
+  のものでなければ `EINVAL`）。`io_uring_register` は `IORING_REGISTER_PROBE`、
   `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_BUFFERS2`、
   `IORING_REGISTER_BUFFERS_UPDATE`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
@@ -554,7 +554,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   リングのどの領域でもないオフセットのマッピングは、差分テストを走らせるカーネルである
   Linux 7.0 と同じく `ENOMEM` です。Linux master の `io_uring_get_unmapped_area` は `EINVAL` を
   返します。テストを走らせるカーネルが追いつけば master に合わせます。
-  機能は Linux 6.12 のものです。疑似端末の読み出しは、パイプの読み出しのように
+  機能は Linux 6.12 のものなので、`IORING_FEAT_RW_ATTR` と `_NO_IOWAIT` は報告しませんが、
+  `IORING_ENTER_NO_IOWAIT` は受け付けます。疑似端末の読み出しは、パイプの読み出しのように
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。
   読めないファイル（epoll のインスタンス、リング）は、Linux が先に準備を待つところで、すぐに
   `EINVAL` で失敗します。`IORING_ASYNC_CANCEL_OP` と `IORING_OP_LAST` 以降の操作を持つ

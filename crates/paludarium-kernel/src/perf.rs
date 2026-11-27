@@ -792,11 +792,19 @@ impl Event {
     /// What of `counts` its counter counts, in user mode and in the kernel,
     /// with nothing left out.
     fn of_all_counts(&self, counts: crate::Counts) -> (u64, u64) {
-        let [faults, kernel_faults, switches, migrations, major_faults] = counts;
+        let [
+            faults,
+            kernel_faults,
+            switches,
+            migrations,
+            major_faults,
+            unfinished_faults,
+        ] = counts;
         match self.counter {
-            Counter::Faults(crate::FaultKind::All) => {
-                (faults, kernel_faults.saturating_add(major_faults))
-            }
+            Counter::Faults(crate::FaultKind::All) => (
+                faults.saturating_add(unfinished_faults),
+                kernel_faults.saturating_add(major_faults),
+            ),
             Counter::Faults(crate::FaultKind::Minor) => (faults, kernel_faults),
             Counter::Faults(crate::FaultKind::Major) => (0, major_faults),
             Counter::Switches => (0, switches),
@@ -2533,6 +2541,35 @@ mod tests {
         assert_eq!(addresses(All, 2, 1), [0xb000]);
         // None of the thread's own code's is major.
         assert!(usage.fault_addresses(false, Major, 1, 1)[0] == At::default());
+    }
+
+    #[test]
+    fn an_unfinished_fault_is_a_page_fault_and_no_minor_one() {
+        use crate::FaultKind::{All, Minor};
+        use paludarium_mmu::faults::{At, Sink};
+        paludarium_mmu::faults::trace_addresses();
+        let at = |addr| At {
+            addr,
+            present: false,
+        };
+        let usage = crate::Usage::default();
+        // Minor, unfinished (a wait a signal ended), minor.
+        usage.faults.store(1, Ordering::SeqCst);
+        usage.fault(false, false, 1, at(0x1000));
+        usage.unfinished_fault(at(0x2000));
+        usage.faults.store(2, Ordering::SeqCst);
+        usage.fault(false, false, 2, at(0x3000));
+        let addresses = |kind, counted, n| {
+            usage
+                .fault_addresses(false, kind, counted, n)
+                .iter()
+                .map(|f| f.addr)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(addresses(All, 3, 3), [0x1000, 0x2000, 0x3000]);
+        assert_eq!(addresses(Minor, 2, 2), [0x1000, 0x3000]);
+        assert_eq!(usage.counts(), [2, 0, 0, 0, 0, 1]);
+        assert_eq!(usage.fault_counts().minor, 2);
     }
 
     #[test]

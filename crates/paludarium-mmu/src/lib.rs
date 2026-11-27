@@ -406,6 +406,10 @@ pub mod faults {
     pub fn trace_addresses() {
         ADDRESSES.store(true, Ordering::SeqCst);
     }
+    /// Whether [`trace_addresses`] asked for them.
+    pub fn addresses_traced() -> bool {
+        ADDRESSES.load(Ordering::Relaxed)
+    }
 
     std::thread_local! {
         static TAKEN: Cell<u64> = const { Cell::new(0) };

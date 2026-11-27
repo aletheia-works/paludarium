@@ -2305,13 +2305,17 @@ static int case_held(void) {
    the kernel's copy for a read(2) or a write(2) is not tried under that
    lock first, so its retry is FAULT_FLAG_TRIED: a major fault. A
    get_user_pages population that waited finds the page there and counts
-   nothing, nor does a write to a page a fill left writable. The faulting
+   nothing, nor does a write to a page a fill left writable. A wait that a
+   signal ends is not tried again (fault_signal_pending) and counts
+   nothing; the access faults again once the handler returns. The faulting
    thread reads its own getrusage(RUSAGE_THREAD) and page-faults,
    minor-faults and major-faults events around the one access. */
 struct counted {
     char *at;
     int how; /* 0 a read, 1 a write, 2 MADV_POPULATE_WRITE, 3 read(2) into it, 4 write(2) from it */
     volatile int ready;
+    volatile pid_t tid;
+    int again; /* a signal's wait: whether the access faulted again */
     long minor, major;
     long long faults, minor_events, major_events;
 };
@@ -2333,6 +2337,7 @@ static void *counted_access(void *arg) {
     struct rusage was, now;
     for (int i = 0; i < 3; i++) read(events[i], &before[i], 8);
     getrusage(RUSAGE_THREAD, &was);
+    c->tid = (pid_t)syscall(SYS_gettid);
     c->ready = 1;
     if (c->how == 0) (void)*(volatile char *)c->at;
     if (c->how == 1) *(volatile char *)c->at = 'w';
@@ -2379,6 +2384,15 @@ static void by_continue(int fd, struct counted *c) {
 }
 static void by_unregister(int fd, struct counted *c) {
     unreg(fd, c->at, PAGE);
+}
+/* A signal ends the wait; the fault the access then takes again is
+   served by a copy. */
+static void by_signal_then_copy(int fd, struct counted *c) {
+    wait_blocked(c->tid);
+    syscall(SYS_tgkill, getpid(), c->tid, SIGUSR1);
+    struct uffd_msg msg;
+    c->again = wait_message(fd) == 1 && read(fd, &msg, sizeof msg) == sizeof msg;
+    by_copy(fd, c);
 }
 
 /* Fields `from` and the one after of /proc/self/stat, counted from 1:
@@ -2431,6 +2445,14 @@ static int case_major(void) {
     counted("protected write, unprotect", fd, &(struct counted){.at = base + 2 * PAGE, .how = 1}, by_unprotect);
     counted("populate, copy", fd, &(struct counted){.at = base + 3 * PAGE, .how = 2}, by_copy);
     counted("read, unregister", fd, &(struct counted){.at = base + 4 * PAGE, .how = 0}, by_unregister);
+    struct sigaction handler = {0};
+    handler.sa_handler = on_signal;
+    sigaction(SIGUSR1, &handler, NULL);
+    signalled = 0;
+    struct counted waits = {.at = anon(PAGE), .how = 0};
+    reg(fd, waits.at, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+    counted("read, signal, copy", fd, &waits, by_signal_then_copy);
+    printf("signal: handled %d faulted again %d\n", signalled, waits.again);
     pipe(kernel_pipe);
     write(kernel_pipe[1], "k", 1);
     counted("read(2), copy", fd, &(struct counted){.at = base + 5 * PAGE, .how = 3}, by_copy);

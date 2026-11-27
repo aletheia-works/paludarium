@@ -1295,7 +1295,10 @@ kernel.
   Unless a signal is to be taken first, the retry counts as a minor fault
   of the thread's own code (`ru_minflt`, `page-faults`, `minor-faults`),
   whether it brings the page in or not: its first try ran under the VMA's
-  lock, whose retry is not `FAULT_FLAG_TRIED`. The fault of a kernel
+  lock, whose retry is not `FAULT_FLAG_TRIED`. A wait that a signal to be
+  taken ends is no retry, and counts in `page-faults` alone, as Linux
+  counts a fault there as it starts; the instruction then faults again
+  after the signal's handler. The fault of a kernel
   access, which waits as described above, is a major one: a kernel-mode
   fault does not run under the VMA's lock first, so its retry is
   `FAULT_FLAG_TRIED`, and it counts once (`ru_majflt`, `page-faults`,

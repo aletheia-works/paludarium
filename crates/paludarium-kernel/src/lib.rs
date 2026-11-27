@@ -251,7 +251,10 @@ impl Eq for CpuAccount {}
 /// through `get_user_pages` are kept apart (`forced_faults`), as they count
 /// to its `min_flt` but are no `perf` event, and so are its major faults
 /// (`major_faults`, Linux's `maj_flt`): those of the kernel's accesses that
-/// a `userfaultfd` had try again.
+/// a `userfaultfd` had try again. So are the faults of its own code that
+/// ended with no page (`unfinished_faults`): a `userfaultfd`'s wait that a
+/// signal ended, which `page-faults` counts as the fault starts, and no
+/// `min_flt` or `minor-faults` as it never ends.
 #[derive(Debug, Default)]
 pub(crate) struct Usage {
     /// Grows only, under [`Self::time`]'s lock.
@@ -265,6 +268,7 @@ pub(crate) struct Usage {
     pub(crate) kernel_faults: std::sync::atomic::AtomicU64,
     pub(crate) forced_faults: std::sync::atomic::AtomicU64,
     pub(crate) major_faults: std::sync::atomic::AtomicU64,
+    pub(crate) unfinished_faults: std::sync::atomic::AtomicU64,
     pub(crate) switches: std::sync::atomic::AtomicU64,
     pub(crate) migrations: std::sync::atomic::AtomicU64,
     /// The CPU it was last seen on (Linux's `task_cpu`), which
@@ -403,16 +407,18 @@ impl Faults {
 }
 
 /// What a [`Usage`] counts on each CPU, in [`CpuCounts`]'s order.
-pub(crate) type Counts = [u64; 5];
+pub(crate) type Counts = [u64; 6];
 
-/// One of a thread's latest faults: the minor and major faults it had
-/// counted in its own code or in the kernel's work with this one, whether
-/// this one is major, and where it was.
+/// One of a thread's latest faults: the minor, major and unfinished faults
+/// it had counted in its own code or in the kernel's work with this one,
+/// which of them this one is ([`FaultKind::All`] for an unfinished one,
+/// which `page-faults` alone counts), and where it was.
 #[derive(Clone, Copy, Debug)]
 struct FaultAt {
     minor: u64,
     major: u64,
-    is_major: bool,
+    unfinished: u64,
+    kind: FaultKind,
     at: paludarium_mmu::faults::At,
 }
 
@@ -426,8 +432,8 @@ pub(crate) enum FaultKind {
 }
 
 /// What a thread's [`Usage`] counted on each CPU: its minor faults in its
-/// own code and the kernel's, its switches, its migrations and its major
-/// faults, in that order.
+/// own code and the kernel's, its switches, its migrations, its major
+/// faults and its unfinished ones, in that order.
 /// Those of the CPU it is on are what it counted since it came there; a
 /// migration counts to the CPU it comes to, as Linux's
 /// `perf_sw_event_sched` of `PERF_COUNT_SW_CPU_MIGRATIONS` runs there.
@@ -512,6 +518,7 @@ impl Usage {
             self.switches.load(SeqCst),
             self.migrations.load(SeqCst),
             self.major_faults.load(SeqCst),
+            self.unfinished_faults.load(SeqCst),
         ]
     }
     /// The thread is on `cpu` now: what it counted since it came to the
@@ -527,7 +534,7 @@ impl Usage {
             Some((was, since)) => {
                 let was = was as usize;
                 if counts.done.len() <= was {
-                    counts.done.resize(was + 1, [0; 5]);
+                    counts.done.resize(was + 1, [0; 6]);
                 }
                 for (done, (now, since)) in counts.done[was].iter_mut().zip(now.iter().zip(since)) {
                     *done = done.saturating_add(now.saturating_sub(since));
@@ -535,7 +542,7 @@ impl Usage {
                 counts.on = Some((cpu, now));
             }
             // What it counted before it was first seen is the first CPU's.
-            None => counts.on = Some((cpu, [0; 5])),
+            None => counts.on = Some((cpu, [0; 6])),
         }
     }
     /// Another thread's `sched_setaffinity` left it the mask whose lowest
@@ -569,7 +576,7 @@ impl Usage {
         since[2] = since[2].saturating_add(n);
         let cpu = cpu as usize;
         if counts.done.len() <= cpu {
-            counts.done.resize(cpu + 1, [0; 5]);
+            counts.done.resize(cpu + 1, [0; 6]);
         }
         counts.done[cpu][2] = counts.done[cpu][2].saturating_add(n);
     }
@@ -606,7 +613,7 @@ impl Usage {
             let counts = self.counts_on(cpu);
             let cpu = cpu as usize;
             if sums.len() <= cpu {
-                sums.resize(cpu + 1, [0; 5]);
+                sums.resize(cpu + 1, [0; 6]);
             }
             for (sum, count) in sums[cpu].iter_mut().zip(counts) {
                 *sum = sum.saturating_add(count);
@@ -638,9 +645,9 @@ impl Usage {
         // Its number among those of `kind`, and whether it is one: each
         // count grows with the faults, so they are in its order.
         let nth = |fault: &FaultAt| match kind {
-            FaultKind::All => (fault.minor + fault.major, true),
-            FaultKind::Minor => (fault.minor, !fault.is_major),
-            FaultKind::Major => (fault.major, fault.is_major),
+            FaultKind::All => (fault.minor + fault.major + fault.unfinished, true),
+            FaultKind::Minor => (fault.minor, fault.kind == FaultKind::Minor),
+            FaultKind::Major => (fault.major, fault.kind == FaultKind::Major),
         };
         // Those before are gone.
         let known = n.min(FAULT_ADDRESSES as u64);
@@ -676,6 +683,30 @@ impl Usage {
             .load(SeqCst)
             .saturating_add(self.kernel_faults.load(SeqCst))
             .saturating_add(self.forced_faults.load(SeqCst))
+    }
+    /// A fault of its own code `at` ended with no page: one more of the
+    /// faults `page-faults` alone counts.
+    pub(crate) fn unfinished_fault(&self, at: paludarium_mmu::faults::At) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut addresses = self
+            .fault_addresses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nth = self.unfinished_faults.fetch_add(1, SeqCst).wrapping_add(1);
+        if !paludarium_mmu::faults::addresses_traced() {
+            return;
+        }
+        let latest = &mut addresses[0];
+        if latest.len() == FAULT_ADDRESSES {
+            latest.pop_front();
+        }
+        latest.push_back(FaultAt {
+            minor: self.faults.load(SeqCst),
+            major: 0,
+            unfinished: nth,
+            kind: FaultKind::All,
+            at,
+        });
     }
     /// Its minor and major faults (Linux's `min_flt` and `maj_flt`).
     pub(crate) fn fault_counts(&self) -> Faults {
@@ -715,6 +746,12 @@ impl paludarium_mmu::faults::Sink for Usage {
             (false, true) => load(&self.major_faults),
             (false, false) => 0,
         };
+        // Its own code alone has unfinished ones.
+        let unfinished = if kernel {
+            0
+        } else {
+            load(&self.unfinished_faults)
+        };
         if latest.len() == FAULT_ADDRESSES {
             latest.pop_front();
         }
@@ -722,7 +759,12 @@ impl paludarium_mmu::faults::Sink for Usage {
         latest.push_back(FaultAt {
             minor,
             major: major_count,
-            is_major: major,
+            unfinished,
+            kind: if major {
+                FaultKind::Major
+            } else {
+                FaultKind::Minor
+            },
             at,
         });
     }
@@ -1431,6 +1473,19 @@ impl Kernel {
                 access.write,
                 access.fetch,
             );
+        } else if !sigbus {
+            // Not tried again, it ends here: `page-faults` counted it as it
+            // started (`do_user_addr_fault`), and `mm_account_fault` counts
+            // no `VM_FAULT_RETRY`. The instruction faults again after the
+            // signal.
+            thread
+                .state
+                .cpu
+                .used
+                .unfinished_fault(paludarium_mmu::faults::At {
+                    addr: access.address,
+                    present: access.reason == paludarium_mmu::UserfaultReason::Protected,
+                });
         }
         if sigbus {
             signals::queue(

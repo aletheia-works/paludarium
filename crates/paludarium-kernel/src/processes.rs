@@ -4549,6 +4549,11 @@ impl Kernel {
         if let Some(page) = poisoned {
             crate::signals::queue(c.process, crate::syscalls::poisoned_sigbus(page));
         }
+        // As `madvise`'s, where Linux's `vector_madvise` tries again until
+        // a fatal signal.
+        if result == Err(paludarium_mmu::GUARD_RESTART) {
+            return Err(crate::syscalls::restart_guard_install(&mut c, 440));
+        }
         result
     }
     /// `process_mrelease(pidfd, flags)`, as Linux master's: `flags` must be

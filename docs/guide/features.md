@@ -1140,7 +1140,14 @@ kernel.
   leaving pages without contents. Sealed memory whose pages may not be
   discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
   which Linux maps `VM_DONTEXPAND`, huge pages and the vDSO's data take
-  neither advice (`EINVAL`).
+  neither advice (`EINVAL`). On memory that is not private anonymous
+  memory, a uffd-wp marker stops an install, as Linux's
+  `madvise_guard_install` meets one its zap keeps (and the zap leaves one
+  for each write-protected page): the pages before it take guards, the
+  rest lose their entries, and the call runs again until a signal is to
+  be taken, and again after its handler (`ERESTARTNOINTR`), so that it
+  does not return while the marker is there. Private anonymous memory
+  loses its markers to the guards.
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
   `MADV_NOHUGEPAGE` or in a space that `PR_SET_THP_DISABLE` disabled for

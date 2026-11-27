@@ -3426,7 +3426,28 @@ pub(crate) fn madvise(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if let Some(page) = poisoned {
         signals::queue(c.process, poisoned_sigbus(page));
     }
+    if result == Err(paludarium_mmu::GUARD_RESTART) {
+        return Err(restart_guard_install(c, nr::MADVISE));
+    }
     result.map(|()| 0)
+}
+
+/// An install of guards that has to start again
+/// ([`paludarium_mmu::GUARD_RESTART`]), by the call `number`: Linux's
+/// `madvise_guard_install` gives `restart_syscall`, and the call runs again
+/// and again, until a signal is to be taken and after its handler too
+/// (`ERESTARTNOINTR`). Here the thread waits for the signal, and the call is
+/// to run again after any handler.
+pub(crate) fn restart_guard_install(c: &mut Context<'_>, number: u64) -> Errno {
+    let error = match wait_for_signal(c) {
+        Err(error) => error,
+        Ok(_) => Errno(4),
+    };
+    if error == Errno(4) {
+        c.process.restart = Some(number);
+        c.process.seccomp_restart = Some(true);
+    }
+    error
 }
 
 /// `madvise(addr, len, advice)` on `mem`, which `process_madvise` gives

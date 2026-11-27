@@ -846,6 +846,44 @@ fn uffdio_continue_maps_a_memfd_page_registered_for_minor_faults() {
 }
 
 #[test]
+fn a_guard_install_stops_at_a_shmem_marker_its_zap_keeps() {
+    let mut f = fixture();
+    let fd = f.ready(NONBLOCK, 0);
+    f.mem.write(GuestAddr(DATA), b"uffd\0").unwrap();
+    let file = f.ret(319, &[DATA, 0]);
+    assert_eq!(f.ret(77, &[file, 3 * PAGE]), 0);
+    let at = f.ret(9, &[0, 3 * PAGE, 3, 1, file, 0]);
+    assert!((at as i64) > 0, "{at:#x}");
+    assert_eq!(f.ioctl(fd, REGISTER, &[at, 3 * PAGE, 2, 0]).0, 0);
+    // The second page has an entry, the third none; both are protected.
+    f.mem.write(GuestAddr(at + PAGE), b"w").unwrap();
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[at + PAGE, 2 * PAGE, 1]).0, 0);
+    // The first page takes a guard; the zap leaves a marker for the
+    // protected entry, and the install stops there, to be restarted.
+    assert_eq!(
+        f.mem.guard(GuestAddr(at), at + 3 * PAGE, true),
+        Err(paludarium_mmu::GUARD_RESTART)
+    );
+    assert!(f.mem.has_guards(GuestAddr(at), at + PAGE));
+    assert!(!f.mem.has_guards(GuestAddr(at + PAGE), at + 3 * PAGE));
+    let pagemap = f.mem.view().pagemap(at, 3).unwrap();
+    let (present, uffd_wp) = (1 << 63, 1 << 57);
+    assert_eq!(
+        pagemap.iter().map(|e| e & uffd_wp != 0).collect::<Vec<_>>(),
+        [false, true, true]
+    );
+    assert!(pagemap.iter().all(|e| e & present == 0), "{pagemap:x?}");
+    // Its contents stay in the file.
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[at + PAGE, 2 * PAGE, 0]).0, 0);
+    let mut byte = [0];
+    f.mem.read(GuestAddr(at + PAGE), &mut byte).unwrap();
+    assert_eq!(byte, *b"w");
+    // With no marker left, the install takes the rest.
+    assert_eq!(f.mem.guard(GuestAddr(at), at + 3 * PAGE, true), Ok(()));
+    assert!(f.mem.has_guards(GuestAddr(at + 2 * PAGE), at + 3 * PAGE));
+}
+
+#[test]
 fn wp_unpopulated_protects_the_pages_that_have_none() {
     let mut f = fixture();
     let protected = |f: &Fixture, addr: u64| {

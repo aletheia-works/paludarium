@@ -1016,7 +1016,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ガードを外し、内容のないページを残します。ページを捨てられない封印したメモリには
   ガードを置けません（`EPERM`）。Linux が `VM_DONTEXPAND` でマップする AIO と
   `io_uring` のリング、ヒュージページ、vDSO のデータは、どちらの指定も受け付けません
-  （`EINVAL`）。
+  （`EINVAL`）。プライベートな匿名メモリでないメモリでは、uffd-wp マーカーがガードの
+  設定を止めます。Linux の `madvise_guard_install` が、エントリーを外す（zap）ときに
+  残るマーカーに出会うのと同じです（zap は書き込み保護したページにもマーカーを残します）。
+  マーカーより前のページはガードになり、残りのページはエントリーを失い、呼び出しは
+  シグナルを受け取るまで、そしてそのハンドラーの後もやり直します（`ERESTARTNOINTR`）。
+  そのため、マーカーがある間は戻りません。プライベートな匿名メモリでは、マーカーは
+  ガードに置き換わります。
   `MADV_COLLAPSE` は、Linux の `madvise_collapse` と同じく VMA ごとにプライベートな
   anonymous メモリと shmem のページキャッシュをまとめます。`MADV_NOHUGEPAGE` の VMA や
   `PR_SET_THP_DISABLE` がすべての VMA で止めた空間の VMA、

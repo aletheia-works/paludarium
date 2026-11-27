@@ -105,8 +105,12 @@ impl Kernel {
         thread.cpu.gpr[reg::RAX] = Errno::ENOSYS.to_syscall_return();
         let skipped = match self.vsyscall_seccomp(thread, mem, number, address) {
             Ok(skipped) => skipped,
-            // "seccomp tried to change syscall nr or ip" (`force_exit_sig`).
-            Err(()) => return self.terminate(thread, signal::SIGSYS),
+            // "seccomp tried to change syscall nr or ip" (`force_exit_sig`,
+            // which leaves the action immutable).
+            Err(()) => {
+                self.group.force_exit_action(signal::SIGSYS);
+                return self.terminate(thread, signal::SIGSYS);
+            }
         };
         thread.state.ptrace.orig_rax = u64::MAX;
         match skipped {

@@ -5302,7 +5302,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ブロックされずに無視されるシグナルは数えません。マスクが変わるのもエッジです。
   signalfd のディスクリプタに `signalfd` を呼ぶと
   マスクが変わります（ほかのファイルなら `EINVAL`）。`SIGKILL` と `SIGSTOP` は
-  マスクに入りません。書き込みは `EINVAL`、`pread` と `pwrite` は `ESPIPE`、`lseek` は
+  マスクに入りません。アクションが `SA_IMMUTABLE`（下に書きます）のシグナルは、Linux master の
+  `refine_sigmask` が除くのと同じく、読み込みでも poll でも取りません（v7.0 は取ります）。
+  書き込みは `EINVAL`、`pread` と `pwrite` は `ESPIPE`、`lseek` は
   Linux の `noop_llseek` と同じく 0 を返します。
 
 - Linux の `dnotify.c` と同じく、ディレクトリの通知（dnotify）を扱います。ディレクトリの
@@ -6162,6 +6164,12 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   フレームは前のフレームの上に、そのハンドラが動くときのマスクで積むので、最後のフレームの
   ハンドラが最初に動き、そのマスクがブロックするシグナルは、その `rt_sigreturn` まで待ちます。
   スレッドが中にいたシステムコールを再開できるのは、最初のものだけです。
+- `sigaction` は Linux が知っているフラグ（`UAPI_SA_FLAGS`: `SA_NOCLDSTOP`、`SA_NOCLDWAIT`、
+  `SA_SIGINFO`、`SA_ONSTACK`、`SA_RESTART`、`SA_NODEFER`、`SA_RESETHAND`、
+  `SA_EXPOSE_TAGBITS`、`SA_RESTORER`）だけを残して見せるので、プログラムは
+  `SA_UNSUPPORTED` がないとわかります。Linux の `rt_sigaction` と同じく、読めない新しい
+  アクションはシグナルを確かめる前に `EFAULT`、書けない古いアクションは変更の後に
+  `EFAULT` です。
 - シグナルを無視にする `sigaction`（`SIG_IGN` か、既定で無視される `SIGCHLD`、`SIGCONT`、
   `SIGURG`、`SIGWINCH` への `SIG_DFL`）は、Linux の `do_sigaction` と同じく、プロセスと
   すべてのスレッドで保留中のそのシグナルを捨てます。その後に送られたブロック中の
@@ -6268,7 +6276,11 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   レジスタ全体を見て、いちばん低いアクションが決めます。
   `SECCOMP_RET_KILL_PROCESS` はプロセスを `SIGSYS` で終わらせます。
   `SECCOMP_RET_KILL_THREAD` はスレッドを、最後のスレッドならプロセスを終わらせます
-  （X が 0 の割り算は 0 を返すので、このアクションになります）。
+  （X が 0 の割り算は 0 を返すので、このアクションになります）。プロセスを終わらせる
+  ときは、`force_sig_seccomp` が強制するのと同じく、`SIGSYS` のアクションを既定にして
+  `SA_IMMUTABLE` にします。アクションを共有するプロセス（`CLONE_SIGHAND`）では、その後
+  `SIGSYS` への `sigaction` が `EINVAL` になり、そのプロセスが fork したプロセスもそれを
+  写し、トレーサーにはその配送での停止が見えず、`execve` で消えます。
   `SECCOMP_RET_TRAP` は `SIGSYS` を強制し、`SYS_SECCOMP`、`si_errno` のデータ、
   呼び出しのアドレス、番号、アーキテクチャを渡し、`rax` には呼び出しの番号を戻します。
   `SECCOMP_RET_ERRNO` はデータ（4095 まで）をエラーとして返します。

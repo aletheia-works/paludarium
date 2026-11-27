@@ -6215,7 +6215,9 @@ kernel.
   waiting counts, a standard signal already pending or one ignored and
   unblocked does not; a new mask is an edge too. `signalfd` on a
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);
-  `SIGKILL` and `SIGSTOP` never enter one. A write gives `EINVAL`, `pread`
+  `SIGKILL` and `SIGSTOP` never enter one, and neither a read nor a poll
+  takes a signal whose action is `SA_IMMUTABLE` (below), as Linux master's
+  `refine_sigmask` leaves it out (v7.0 takes it). A write gives `EINVAL`, `pread`
   and `pwrite` `ESPIPE`, and `lseek` 0, as Linux's `noop_llseek`.
 
 - Directory notifications (dnotify), as Linux's `dnotify.c`: `fcntl`'s
@@ -7203,6 +7205,12 @@ one only with an `--allow-net`.
   goes on the one before, with the mask that handler runs with, so the last
   frame's handler runs first, and a signal that mask blocks waits for its
   `rt_sigreturn`. Only the first can restart the call the thread was in.
+- `sigaction` keeps and shows only the flags Linux knows (`UAPI_SA_FLAGS`:
+  `SA_NOCLDSTOP`, `SA_NOCLDWAIT`, `SA_SIGINFO`, `SA_ONSTACK`, `SA_RESTART`,
+  `SA_NODEFER`, `SA_RESETHAND`, `SA_EXPOSE_TAGBITS`, `SA_RESTORER`), so a
+  program sees that `SA_UNSUPPORTED` is not. A new action it cannot read is
+  `EFAULT` before the signal is checked, and an old action it cannot write
+  is `EFAULT` after the change is made, as in Linux's `rt_sigaction`.
 - A `sigaction` that makes a signal ignored (`SIG_IGN`, or `SIG_DFL` for
   `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH`, which are ignored by
   default) discards its pending instances in the process and in every thread,
@@ -7315,7 +7323,12 @@ one only with an `--allow-net`.
   instruction and its six argument registers, whole, and the lowest action
   decides. `SECCOMP_RET_KILL_PROCESS` ends the process by `SIGSYS`, and
   `SECCOMP_RET_KILL_THREAD` the thread, or the process when it is the last
-  thread (a division by an X of 0 returns 0, which is this action);
+  thread (a division by an X of 0 returns 0, which is this action). A kill
+  of the process leaves `SIGSYS`'s action at its default and
+  `SA_IMMUTABLE`, as `force_sig_seccomp` forces it: a process that shares
+  the actions (`CLONE_SIGHAND`) then gets `EINVAL` from `sigaction` for
+  `SIGSYS`, a process it forks copies that, a tracer sees no stop for its
+  delivery, and `execve` clears it;
   `SECCOMP_RET_TRAP` forces a `SIGSYS` with `SYS_SECCOMP`, the data in
   `si_errno`, the call's address, number and architecture, and the call's
   number back in `rax`; `SECCOMP_RET_ERRNO` returns its data, at most 4095,

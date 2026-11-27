@@ -3,7 +3,9 @@
 //! `signalfd_read` takes them with `dequeue_signal` from `current`: the
 //! thread's own queue first, then the process's shared one. `poll` and
 //! `epoll` see the same thread's signals, as `signalfd_poll` does, through
-//! what [`observe`] last recorded for the calling thread.
+//! what [`observe`] last recorded for the calling thread. Neither takes a
+//! signal whose action is `SA_IMMUTABLE`, as Linux master's
+//! `refine_sigmask` leaves them out (v7.0 does not).
 use crate::events::{CLOEXEC, IN, NONBLOCK};
 use crate::syscalls::{Context, Outcome};
 use crate::{SignalInbox, ThreadGroup, ThreadState, signals};
@@ -25,7 +27,8 @@ thread_local! {
     /// have come for it and its process so far, and a count bumped whenever
     /// that grows: one for each signal queued, as Linux's `signalfd_notify`
     /// wakes the file for each (an edge for edge-triggered epoll).
-    static VIEW: Cell<View> = const { Cell::new(View { thread: 0, set: 0, arrivals: 0, epoch: 0 }) };
+    static VIEW: Cell<View> =
+        const { Cell::new(View { thread: 0, set: 0, immutable: 0, arrivals: 0, epoch: 0 }) };
 }
 #[derive(Clone, Copy)]
 struct View {
@@ -33,6 +36,8 @@ struct View {
     /// records, as nothing came since it last looked.
     thread: usize,
     set: u64,
+    /// The signals whose actions are `SA_IMMUTABLE`, which no file takes.
+    immutable: u64,
     arrivals: u64,
     epoch: u64,
 }
@@ -67,6 +72,7 @@ pub(crate) fn observe(process: &ThreadState, inbox: &SignalInbox, group: &Thread
         view.set(View {
             thread,
             set,
+            immutable: signals::immutable_set(&process.signal_actions),
             arrivals,
             epoch,
         });
@@ -178,7 +184,14 @@ fn read_signals(
     }
     let mut taken = 0;
     while taken < records {
-        let mask = file.mask.load(Ordering::SeqCst);
+        // Again each time, as the actions may change while it waits.
+        let immutable = signals::immutable_set(
+            &c.group
+                .shared_actions()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mask = file.mask.load(Ordering::SeqCst) & !immutable;
         let ticket = c.files.readiness.token.value();
         if let Some(signal) = take(c, mask) {
             let record = siginfo(&signals::siginfo(c.process, &signal));
@@ -312,7 +325,7 @@ fn siginfo(info: &[u8; 128]) -> [u8; RECORD] {
 impl FileHandle for SignalFile {
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         let view = VIEW.with(Cell::get);
-        let ready = view.set & self.mask.load(Ordering::SeqCst) != 0;
+        let ready = view.set & self.mask.load(Ordering::SeqCst) & !view.immutable != 0;
         let epoch = view.epoch.wrapping_add(self.updates.load(Ordering::SeqCst));
         Ok((u32::from(ready) * IN, epoch, 0))
     }
@@ -406,16 +419,20 @@ mod tests {
     #[test]
     fn readiness_follows_the_view() {
         let file = SignalFile::new(1 << 9, NONBLOCK);
-        let view = |set, epoch| View {
+        let view = |set, immutable, epoch| View {
             thread: 0,
             set,
+            immutable,
             arrivals: 0,
             epoch,
         };
-        VIEW.with(|v| v.set(view(1 << 9, 4)));
+        VIEW.with(|v| v.set(view(1 << 9, 0, 4)));
         assert_eq!(file.readiness(), Ok((IN, 4, 0)));
-        VIEW.with(|v| v.set(view(1 << 10, 5)));
+        VIEW.with(|v| v.set(view(1 << 10, 0, 5)));
         assert_eq!(file.readiness(), Ok((0, 5, 0)));
+        // A signal whose action is SA_IMMUTABLE does not make it readable.
+        VIEW.with(|v| v.set(view(1 << 9, 1 << 9, 6)));
+        assert_eq!(file.readiness(), Ok((0, 6, 0)));
         assert_eq!(file.flags(), 2 | NONBLOCK);
         assert_eq!(file.read(&mut [0; 127]), Err(Errno::EINVAL));
         assert_eq!(file.read(&mut [0; 128]), Err(Errno::EAGAIN));

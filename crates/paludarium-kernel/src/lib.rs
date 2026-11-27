@@ -1314,6 +1314,8 @@ impl Kernel {
                 if !process && self.group.active_threads() > 1 {
                     Next::Exit(ExitStatus::Signaled(signal::SIGSYS))
                 } else {
+                    // `force_sig_seccomp` forces it as `HANDLER_EXIT`.
+                    self.group.force_exit_action(signal::SIGSYS);
                     self.terminate_with(thread, signal::SIGSYS, seccomp::full_siginfo(&siginfo))
                 }
             }
@@ -1736,9 +1738,17 @@ impl Kernel {
         let mut delivered = false;
         while let Some(index) = signals::next_pending(&thread.state, false) {
             let mut signal = thread.state.pending.remove(index);
-            // A traced thread reports each signal but SIGKILL to its tracer
-            // first, which may cancel or change it (`ptrace_signal`).
-            if signal.number != signal::SIGKILL && self.traced(thread.tid) {
+            // A traced thread reports each signal but SIGKILL and one whose
+            // action is `SA_IMMUTABLE` to its tracer first, which may cancel
+            // or change it (`ptrace_signal`).
+            if signal.number != signal::SIGKILL
+                && thread
+                    .state
+                    .signal_actions
+                    .get(&signal.number)
+                    .is_none_or(|action| action.flags & signals::SA_IMMUTABLE == 0)
+                && self.traced(thread.tid)
+            {
                 match self.ptrace_signal(thread, signal, &mut restart) {
                     Some(given) => signal = given,
                     None => continue,

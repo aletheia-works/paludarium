@@ -4443,20 +4443,21 @@ pub(crate) fn write_words(mem: &AddressSpace, at: u64, words: &[u64]) -> Result<
     mem.write(GuestAddr(at), &bytes).map_err(|_| Errno::EFAULT)
 }
 
+/// `rt_sigaction`, in Linux's order: the size, the new action read, the
+/// signal, an action `SA_IMMUTABLE` (which neither changes nor shows), then
+/// the change, and only after it the old action written, so that an old
+/// action that cannot be written is EFAULT with the change made. The flags
+/// it keeps and shows are those of `UAPI_SA_FLAGS`.
 fn sys_rt_sigaction(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (sig, act, oldact, size) = (a[0], a[1], a[2], a[3]);
-    if size != SIGSET_SIZE || sig == 0 || sig > NSIG {
+    if size != SIGSET_SIZE {
         return err(Errno::EINVAL);
     }
-    if act != 0 && (sig == SIGKILL || sig == SIGSTOP) {
-        return err(Errno::EINVAL);
-    }
-    let key = i32::try_from(sig).unwrap_or(0);
     let new = if act != 0 {
         match read_words::<4>(c.mem, act) {
             Ok(w) => Some(SignalAction {
                 handler: w[0],
-                flags: w[1],
+                flags: w[1] & signals::UAPI_SA_FLAGS,
                 restorer: w[2],
                 mask: w[3] & !unblockable(),
             }),
@@ -4465,21 +4466,20 @@ fn sys_rt_sigaction(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     } else {
         None
     };
-    if oldact != 0 {
-        let old = c
-            .process
-            .signal_actions
-            .get(&key)
-            .copied()
-            .unwrap_or_default();
-        if let Err(e) = write_words(
-            c.mem,
-            oldact,
-            &[old.handler, old.flags, old.restorer, old.mask],
-        ) {
-            return err(e);
-        }
+    if sig == 0 || sig > NSIG || new.is_some() && (sig == SIGKILL || sig == SIGSTOP) {
+        return err(Errno::EINVAL);
     }
+    let key = i32::try_from(sig).unwrap_or(0);
+    let mut old = c
+        .process
+        .signal_actions
+        .get(&key)
+        .copied()
+        .unwrap_or_default();
+    if old.flags & signals::SA_IMMUTABLE != 0 {
+        return err(Errno::EINVAL);
+    }
+    old.flags &= signals::UAPI_SA_FLAGS;
     if let Some(new) = new {
         c.process.signal_actions.insert(key, new);
         // An ignored signal's pending instances go, as in Linux's
@@ -4488,6 +4488,15 @@ fn sys_rt_sigaction(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if new.handler == 1 || new.handler == 0 && matches!(key, 17 | 18 | 23 | 28) {
             c.group.discard_pending(key, c.process);
         }
+    }
+    if oldact != 0
+        && let Err(e) = write_words(
+            c.mem,
+            oldact,
+            &[old.handler, old.flags, old.restorer, old.mask],
+        )
+    {
+        return err(e);
     }
     ok(0)
 }

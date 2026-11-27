@@ -2435,6 +2435,18 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(n, a);
     }
+    /// Leaves signal `n`'s action at its default and `SA_IMMUTABLE`, as
+    /// Linux's `force_sig_info_to_task` does for `HANDLER_EXIT`: the other
+    /// fields stay. A process that shares the actions (`CLONE_SIGHAND`)
+    /// keeps it after this one ends, and a process forked from that one
+    /// copies it, until an `execve`.
+    pub(crate) fn force_exit_action(&self, n: i32) {
+        let actions = self.shared_actions();
+        let mut actions = actions.lock().unwrap_or_else(PoisonError::into_inner);
+        let action = actions.entry(n).or_default();
+        action.handler = 0;
+        action.flags |= signals::SA_IMMUTABLE;
+    }
 }
 impl Kernel {
     #[must_use]

@@ -361,3 +361,32 @@ fn signalfd_calls_as_linux() {
 
     assert_eq!(e.lines, EXPECTED.lines().collect::<Vec<_>>());
 }
+
+/// A signal whose action is `SA_IMMUTABLE` neither makes the file readable
+/// nor is read, and stays pending, as Linux master's `refine_sigmask`
+/// leaves it out; another signal of the mask is read as before.
+#[test]
+fn signalfd_leaves_out_an_immutable_actions_signal() {
+    let mut e = Env::new();
+    e.set(&[10, 31]);
+    e.block();
+    let fd = e.signalfd(-1, SFD_NONBLOCK);
+    assert!(fd >= 0, "{fd}");
+    e.k.group.force_exit_action(31);
+    e.kill_self(31);
+    assert_eq!(e.readable(fd), 0);
+    let n = e.call(READ, [fd as u64, BUFFER, RECORD as u64 * 2, 0, 0, 0]);
+    assert_eq!(n, -11);
+    assert_eq!(e.pending(31), 1);
+    e.kill_self(10);
+    assert_eq!(e.readable(fd), 1);
+    e.records(fd, 2);
+    assert_eq!(e.pending(31), 1);
+    assert_eq!(
+        e.lines,
+        [
+            "read 128 bytes",
+            "  signo 10 errno 0 code 0 pid-match 1 uid-match 1 status 0 int 0 tid 0 overrun 0",
+        ]
+    );
+}

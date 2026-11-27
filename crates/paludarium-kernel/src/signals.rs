@@ -10,6 +10,30 @@ pub(crate) const SA_ONSTACK: u64 = 0x0800_0000;
 pub(crate) const SA_NODEFER: u64 = 0x4000_0000;
 pub(crate) const SA_RESETHAND: u64 = 0x8000_0000;
 pub(crate) const SA_RESTART: u64 = 0x1000_0000;
+/// `SA_IMMUTABLE`, a bit of Linux's own: the action `force_exit_sig` and
+/// seccomp's kill leave, which `sigaction` may not change or read, a tracer
+/// does not see delivered, and a signal file does not take.
+pub(crate) const SA_IMMUTABLE: u64 = 0x0080_0000;
+/// The flags `sigaction` keeps of those it is given, and shows (Linux's
+/// `UAPI_SA_FLAGS`): SA_NOCLDSTOP, SA_NOCLDWAIT, SA_SIGINFO, SA_ONSTACK,
+/// SA_RESTART, SA_NODEFER, SA_RESETHAND, SA_EXPOSE_TAGBITS and SA_RESTORER.
+/// The others are cleared, so that a program can tell a flag is not known.
+pub(crate) const UAPI_SA_FLAGS: u64 = SA_NOCLDSTOP
+    | SA_NOCLDWAIT
+    | 4
+    | SA_ONSTACK
+    | SA_RESTART
+    | SA_NODEFER
+    | SA_RESETHAND
+    | 0x800
+    | 0x0400_0000;
+/// The signals whose actions are `SA_IMMUTABLE`.
+pub(crate) fn immutable_set(actions: &std::collections::BTreeMap<i32, SignalAction>) -> u64 {
+    actions
+        .iter()
+        .filter(|(n, a)| (1..=64).contains(*n) && a.flags & SA_IMMUTABLE != 0)
+        .fold(0, |set, (n, _)| set | 1 << (n - 1))
+}
 const FRAME_SIZE: usize = 1024;
 const UC: usize = 8;
 const SC: usize = UC + 40;

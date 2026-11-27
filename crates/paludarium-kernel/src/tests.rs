@@ -769,6 +769,61 @@ fn floating_point_fault_codes_terminate_with_sigfpe() {
     }
 }
 
+/// `rt_sigaction` keeps and shows only the flags of Linux's
+/// `UAPI_SA_FLAGS`, writes the old action only after the change, and is
+/// EINVAL for an action `SA_IMMUTABLE`, which it neither changes nor shows.
+#[test]
+fn signal_actions_keep_known_flags_and_an_immutable_one_stays() {
+    let mut f = fixture();
+    // SA_SIGINFO | SA_RESTORER, SA_UNSUPPORTED, SA_IMMUTABLE and a high bit.
+    let act = [
+        0x1234u64,
+        0x0400_0004 | 0x400 | 0x0080_0000 | 1 << 40,
+        0x5678,
+        0,
+    ];
+    for (i, w) in act.iter().enumerate() {
+        f.mem.write_u64(GuestAddr(DATA + 8 * i as u64), *w).unwrap();
+    }
+    assert_eq!(f.ret(nr::RT_SIGACTION, &[10, DATA, 0, 8]), 0);
+    assert_eq!(f.ret(nr::RT_SIGACTION, &[10, 0, DATA + 0x100, 8]), 0);
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(DATA + 0x108)).unwrap(),
+        0x0400_0004
+    );
+    // An old action it cannot write: EFAULT, with the new one set.
+    f.mem.write_u64(GuestAddr(DATA), 0x4321).unwrap();
+    assert_eq!(
+        f.ret(nr::RT_SIGACTION, &[10, DATA, 0x1000, 8]),
+        errno(Errno::EFAULT)
+    );
+    assert_eq!(f.thread.state.signal_actions[&10].handler, 0x4321);
+    // A new action it cannot read comes before the signal's checks.
+    assert_eq!(
+        f.ret(nr::RT_SIGACTION, &[9, 0x1000, 0, 8]),
+        errno(Errno::EFAULT)
+    );
+    f.thread.state.signal_actions.insert(
+        31,
+        SignalAction {
+            handler: 0,
+            flags: crate::signals::SA_IMMUTABLE,
+            ..SignalAction::default()
+        },
+    );
+    f.mem.write_u64(GuestAddr(DATA + 0x100), 0x77).unwrap();
+    assert_eq!(
+        f.ret(nr::RT_SIGACTION, &[31, 0, DATA + 0x100, 8]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(nr::RT_SIGACTION, &[31, DATA, 0, 8]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 0x100)).unwrap(), 0x77);
+    assert_eq!(f.thread.state.signal_actions[&31].handler, 0);
+}
+
 #[test]
 fn signal_registration_is_recorded_but_not_delivered() {
     let mut f = fixture();
@@ -12248,6 +12303,43 @@ fn vsyscall_entries_make_their_call_and_return() {
         let mut f = fixture();
         assert_eq!(vsyscall(&mut f, entry, [at, 0]), segv);
     }
+}
+/// A kill by seccomp leaves SIGSYS's action at its default and
+/// SA_IMMUTABLE, with its other fields, as `force_sig_seccomp` forces it
+/// (`HANDLER_EXIT`); a process sharing the actions then has it.
+#[test]
+fn a_seccomp_kill_leaves_sigsys_immutable() {
+    let mut f = fixture();
+    // gettid is KILL_PROCESS, the rest allowed.
+    seccomp_program(
+        &f,
+        &[
+            (0x20, 0, 0, 0),
+            (0x15, 0, 1, 186),
+            (0x06, 0, 0, 0x8000_0000),
+            (0x06, 0, 0, 0x7fff_0000),
+        ],
+    );
+    assert_eq!(f.ret(317, &[1, 0, DATA]), 0);
+    f.kernel.group.set_action(
+        31,
+        SignalAction {
+            handler: 0x5000,
+            flags: 0x0400_0004,
+            restorer: 0x6000,
+            mask: 2,
+        },
+    );
+    assert_eq!(f.call(186, &[]), Next::Exit(ExitStatus::Signaled(31)));
+    assert_eq!(
+        f.kernel.group.shared_actions().lock().unwrap()[&31],
+        SignalAction {
+            handler: 0,
+            flags: 0x0400_0004 | crate::signals::SA_IMMUTABLE,
+            restorer: 0x6000,
+            mask: 2,
+        }
+    );
 }
 #[test]
 fn vsyscall_calls_go_through_seccomp() {

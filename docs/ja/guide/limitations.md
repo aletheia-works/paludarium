@@ -1037,9 +1037,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   引き直すとほかのホップに移ります（`ip6_ecmp_set_mp_hash`、`sk_rethink_txhash`）。
   ここでは接続の道筋は開くときに決まるので、答えの返らないホップの接続は失敗します。
   ICMPv6 のエラーは自分のフローのホップを取りますが、Linux のものは知らせるパケットの
-  ホップを取ります（`icmp6_send`）。まだ自分のポートのない IPv4 の接続は、どの引き当てでも
-  同じ乱数の送り元ポートをハッシュしますが、Linux は引き当てごとに新しく引きます
-  （`ip_route_connect` と `ip_route_newports` の `FLOWI_FLAG_ANY_SPORT`）。
+  ホップを取ります（`icmp6_send`）。まだ自分のポートのない接続は、Linux と同じく乱数の
+  送り元ポートをハッシュします（`FLOWI_FLAG_ANY_SPORT`）。ここではどの引き当てでも同じ
+  ものを使いますが、Linux の IPv4 は引き当てごとに新しく引きます（`ip_route_connect`、
+  `ip_route_newports`）。IPv6 は経路を一度だけ引きます（`tcp_v6_connect`）。
   経路のない UDP の connect は、Linux master が "ipv6: fix device binding after failed
   datagram connect" からするように、ソケットのデバイスを元に戻します。その修正のない
   CI のカーネルでは、スコープ ID が与えたデバイスが残ります。

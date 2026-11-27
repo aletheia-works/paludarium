@@ -2889,9 +2889,10 @@ impl InetSocket {
                     {
                         self.mapped_source(bound)?;
                     }
-                    // `ip_route_connect`: one with no port of its own yet
-                    // hashes a random one (`FLOWI_FLAG_ANY_SPORT`), as the
-                    // lookups after its port is bound do too.
+                    // `ip_route_connect`, `tcp_v6_connect`: one with no port
+                    // of its own yet hashes a random one
+                    // (`FLOWI_FLAG_ANY_SPORT`), as IPv4's lookups after its
+                    // port is bound do too.
                     s.route_sport = match s.bound {
                         Some(bound) => bound.port(),
                         None => u16::from_le_bytes(self.random()),

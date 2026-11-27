@@ -584,7 +584,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルの終わりがありません。相手が閉じると、読み込みは待ち続け、次の送信は
   `ECONNREFUSED`、その後は `ENOTCONN` になります。その送信は、下と同じく、その端が
   読んでいないものを捨てます。`EPIPE` で `SIGPIPE` を送るのは、
-  Linux と同じく `SOCK_STREAM` だけです。
+  Linux と同じく `SOCK_STREAM` だけで、何も送れなかったときだけです。パイプは、書き込みの
+  一部のあとで最後の読み手がいなくなったときも送り、その書き込みは書いた分を返します。
 
 - `socket(AF_UNIX)` は、Linux の `af_unix.c` と同じく、`SOCK_STREAM` か
   `SOCK_SEQPACKET` のソケットを作ります。抽象名前空間の名前（0 で始まる `sun_path`）に
@@ -755,7 +756,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `O_NONBLOCK` を付けると、何もない標準入力の読み込みは `EAGAIN` で、ホストに空きの
     ない標準出力や標準エラーへの書き込みも `EAGAIN` です。読み手のいなくなった標準出力や
     標準エラー（終わった `head` へのパイプなど）への書き込みは、読み手のいないどのパイプへの
-    書き込みとも同じく、`SIGPIPE` を送って `EPIPE` を返します。
+    書き込みとも同じく、`SIGPIPE` を送って `EPIPE` を返します。一部を書いたあとで読み手が
+    いなくなった書き込みも、Linux の `pipe_write` と同じく `SIGPIPE` を送り、書いた分を返します。
   - **TCP と UDP のソケット**（[ネットワーク](#network)）：Linux の TCP と同じように
     送ります。接続が開くと `POLL_OUT`、失敗すると `POLL_ERR`、データが届くと
     `POLL_IN` です。相手の終わりが届くと `POLL_IN`（こちらも閉じていれば `POLL_HUP`）を
@@ -1016,7 +1018,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `io_uring` のリング、ヒュージページ、vDSO のデータは、どちらの指定も受け付けません
   （`EINVAL`）。
   `MADV_COLLAPSE` は、Linux の `madvise_collapse` と同じく VMA ごとにプライベートな
-  anonymous メモリと shmem のページキャッシュをまとめます。`MADV_NOHUGEPAGE` の VMA、
+  anonymous メモリと shmem のページキャッシュをまとめます。`MADV_NOHUGEPAGE` の VMA や
+  `PR_SET_THP_DISABLE` がすべての VMA で止めた空間の VMA、
   揃った 2 MiB の区間が入らない VMA、どのページも書かれていないプライベートな
   anonymous の VMA、アドレスとファイルのオフセットが 2 MiB 単位で揃っていない shmem の
   VMA、通常のファイルのマッピングは断り（`EINVAL`）、そのうえで揃った区間をまるごと
@@ -1657,7 +1660,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - io_uring は Linux 6.12 のものですが、登録したファイル、バッファーのグループ、NOP の
   フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
-  `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
+  `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。知っている操作、登録、setup と
+  `io_uring_enter` のフラグも Linux 7.0 のものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
   `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
@@ -1665,8 +1669,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
   `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE` と
   `_TEE`、それにソケットの要求
-  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。Linux 6.12 のほかの操作は、それらなしでビルドした Linux と同じく
-  `EOPNOTSUPP` で完了し、それより新しい操作は 6.12 と同じく `EINVAL` で完了します。`IORING_REGISTER_PROBE` はこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
+  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで、それらなしでビルドした Linux と同じく
+  `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` はこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
   `fsgid` を返します。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
@@ -2729,7 +2733,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     送り元であるホップは、ハッシュより先に選ばれます。デバイスを名前で挙げれば、
     それを通る最初のホップです。bind していない
     ソケットは、送り元なしのハッシュで決まるホップの送り元を使い、接続と UDP の connect は、
-    続けてその送り元から経路を引き当てます（`ip_route_connect`）。パケットは、その送り元への
+    続けてその送り元から経路を引き当てます（`ip_route_connect`）。ソケットのフローは自分の
+    ポートをハッシュします。UDP のソケットは経路より先にポートを持ち（`inet_send_prepare`、
+    `inet_dgram_connect`）、まだポートのない接続は乱数のポートをハッシュします
+    （`FLOWI_FLAG_ANY_SPORT`）。答えは自分のポートをハッシュします。パケットは、その送り元への
     経路のどのホップのデバイスからも入れます（`fib_info_nh_uses_dev`）。その答えは自分の
     引き当てで選ばれる端か、リスナーがバインドされている端を通って返ります。端を
     通る出力の経路の検索は、端の最初のプライマリアドレスから、なければほかのデバイスの
@@ -2818,6 +2825,31 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     でもグループに入っているものと、`IPV6_MULTICAST_ALL` が入ったものに届きます
     （`inet6_mc_check`）。受け付けた接続の `IPV6_MULTICAST_HOPS` は 64 です
     （`tcp_v6_syn_recv_sock`）。
+  - **IPv6 のエニーキャストのアドレス:** IPv6 のソケットは（TCP のものも）`IPV6_JOIN_ANYCAST` と
+    `IPV6_LEAVE_ANYCAST` で、`ipv6_mreq`（短ければ `EINVAL`）のインデックスが指すデバイスか、
+    0 ならそのアドレスへの経路のデバイスで、エニーキャストのアドレスに入り、出ます
+    （`ipv6_sock_ac_join`、`ipv6_sock_ac_drop`）。`CAP_NET_ADMIN` がなければ `EPERM`、
+    マルチキャストのアドレスか、名前空間の仮でないアドレスなら `EINVAL`、デバイスがなければ
+    `ENODEV` です。経路がなければ `EADDRNOTAVAIL` ですが、`all` が転送するときは、上がっている
+    ループバックでない最初のデバイスです。転送しないデバイスでは、デバイスのアドレスのどの
+    接頭辞にもないアドレスも `EADDRNOTAVAIL` です。入っていないのに出れば `ENOENT` で、出るのは
+    指したデバイスのもの、0 ならどこかで最も新しく入ったものです。転送するデバイスは、
+    自分の各アドレスのサブネットルーターのエニーキャストアドレス（その接頭辞。127 ビット以上の
+    ものは除きます）に入ります。アドレスの準備ができたとき（重複アドレス検出の後、しなければ
+    すぐ）と、転送を始めたときに仮でないアドレスのものです。アドレスがなくなるか、転送を
+    やめると出ます（`addrconf_join_anycast`、`dev_forward_change`）。どれも入った回数を数え、
+    新しいものから並べます（`__ipv6_dev_ac_inc`）。新しく入ると、ローカルの表にデバイスを通る
+    `RTN_ANYCAST` の経路を足し、その要請ノードのグループに入り（ループバックは入りません）、
+    `RTNLGRP_IPV6_ACADDR`（39）に `RTM_NEWANYCAST` を伝えます。すっかり出ると、グループから
+    抜け、経路がまだあれば除き、`RTM_DELANYCAST` を伝えます（`inet6_ifacaddr_notify`）。
+    デバイスが下がると、その経路は、ソケットが入ったものの経路も消えますが、ソケットは経路の
+    ないまま入ったままです。デバイスがなくなると、残りは何も伝えずに消えます
+    （`ipv6_ac_destroy_dev`）。ソケットを閉じると、入ったものから出ます。`/proc/net/anycast6`
+    （`ac6_seq_show`）は、デバイスごとのものを名前空間の順に、利用者の数と並べます。
+    `RTM_GETANYCAST` のダンプ（`inet6_dump_ifacaddr`）は、IPv6 のアドレスのダンプと同じく
+    要求を調べ、インデックスの順に、128 ビットの永続のアドレス（`IFA_ANYCAST`）で、スコープは
+    ユニバース（サイトローカルのものはサイトの 200）、有効期間は無期限で返します
+    （`inet6_fill_ifacaddr`）。`ipv6_route` はその経路を `RTF_ANYCAST` で示します。
   - **送信元フィルター:** グループに入ったソケットは、そのフィルターが通すものを受け取ります。
     フィルターの送信元からのもの（`MCAST_INCLUDE`）か、ほかのすべてからのもの
     （`MCAST_EXCLUDE`。入ったときは送信元なしです）です。IPv4 の
@@ -3768,7 +3800,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`RssAnon`、`RssFile`、`RssShmem`）、書き込めるプライベートなマップとスタック（`VmData`、
   `VmStk`）、コードの範囲とそのほかの実行できるマップ（`VmExe`、`VmLib`）です。スワップ
   アウトするものはなく、ヒュージページのプールは空なので、`VmSwap` と `HugetlbPages` は
-  0 です。`VmPin`、`VmPTE` と CPU の項目は、何も数えていないのでありません。大きさの
+  0 です。タスクにメモリーがある間は、そのあとに `CoreDumping`（プロセスのコアを書く
+  致命的なシグナルから、最後のスレッドが書き終えるまで 1）、`THP_enabled`（
+  `PR_SET_THP_DISABLE` が空間全体の透過的ヒュージページを止めると 0）、`untag_mask`
+  （線形アドレスのマスクを有効にするものがないので、すべてのビットが 1）が続きます。
+  `VmPin`、`VmPTE` と CPU の項目は、何も数えていないのでありません。大きさの
   最大値は Linux の `hiwater_vm` です。`vms_complete_munmap_vmas` が `update_hiwater_vm`
   を呼ぶのと同じく、アンマップがマップされたページを取り除くときに記録します。それを置き換える
   固定のマップは、そのあとで自分のページを数えます。`mremap` がページを
@@ -4008,7 +4044,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `exe`（このプロセスのもの、または見てよいほかのプロセスのもの）への `execve` は、
   リンク先のプログラムを動かします。Linux のパスのたどり方と同じく、ファイルへ直接
   飛び、そのディレクトリは探しません。`AT_SYMLINK_NOFOLLOW` は拒み（`ELOOP`）、リンクで
-  ない生成されるファイルは `EACCES` です。
+  ない生成されるファイルは `EACCES` です。独自のルートの下でも、そこにある `/proc` の
+  バインドマウントを通して同じく動かします。そのルートの中から `/proc` や `/dev` の
+  バインドマウントを指すシンボリックリンク（絶対パスのものは新しいルートから）も、
+  どの呼び出しでもそれ自身のパスと同じく生成されるファイルへ届きます。リンクでない
+  生成されるファイル（`/proc` 自身も）の `readlink` は `EINVAL` です。
 
 - `/proc/sys/fs/mqueue` には、Linux の `ipc/mq_sysctl.c` と同じく、読むプロセスの IPC
   名前空間の POSIX メッセージキューの上限があります。`queues_max`、`msg_max` と
@@ -4156,7 +4196,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `all` かデバイスの `forwarding` は 1 を返しました）。`all` のものは `default` とすべてのデバイスのものを変えます。
     `forwarding` は、`addrconf_fixup_forwarding` と同じく、入るか切れるときだけ
     `RTNLGRP_IPV6_NETCONF` のメンバーに伝えます（1 から 2 では伝えません）。`all` の
-    ものでは、`default`、切り替わったデバイスのもの、`all` 自身の順です。
+    ものでは、`default`、切り替わったデバイスのもの（デバイスが登録された順）、`all` 自身の順です。
     `disable_ipv6` はこうして伝えることはありません。
     デバイスの `disable_ipv6` を入れると、そのデバイスは IPv6 のアドレスと経路を失い、
     落ちたときと同じく知らせます（`addrconf_ifdown`）。上がっている間に切ると、
@@ -5754,6 +5794,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかに名前を付けてから `ENOMEM` です。`/proc/<pid>/maps` と `smaps` はこれを
   `[anon:<名前>]`、共有の無名メモリでは `[anon_shmem:<名前>]` と示し、ヒープとスタックは
   それぞれの名前のままです。名前の違う VMA はまとまらず、`fork` した子も名前を保ちます。
+  `PR_SET_THP_DISABLE` と `PR_GET_THP_DISABLE` は、Linux の `MMF_DISABLE_THP_*` と同じく
+  アドレス空間のもので、スレッドは共有し、`fork` した子と `execve` は保ちます。2 番目の
+  引数が 0 でなければ透過的ヒュージページを止め、3 番目が
+  `PR_THP_DISABLE_EXCEPT_ADVISED`（2）なら `MADV_HUGEPAGE` が求めていないところだけを
+  止めます。フラグなしの 0 でふたたび使えるようにします（ほかのフラグ、使えるようにする
+  ときのフラグ、4 番目か 5 番目の引数は `EINVAL`）。`PR_GET_THP_DISABLE` は引数を取らず
+  （`EINVAL`）、0、1、または求めたメモリーを除く種類なら 3 を返します。すべての VMA で
+  止めたときは、Linux の `vma_thp_disabled` と同じく `MADV_COLLAPSE` を断ります（`EINVAL`）。
+  ほかに変わるものはありません。どちらでも、Linux と同じくヒュージページが入るところに
+  マップを置くためです。
   ほかの指定には `EINVAL` を返します。
 
 - プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって

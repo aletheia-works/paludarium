@@ -116,7 +116,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
-- **`/proc/net` の一部**：あるのは `arp`、`dev`、`if_inet6`、`igmp`、`igmp6`、`ipv6_route`、
+- **`/proc/net` の一部**：あるのは `anycast6`、`arp`、`dev`、`if_inet6`、`igmp`、`igmp6`、`ipv6_route`、
   `mcfilter`、`mcfilter6`、`route` と、ソケットのファイル（[機能](./features) を参照）だけです。
   `dev_mcast`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、`dev` のものは
   0 です。ネットワークのないセッションのファイルには、
@@ -151,8 +151,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `status` は、それを `voluntary_ctxt_switches` として示し、`nonvoluntary_ctxt_switches` は
   0 です。`getrusage` と wait の rusage も同じく `ru_nvcsw` に示し、`ru_nivcsw` は 0 です。
   ピン留めしたページ（`pinned_vm`）とページテーブルのバイト数は何も数えないので、`status` には
-  `VmPin` と `VmPTE` がありません。Linux がメモリの項目のあとに書く行（`CoreDumping`、
-  `THP_enabled`、`untag_mask`）もありません。ほかのプロセスのスレッドは、どの待ちでも
+  `VmPin` と `VmPTE` がありません。ほかのプロセスのスレッドは、どの待ちでも
   `S (sleeping)` です。Linux は割り込めない待ちの一部を `D (disk sleep)` と見せます。スレッドが
   ほかのプロセスに見せるのは最後のシステムコールかシグナルの確認で公開したものなので、
   呼び出しの間だけ変えたマスク（`rt_sigsuspend`、`ppoll`）は、スレッドがその中で停止している
@@ -174,8 +173,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   登るパスでは、そのバインドマウントで見える生成されるファイルの中の `..` を、書かれた名前から
   取ります。Linux は、`/proc` のリンク（`/proc/self/cwd` など）のあとの `..` をリンク先から
   取ります。Linux master で新しく入った `fchroot` はありません（`ENOSYS`）。
-- **独自のルートの下での `/dev` と `/proc` の中を指すリンク**：そこでは、ほかの場所から
-  その中を指すシンボリックリンクを、生成されるファイルまでたどりません。
 - **`/dev` の名前**：root では、`/dev` に名前を作る呼び出し（`mkdir`、`mknod`、`symlink`、
   `O_CREAT` 付きの `open`）は `ENOENT`、そこの名前の `unlink`、`rmdir`、`rename` は `EPERM`
   です。Linux の devtmpfs は名前を作り、消し、変えます。ほかのユーザーには Linux と同じく
@@ -520,8 +517,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
   `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
-  だけです。Linux 6.12 のほかの操作は `EOPNOTSUPP` で完了し、Linux 7.0 がそのあとに加えた操作
-  （`IORING_OP_RECV_ZC` から）は 6.12 と同じく `EINVAL` で失敗します。ソケットの要求のうち、マルチショットの
+  だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
   `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
@@ -541,9 +537,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   残します（Linux は取り消します）。自分の要求にポーリングされるリングは、その要求が終わるまで
   残ります。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
-  `_REGISTERED_FD_ONLY` と、Linux 7.0 が `_NO_SQARRAY` のあとに加えたフラグ（`_HYBRID_IOPOLL` から）は
-  `EINVAL` です。`io_uring_enter` のフラグも、`IORING_ENTER_ABS_TIMER` のあとに 7.0 が加えたもの
-  （`_EXT_ARG_REG` と `_NO_IOWAIT`）は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
+  `_REGISTERED_FD_ONLY`、`_HYBRID_IOPOLL`、`_CQE_MIXED`、`_SQE_MIXED`、`_SQ_REWIND` は
+  `EINVAL` です。待つための領域は登録できない（`IORING_REGISTER_MEM_REGION`）ので、
+  `IORING_ENTER_EXT_ARG_REG` で待つと `EFAULT` で失敗します（大きさが `struct io_uring_reg_wait`
+  のものでなければ `EINVAL`）。`io_uring_register` は `IORING_REGISTER_PROBE`、
   `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_BUFFERS2`、
   `IORING_REGISTER_BUFFERS_UPDATE`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
@@ -567,7 +564,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   リングのどの領域でもないオフセットのマッピングは、差分テストを走らせるカーネルである
   Linux 7.0 と同じく `ENOMEM` です。Linux master の `io_uring_get_unmapped_area` は `EINVAL` を
   返します。テストを走らせるカーネルが追いつけば master に合わせます。
-  機能は Linux 6.12 のものです。疑似端末の読み出しは、パイプの読み出しのように
+  機能は Linux 6.12 のものなので、`IORING_FEAT_RW_ATTR` と `_NO_IOWAIT` は報告しませんが、
+  `IORING_ENTER_NO_IOWAIT` は受け付けます。疑似端末の読み出しは、パイプの読み出しのように
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。
   読めないファイル（epoll のインスタンス、リング）は、Linux が先に準備を待つところで、すぐに
   `EINVAL` で失敗します。`IORING_ASYNC_CANCEL_OP` と `IORING_OP_LAST` 以降の操作を持つ
@@ -800,9 +798,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc/sys/fs/binfmt_misc` はありません。そのため `/proc` や `/dev`（またはその中の
   ディレクトリ）のバインドマウントも、そこのディレクトリに生成されるものと `/dev/shm` の
   中身を見せます。Linux では空のマウントポイントです。`MS_REC` でもマウントは付いて
-  きません。権限の低い所有者の名前空間では、`/dev` のバインドマウントは Linux が
-  ロックされた `/dev/shm` のために断るのと同じく `EINVAL` ですが、`/proc` や `/dev/pts`
-  のものは作ります。Linux は下のロックされたマウントのために断ります（`EINVAL`）。
+  きません。権限の低い所有者の名前空間では、`MS_REC` のない `/dev` のバインドマウントは
+  Linux がロックされた `/dev/shm` のために断るのと同じく `EINVAL` ですが、`/proc` や
+  `/dev/pts` のものは作ります。Linux は下のロックされたマウントのために断ります（`EINVAL`）。
+  `MS_REC` があれば、Linux と同じくどれも作ります。
   `/dev/shm` をアンマウントすると、その名前は見つからず（`ENOENT`）、`/dev` の一覧にも出ません。Linux では
   devtmpfs の空のディレクトリが見えます。
   ファイルシステムのコンテキストが作るのは、`mount` と同じく tmpfs だけで、記録する
@@ -1031,11 +1030,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   引き直すとほかのホップに移ります（`ip6_ecmp_set_mp_hash`、`sk_rethink_txhash`）。
   ここでは接続の道筋は開くときに決まるので、答えの返らないホップの接続は失敗します。
   ICMPv6 のエラーは自分のフローのホップを取りますが、Linux のものは知らせるパケットの
-  ホップを取ります（`icmp6_send`）。`fib_multipath_hash_policy` が 1 のとき、また 3 で
-  ポートのフィールドがあるとき、ソケットのフローはポートなしでハッシュします。Linux は
-  ソケットのポートを、まだないものには乱数の送り元ポート（`FLOWI_FLAG_ANY_SPORT`）を
-  ハッシュするので、そのホップは Linux と違うことがあります。`RTM_GETROUTE` のポートは
-  Linux と同じくハッシュします。
+  ホップを取ります（`icmp6_send`）。まだ自分のポートのない IPv4 の接続は、どの引き当てでも
+  同じ乱数の送り元ポートをハッシュしますが、Linux は引き当てごとに新しく引きます
+  （`ip_route_connect` と `ip_route_newports` の `FLOWI_FLAG_ANY_SPORT`）。
   経路のない UDP の connect は、Linux master が "ipv6: fix device binding after failed
   datagram connect" からするように、ソケットのデバイスを元に戻します。その修正のない
   CI のカーネルでは、スコープ ID が与えたデバイスが残ります。
@@ -1052,17 +1049,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （`ff02::16`、要請ノードのもの、`ff02::2`）の近隣を作りますが、相手には届きません。
   転送する相手は、要請から端のリンクローカルのアドレスの近隣を学びません
   （`ndisc_recv_rs`）。報告はすぐに送りますが、Linux では 2 tick 後です
-  （`mld_ifc_start_work`）。どれも 1 回だけ送るので、その近隣を消すと、Linux がその後に
-  送るもの（`mld_ifc_work`、`mld_dad_work`、`addrconf_rs_timer`）がもう一度作ることは
+  （`mld_ifc_start_work`）。Linux のタイマーが送り直すもの（`mld_ifc_work`、`mld_dad_work`、
+  `addrconf_rs_timer`）は送り直さないので、その近隣を消しても、それがもう一度作ることは
   ありません。グループのソースが変わっても報告は送りません（`ip6_mc_add_src`、
   `ip6_mc_del_src`）。IGMP の報告は、送り先のグループの近隣を作りません。端を通る通信は
   カウンタを動かしません。名前空間は別の名前空間へ転送しません。マルチキャストのグループはゲストの名前空間の中だけのものです。最初の名前空間には
   ホストのネットワークへのデバイスがなく、グループへの経路もないので、デバイスを指さずに
   入ろうとすると `ENODEV` です。IGMP と MLD のパケットはどこにも届きません。raw ソケットは `EPERM` で、パケット
-  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。エニーキャストの
-  グループ（`IPV6_JOIN_ANYCAST`）は `ENOPROTOOPT` です。IPv6 を転送するデバイスには
-  サブネットルーターのエニーキャストアドレスがない（`addrconf_join_anycast`）ので、その
-  要請ノードのグループにも入りません。Linux の master のリンク層のグループ
+  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。経路の検索は
+  エニーキャストのアドレスの経路（`RTN_ANYCAST`）を飛ばしますが、Linux は見つけます。その
+  アドレスの検索（`RTM_GETROUTE`）はその接頭辞の経路を返し、そこへのパケットはその経路の
+  とおりに出ていきますが、Linux は受け取ります。Linux の master のリンク層のグループ
   （`AF_PACKET`、`dev_mc_dump`）の `RTM_GETMULTICAST` は `EOPNOTSUPP` です。ICMP の port unreachable の頻度を
   抑えないので（`icmpv4_xrlim_allow`、`icmpv6_xrlim_allow`）、相手の閉じたポートへのデータグラムのたびに、
   接続したソケットの次の送信は `ECONNREFUSED` になります。組を通る接続は、端が
@@ -1116,9 +1113,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   そこから始まります。`fib_multipath_hash_seed`、`fib_multipath_hash_policy`、
   `fib_multipath_hash_fields`、`fib_multipath_use_neigh` への書き込みは、Linux 7.0 から 7.2 と同じく
   全部を取り、ファイルの位置を動かしません。master は読んだ分だけを取り、位置を進めます
-  （`proc_vec`）。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
-  加わりません。`all` のものに書くと、デバイスのものを
-  インデックスの順に伝えますが、Linux は増えた順です。netconf の通知は、ファイルのない
+  （`proc_vec`）。netconf の通知は、ファイルのない
   設定（プロキシ ARP と NDP、マルチキャストとブロードキャストの転送、リンクの落ちた
   経路を無視する設定）を、Linux の組み込みの値と同じく 0 として伝えます。MTU が 1280
   より小さい veth の端にも `ipv6/conf/<デバイス>` のファイルがありますが、Linux では

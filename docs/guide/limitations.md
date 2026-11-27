@@ -130,7 +130,7 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
-- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `igmp`,
+- **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `if_inet6`, `igmp`,
   `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route` and those of the
   sockets (see [features](./features)) alone; `dev_mcast`, `snmp`,
   `sockstat` and the rest are `ENOENT`, and no counter is kept, so those of
@@ -173,9 +173,7 @@ verified.
   those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`,
   and `getrusage` and a wait's rusage as `ru_nvcsw` and 0 as `ru_nivcsw`.
   `status` has no `VmPin` or `VmPTE`, as nothing counts the pages pinned
-  (`pinned_vm`) or the bytes of the page tables, and none of the lines
-  Linux writes after the memory ones (`CoreDumping`, `THP_enabled`,
-  `untag_mask`).
+  (`pinned_vm`) or the bytes of the page tables.
   Another process's thread is `S (sleeping)` in every wait, where Linux shows
   some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
   process what it published at its last system call or signal check, so a mask
@@ -202,9 +200,6 @@ verified.
   names as written, where Linux takes a `..` after a link in `/proc` (such
   as `/proc/self/cwd`) from its target.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
-- **Links into `/dev` and `/proc` under a root of its own**: there, no
-  symbolic link elsewhere that leads into them is followed to the
-  generated file.
 - **Names in `/dev`**: as root, a call that makes a name in `/dev`
   (`mkdir`, `mknod`, `symlink`, an `open` with `O_CREAT`) gives `ENOENT`,
   and `unlink`, `rmdir` and `rename` of a name there give `EPERM`, where
@@ -626,10 +621,9 @@ verified.
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
   `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
-  `_RECV`, `_SENDMSG` and `_RECVMSG` run; Linux 6.12's other operations
-  complete with `EOPNOTSUPP`, and those Linux 7.0 adds after them (from
-  `IORING_OP_RECV_ZC`) fail with `EINVAL`, as on 6.12. Of the socket
-  requests, a multishot `IORING_OP_RECVMSG`, a bundle
+  `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
+  Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
+  socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
   one are not there yet (`EINVAL`). A multishot receive whose socket keeps
@@ -655,10 +649,11 @@ verified.
   waiting, where Linux cancels them, and a ring polled by a request of its
   own stays until that request ends. The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`,
-  `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY`, and those
-  Linux 7.0 adds after `_NO_SQARRAY` (from `_HYBRID_IOPOLL`), give
-  `EINVAL`, as do the `io_uring_enter` flags it adds after
-  `IORING_ENTER_ABS_TIMER` (`_EXT_ARG_REG` and `_NO_IOWAIT`),
+  `_SQE128`, `_CQE32`, `_NO_MMAP`, `_REGISTERED_FD_ONLY`,
+  `_HYBRID_IOPOLL`, `_CQE_MIXED`, `_SQE_MIXED` and `_SQ_REWIND` give
+  `EINVAL`. No wait region can be registered (`IORING_REGISTER_MEM_REGION`),
+  so a wait with `IORING_ENTER_EXT_ARG_REG` fails with `EFAULT` (`EINVAL`
+  for a size other than `struct io_uring_reg_wait`'s),
   and `io_uring_register` has only `IORING_REGISTER_PROBE`,
   `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
   `IORING_REGISTER_BUFFERS2`, `IORING_REGISTER_BUFFERS_UPDATE`,
@@ -688,7 +683,8 @@ verified.
   Linux master's `io_uring_get_unmapped_area` gives `EINVAL`. This follows
   master once the test runners' kernel does.
   The features are Linux
-  6.12's. A pseudo-terminal's read waits in
+  6.12's, so `IORING_FEAT_RW_ATTR` and `_NO_IOWAIT` are not reported,
+  though `IORING_ENTER_NO_IOWAIT` is taken. A pseudo-terminal's read waits in
   `io_uring_enter` instead of waiting for its file as a pipe's read does. A file that is never read (an epoll instance, a ring)
   fails with `EINVAL` at once, where Linux first waits for it to be ready.
   An `IORING_OP_ASYNC_CANCEL` with `IORING_ASYNC_CANCEL_OP` and an
@@ -968,9 +964,10 @@ verified.
   directory in them) still shows what is generated in those directories,
   and what is in `/dev/shm`, where Linux shows their empty mount points,
   and with `MS_REC` takes no mount along. In a namespace of a less
-  privileged owner a bind mount of `/dev` is `EINVAL`, as Linux refuses
-  it for its locked `/dev/shm`, but one of `/proc` or `/dev/pts` is made,
-  where Linux refuses it for its locked mounts below (`EINVAL`). Once
+  privileged owner a bind mount of `/dev` without `MS_REC` is `EINVAL`,
+  as Linux refuses it for its locked `/dev/shm`, but one of `/proc` or
+  `/dev/pts` is made, where Linux refuses it for its locked mounts below
+  (`EINVAL`); with `MS_REC` each is made, as on Linux. Once
   `/dev/shm` is unmounted, its name is not found there (`ENOENT`) nor
   listed in `/dev`, where Linux shows devtmpfs's empty directory. A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its
@@ -1234,11 +1231,10 @@ verified.
   `sk_rethink_txhash`), but here a connection's path is settled as it
   opens, so a hop whose answers do not come back fails it. An ICMPv6 error
   takes the hop of its own flow, where Linux's takes that of the packet
-  it tells of (`icmp6_send`). Under `fib_multipath_hash_policy` 1, and 3
-  with a port field, a socket's flow hashes with no ports, where Linux's
-  hashes its ports, and a random source port for one that has none yet
-  (`FLOWI_FLAG_ANY_SPORT`), so its hop may not be Linux's; the ports of
-  `RTM_GETROUTE` hash as Linux's do. A UDP
+  it tells of (`icmp6_send`). An IPv4 connection with no port of its own
+  yet hashes one random source port in each of its lookups, where Linux
+  draws a new one at each (`FLOWI_FLAG_ANY_SPORT` in `ip_route_connect`
+  and `ip_route_newports`). A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
@@ -1258,9 +1254,10 @@ verified.
   (`ff02::16`, the solicited-node ones, `ff02::2`), but reaches no peer:
   a peer that forwards learns no neighbour of the end's link-local
   address from the solicitation (`ndisc_recv_rs`). A report goes at once,
-  where Linux's goes two ticks on (`mld_ifc_start_work`); each goes once,
-  so a neighbour of one that is deleted is not made again by those Linux
-  sends on (`mld_ifc_work`, `mld_dad_work`, `addrconf_rs_timer`); and a
+  where Linux's goes two ticks on (`mld_ifc_start_work`); none is sent
+  again as Linux's timers send them (`mld_ifc_work`, `mld_dad_work`,
+  `addrconf_rs_timer`), so a neighbour of one that is deleted is not made
+  again by those; and a
   change of a group's sources sends none (`ip6_mc_add_src`,
   `ip6_mc_del_src`). IGMP's reports make no neighbour of the group they
   go to. Traffic through
@@ -1271,9 +1268,10 @@ verified.
   No IGMP or MLD packet reaches anything: nothing in the guest would see
   one, as raw sockets are `EPERM` and there are no packet sockets
   (`AF_PACKET`).
-  Anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`, and a device
-  that forwards IPv6 has no subnet-router anycast address
-  (`addrconf_join_anycast`), so it joins no solicited-node group of one.
+  A route lookup passes over the route of an anycast address
+  (`RTN_ANYCAST`), where Linux's finds it: a lookup of one
+  (`RTM_GETROUTE`) gives the route of its prefix, and a packet to one
+  goes out as that route takes it, where Linux takes it in.
   `RTM_GETMULTICAST` of Linux master's
   link-layer groups (`AF_PACKET`, `dev_mc_dump`) is `EOPNOTSUPP`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
@@ -1340,9 +1338,7 @@ verified.
   `fib_multipath_hash_fields` or `fib_multipath_use_neigh` is taken whole and leaves the file where it
   was, as Linux 7.0 to 7.2 do; master takes what it reads and
   moves the file on (`proc_vec`).
-  IPv6's `forwarding` joins no router anycast address; a
-  write of `all`'s tells of the devices in the order of their indices,
-  where Linux's goes in the order they came. A netconf notification gives
+  A netconf notification gives
   the settings that have no file (proxy ARP and NDP, multicast and
   broadcast forwarding, ignoring routes with their link down) as 0, as
   Linux is built. A veth end whose MTU is below 1280 still has the files

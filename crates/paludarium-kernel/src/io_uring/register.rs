@@ -40,7 +40,7 @@ pub(super) struct Restrictions {
 #[derive(Clone, Copy, Default)]
 struct Requests {
     /// Their operations, a bit each.
-    ops: u64,
+    ops: u128,
     flags_allowed: u8,
     flags_required: u8,
 }
@@ -184,7 +184,7 @@ pub(super) fn register_restrictions(
                 *new.register.get_or_insert_default() |= 1 << value;
             }
             RESTRICTION_SQE_OP if value < OP_LAST => {
-                new.requests.get_or_insert_default().ops |= 1 << value;
+                new.requests.get_or_insert_default().ops |= 1u128 << value;
             }
             RESTRICTION_SQE_FLAGS_ALLOWED => {
                 new.requests.get_or_insert_default().flags_allowed = value;

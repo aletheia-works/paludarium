@@ -671,7 +671,9 @@ kernel.
   no end of file: when the peer closes, reads wait and the next send gets
   `ECONNREFUSED`, then `ENOTCONN`; that send drops what the end has not
   read, as below. Only `SOCK_STREAM` raises `SIGPIPE` with
-  `EPIPE`, as on Linux.
+  `EPIPE`, as on Linux, and only when nothing was sent; a pipe raises it
+  also when its last reader leaves after part of a write, which returns
+  that part.
 
 - `socket(AF_UNIX)` makes a `SOCK_STREAM` or `SOCK_SEQPACKET` socket that
   binds to a name in the abstract namespace (a `sun_path` starting with 0),
@@ -858,7 +860,9 @@ kernel.
     `EAGAIN`, and so is a write to standard output or standard error that
     the host has no room for. A write to either once its reader is gone (a
     pipe into a `head` that has exited) is `EPIPE` and raises `SIGPIPE`, as
-    a write to any pipe with no reader.
+    a write to any pipe with no reader. A write whose reader leaves after
+    part of it went still raises `SIGPIPE`, and returns that part, as
+    Linux's `pipe_write`.
   - **TCP and UDP sockets** ([Network](#network)), as Linux's TCP signals:
     `POLL_OUT` when a connection opens, `POLL_ERR` when it fails, `POLL_IN`
     when data arrives, and for the peer's end `POLL_IN` (`POLL_HUP` once
@@ -1139,7 +1143,8 @@ kernel.
   neither advice (`EINVAL`).
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
-  `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent, a
+  `MADV_NOHUGEPAGE` or in a space that `PR_SET_THP_DISABLE` disabled for
+  every VMA, one with no room for an aligned 2 MiB extent, a
   private anonymous one no page of which was written, a shmem one whose
   addresses and file offsets are not 2 MiB aligned to each other, and a
   regular file's mapping refuse it (`EINVAL`), and a range with no whole
@@ -1880,7 +1885,8 @@ kernel.
 - io_uring is Linux 6.12's, but for its registered files, its groups of
   buffers and a NOP's flags, which are Linux 7.0's (`io_uring/rsrc.c`,
   `kbuf.c` and `nop.c`, with master's `IOSQE_FIXED_FILE` for a NOP), the
-  kernel the differential tests run on. Its
+  kernel the differential tests run on, and so are the operations,
+  registrations and setup and `io_uring_enter` flags it knows of. Its
   operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
@@ -1893,9 +1899,9 @@ kernel.
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
   `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
-  `_RECV`, `_SENDMSG` and `_RECVMSG`. Linux 6.12's other operations
-  complete with `EOPNOTSUPP`, as on a Linux built without them, and later
-  ones with `EINVAL`, as on 6.12, and `IORING_REGISTER_PROBE` reports only these. The
+  `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations, up to Linux
+  7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`, as on a Linux
+  built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
   as `anon_inode_create_getfile` makes one: `fstat` gives a new inode
@@ -3160,7 +3166,10 @@ kernel.
     it. A socket not bound takes
     the source of the hop it hashes to with no source, and a connection or
     a UDP connect then looks its route up from that source
-    (`ip_route_connect`). A packet may come in on the device of any hop of
+    (`ip_route_connect`). A socket's flow hashes its own port, which a UDP
+    socket has before its route (`inet_send_prepare`, `inet_dgram_connect`),
+    and a connection with none yet a random one (`FLOWI_FLAG_ANY_SPORT`);
+    an answer hashes its own ports. A packet may come in on the device of any hop of
     the route back to its source (`fib_info_nh_uses_dev`), and its answer
     goes back by a lookup of its own, through whichever end that takes, or
     the one its listener is bound to. An output lookup that goes through
@@ -3268,6 +3277,38 @@ kernel.
     none or its sender, that is a member of the group, on whatever device,
     or has `IPV6_MULTICAST_ALL` on (`inet6_mc_check`). An accepted
     connection's `IPV6_MULTICAST_HOPS` is 64 (`tcp_v6_syn_recv_sock`).
+  - **IPv6 anycast addresses:** an IPv6 socket, TCP's too, joins and
+    leaves an anycast address with `IPV6_JOIN_ANYCAST` and
+    `IPV6_LEAVE_ANYCAST`, an `ipv6_mreq` (`EINVAL` for less), on the
+    device of an index or that of the route to it (0)
+    (`ipv6_sock_ac_join`, `ipv6_sock_ac_drop`): `EPERM` without
+    `CAP_NET_ADMIN`; `EINVAL` for a multicast address or one of the
+    namespace's addresses that is not tentative; `ENODEV` for no device;
+    `EADDRNOTAVAIL` for no route, unless `all` forwards, when it is the
+    first device up that is no loopback, and, on a device that does not
+    forward, for an address of no prefix of the device's addresses; and
+    `ENOENT` to leave as none, on the device named, or the newest joined
+    on any (0). A device that forwards joins the subnet-router anycast
+    address (the prefix) of each of its addresses, but one of 127 bits or
+    more: as the address is ready, after its duplicate address detection
+    or at once without, and of those not tentative as it comes to
+    forward; it leaves it as the address goes, or as it stops
+    (`addrconf_join_anycast`, `dev_forward_change`). Each is counted, once
+    for each, the newest first (`__ipv6_dev_ac_inc`). Joined anew, it adds
+    a route of type `RTN_ANYCAST` to the local table through the device,
+    joins its solicited-node group (a loopback does not) and tells
+    `RTNLGRP_IPV6_ACADDR` (39) with `RTM_NEWANYCAST`; left for good, it
+    leaves the group, its route goes, if there still, and it tells
+    `RTM_DELANYCAST` (`inet6_ifacaddr_notify`). Down, the device's routes go, those of
+    what sockets joined too, which stay joined without one; going, what
+    is left goes without a word (`ipv6_ac_destroy_dev`); a socket's close
+    leaves what it joined. `/proc/net/anycast6` (`ac6_seq_show`) shows
+    each device's, in the namespace's order, with their users; an
+    `RTM_GETANYCAST` dump (`inet6_dump_ifacaddr`), checked as an IPv6
+    address dump, gives them by index, as permanent addresses of 128 bits
+    (`IFA_ANYCAST`) of the universe's scope, the site's (200) for a
+    site-local one, with endless lifetimes (`inet6_fill_ifacaddr`); and
+    `ipv6_route` shows their routes with `RTF_ANYCAST`.
   - **Source filters:** a membership takes what its filter lets in: from its
     sources (`MCAST_INCLUDE`) or from all others (`MCAST_EXCLUDE`, of no
     sources as a join leaves it). IPv4's `IP_ADD_SOURCE_MEMBERSHIP`,
@@ -4391,8 +4432,13 @@ kernel.
   `RssShmem`), the private writable mappings and the stack (`VmData`,
   `VmStk`), the code range and the other executable mappings (`VmExe`,
   `VmLib`), and 0 for `VmSwap` and `HugetlbPages`, as nothing is swapped
-  out and the pool of huge pages is empty. `VmPin`, `VmPTE` and the CPU
-  fields are not there, as nothing counts them. The peak of the size is
+  out and the pool of huge pages is empty. After them, while the task has
+  its memory, come `CoreDumping` (1 from the fatal signal that dumps its
+  process's core until the last thread has written it), `THP_enabled` (0
+  once `PR_SET_THP_DISABLE` disabled transparent huge pages for the whole
+  space) and `untag_mask`, all ones as nothing enables linear address
+  masking. `VmPin`, `VmPTE` and the CPU fields are not there, as nothing
+  counts them. The peak of the size is
   Linux's `hiwater_vm`: noted when an unmap takes mapped pages away, as
   `vms_complete_munmap_vmas` calls `update_hiwater_vm` (a fixed mapping
   that replaces them counts its own pages only after it), but not when
@@ -4676,7 +4722,12 @@ kernel.
   for a reader that may look at it, another's) runs the program it leads
   to, as Linux's walk jumps to the file without searching its
   directories; `AT_SYMLINK_NOFOLLOW` refuses it (`ELOOP`), and a
-  generated file that is no link is `EACCES`.
+  generated file that is no link is `EACCES`. Under a root of its own it
+  does so through a bind mount of `/proc` there, and a symbolic link in
+  that root into such a bind mount of `/proc` or `/dev` (an absolute one
+  from the new root) leads every call to the generated file, as its own
+  path does. `readlink` of a generated file that is no link, `/proc`
+  itself too, is `EINVAL`.
 
 - `/proc/sys/fs/mqueue` has the POSIX message queue limits of the
   reader's IPC namespace, as Linux's `ipc/mq_sysctl.c`: `queues_max`,
@@ -4847,7 +4898,8 @@ kernel.
     `default`'s and every device's. `forwarding` is told of to the members
     of `RTNLGRP_IPV6_NETCONF` only as it turns on or off (from 1 to 2 tells
     nothing), as `addrconf_fixup_forwarding` does: of `all`'s, `default`'s
-    first, then each device's that turns, then `all`'s own;
+    first, then each device's that turns, in the order the devices were
+    registered in, then `all`'s own;
     `disable_ipv6` is told of so by nothing. A device whose `disable_ipv6` turns
     on loses its IPv6 addresses and routes, told of as when it goes down
     (`addrconf_ifdown`); turning off while it is up gives `::1` back, and
@@ -6743,6 +6795,18 @@ kernel.
   and `smaps` show it as `[anon:<name>]`, and as `[anon_shmem:<name>]` for
   shared anonymous memory, the heap and the stack keeping their own names;
   VMAs of different names do not merge, and a `fork`ed child keeps them.
+  `PR_SET_THP_DISABLE` and `PR_GET_THP_DISABLE` are of the address space,
+  which a thread shares and a `fork`ed child and an `execve` keep, as
+  Linux's `MMF_DISABLE_THP_*` flags: a nonzero second argument disables
+  transparent huge pages, with `PR_THP_DISABLE_EXCEPT_ADVISED` (2) as the
+  third only where `MADV_HUGEPAGE` did not ask for them, and 0 with no flag
+  enables them again (`EINVAL` for another flag, a flag when enabling, or a
+  fourth or fifth argument). `PR_GET_THP_DISABLE` takes no argument
+  (`EINVAL`) and gives 0, 1, or 3 for the kind that excepts advised
+  memory. Disabled for every VMA, `MADV_COLLAPSE` is refused (`EINVAL`),
+  as Linux's `vma_thp_disabled` decides; nothing else changes, as the
+  emulator places a mapping where a huge page would fit either way, as
+  Linux does.
   Other options give `EINVAL`.
 
 - When a process exits, its children go to the nearest ancestor that set

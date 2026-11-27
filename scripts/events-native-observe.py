@@ -62,7 +62,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--emulator", type=Path)
     parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--case", choices=[str(n) for n in range(84)] + ["timer", "unix"])
+    parser.add_argument("--case", choices=[str(n) for n in range(86)] + ["timer", "unix"])
     args = parser.parse_args()
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise RuntimeError("Native expectations require an x86-64 Linux runner")
@@ -71,14 +71,14 @@ def main():
     cases = (
         [args.case]
         if args.case is not None
-        else ([0] if args.smoke else [*list(range(84)), "timer", "unix"])
+        else ([0] if args.smoke else [*list(range(86)), "timer", "unix"])
     )
     for case in cases:
         case = int(case) if str(case).isdigit() else case
         guest = args.guests / (f"event-{case}" if isinstance(case, int) else f"events-{case}")
         closed = case in CLOSED_STDOUT
         native = run([str(guest.resolve())], args.out / f"native-{case}", closed_stdout=closed)
-        signal_exit = {60: -9, 83: -13}.get(case, 0)
+        signal_exit = {60: -9, 83: -13, 85: -13}.get(case, 0)
         if native["exit"] != signal_exit or (native["stderr"] and case != 82):
             raise RuntimeError(f"Unexpected native case {case}: {native}")
         result = dict(
@@ -101,7 +101,7 @@ def main():
                 if emulated != expected:
                     raise RuntimeError(f"Network policy case {case}: {emulated}")
                 result["policy_exception"] = "AF_INET/AF_INET6 unavailable: EAFNOSUPPORT"
-            elif case in (60, 83):
+            elif case in (60, 83, 85):
                 expected = dict(native, exit=128 - signal_exit)
                 if emulated != expected:
                     raise RuntimeError(f"Signal CLI exit mapping case {case}: {emulated}")

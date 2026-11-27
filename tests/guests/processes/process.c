@@ -9635,11 +9635,18 @@ static int io_uring_case(void) {
     unsigned long arg[3] = {0, 0, (unsigned long)ts};
     uring_show("enter-timeout", uring_enter(u.fd, 0, 1, 1 | 1 << 3, arg, 24));
     uring_show("enter-arg-size", uring_enter(u.fd, 0, 1, 1 | 1 << 3, arg, 16));
+    /* Linux 7.0's: no wait region is registered, and no I/O wait. */
+    uring_show("enter-region-size", uring_enter(u.fd, 0, 1, 1 | 1 << 3 | 1 << 6, NULL, 24));
+    uring_show("enter-region", uring_enter(u.fd, 0, 1, 1 | 1 << 3 | 1 << 6, NULL, 64));
+    uring_show("enter-region-alone", uring_enter(u.fd, 0, 0, 1 | 1 << 6, NULL, 0));
+    uring_show("enter-no-iowait", uring_enter(u.fd, 0, 0, 1 << 7, NULL, 0));
+    uring_show("enter-unknown-flag", uring_enter(u.fd, 0, 0, 1 << 8, NULL, 0));
     uring_show("register-unknown", syscall(427, u.fd, 255, NULL, 0));
     uring_show("register-not-ring", syscall(427, efd, 8, NULL, 0));
     unsigned char probe[16 + 8 * 64];
     memset(probe, 0, sizeof probe);
     uring_show("probe", syscall(427, u.fd, 8, probe, 64));
+    printf("probe-last: %d ops: %d\n", probe[0], probe[1]);
     printf("probe-nop: %d epoll: %d\n", probe[16 + 2] & 1, probe[16 + 8 * 29 + 2] & 1);
     uring_show("probe-dirty", syscall(427, u.fd, 8, probe, 1));
     close(efd);
@@ -18977,6 +18984,98 @@ static int generated_name_errors_case(void) {
     return 0;
 }
 
+/* The generated-rooted-links case: under a root of its own, whose /proc
+   and /dev are bind mounts of the machine's, a symbolic link in that root
+   into them (absolute, so from the new root, or relative) finds what their
+   own paths find, and execve of a process's exe link through one runs the
+   program, as Linux's walk follows links from fs->root. In a user
+   namespace of its own, for the binds and chroot; only errno values and
+   whether the two ways agree are printed. */
+static char grl_base[] = "/tmp/paludarium-rooted-links-XXXXXX";
+static void grl_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", grl_base, name); }
+/* What open, stat and lstat (the file type, S_IFMT >> 12), access and
+   readlink give for `path` (0 or -errno), and its inode. */
+static void grl_probe(const char *path, long out[6]) {
+    struct stat st;
+    char buf[512];
+    int fd = open(path, O_RDONLY);
+    out[0] = fd < 0 ? -errno : 0;
+    if (fd >= 0) close(fd);
+    out[1] = stat(path, &st) ? -errno : (long)(st.st_mode & S_IFMT) >> 12;
+    out[2] = lstat(path, &st) ? -errno : (long)(st.st_mode & S_IFMT) >> 12;
+    out[3] = access(path, R_OK) ? -errno : 0;
+    long n = readlink(path, buf, sizeof buf);
+    out[4] = n < 0 ? -errno : 0;
+    out[5] = stat(path, &st) ? 0 : (long)st.st_ino;
+}
+static int grl_inner(const char *self) {
+    char proc_place[256], dev_place[256], lp[256], lr[256], ld[256];
+    grl_path(proc_place, "proc");
+    grl_path(dev_place, "dev");
+    grl_path(lp, "lp");
+    grl_path(lr, "lr");
+    grl_path(ld, "ld");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    printf("binds=%d %d\n", mount("/proc", proc_place, NULL, MS_BIND | MS_REC, NULL) ? errno : 0,
+           mount("/dev", dev_place, NULL, MS_BIND | MS_REC, NULL) ? errno : 0);
+    printf("links=%d %d %d\n", symlink("/proc", lp), symlink("proc", lr), symlink("/dev", ld));
+    if (chroot(grl_base) || chdir("/")) return 81;
+    const char *pairs[][2] = {{"/proc", "/lp"}, {"/proc", "/lr"}, {"/dev", "/ld"}};
+    const char *names[] = {"self/comm", "uptime", "self", "self/exe", "null", "pts", "x8"};
+    for (unsigned i = 0; i < 3; i++)
+        for (unsigned j = 0; j < 7; j++) {
+            char direct[300], through[300];
+            snprintf(direct, sizeof direct, "%s/%s", pairs[i][0], names[j]);
+            snprintf(through, sizeof through, "%s/%s", pairs[i][1], names[j]);
+            long a[6], b[6];
+            grl_probe(direct, a);
+            grl_probe(through, b);
+            printf("%s: open=%ld stat=%ld lstat=%ld access=%ld readlink=%ld same=%d\n", through, a[0], a[1],
+                   a[2], a[3], a[4], !memcmp(a, b, sizeof a));
+        }
+    const char *runs[] = {"/proc/self/exe", "/lp/self/exe", "/lr/self/exe"};
+    for (unsigned i = 0; i < 3; i++) printf("exec %s=%d\n", runs[i], gl_exec(self, runs[i], 0));
+    return 0;
+}
+static int generated_rooted_links_case(const char *self) {
+    if (!mkdtemp(grl_base)) return 1;
+    char path[256];
+    grl_path(path, "proc");
+    mkdir(path, 0755);
+    grl_path(path, "dev");
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(grl_inner(self));
+    }
+    printf("status=%d\n", reaped(child));
+    const char *files[] = {"lp", "lr", "ld"};
+    for (unsigned i = 0; i < 3; i++) {
+        grl_path(path, files[i]);
+        unlink(path);
+    }
+    grl_path(path, "proc");
+    rmdir(path);
+    grl_path(path, "dev");
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(grl_base) == 0);
+    return 0;
+}
+
 /* The generated-noexec case: /proc and /dev are noexec mounts, so an
    executable mapping of a file there is EPERM before anything else is
    checked, and mprotect to one EACCES; a file reached through a link
@@ -22594,6 +22693,117 @@ static int proc_oom_case(void) {
     waitpid(child, &status, 0);
     printf("user child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     OC_SET("0");
+    return 0;
+}
+
+/* The status-space case: the lines status has while the task has its
+   memory (CoreDumping, THP_enabled, untag_mask). PR_SET_THP_DISABLE (41)
+   changes THP_enabled for the whole space, which a thread shares and a fork
+   and an exec keep; it then refuses MADV_COLLAPSE (25), and a zombie, which
+   has no memory, shows none of the lines. */
+static void ss_field(const char *path, const char *name, char *out, size_t size) {
+    snprintf(out, size, "missing");
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(out, size, "open-%d", errno);
+        return;
+    }
+    char line[256];
+    size_t len = strlen(name);
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, name, len) && line[len] == ':') {
+            char *v = line + len + 1;
+            while (*v == '\t' || *v == ' ') v++;
+            v[strcspn(v, "\n")] = 0;
+            snprintf(out, size, "%s", v);
+            break;
+        }
+    }
+    fclose(f);
+}
+static void ss_show(const char *label, const char *path) {
+    const char *names[] = {"CoreDumping", "THP_enabled", "untag_mask"};
+    printf("%s:", label);
+    for (int i = 0; i < 3; i++) {
+        char v[64];
+        ss_field(path, names[i], v, sizeof v);
+        printf(" %s=%s", names[i], v);
+    }
+    printf("\n");
+}
+static void *ss_thread(void *arg) {
+    (void)arg;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/status", (long)syscall(SYS_gettid));
+    ss_show("thread", path);
+    printf("thread get: %d\n", prctl(42, 0, 0, 0, 0));
+    return NULL;
+}
+static void ss_try(const char *label, long arg2, long arg3, long arg4) {
+    errno = 0;
+    int r = prctl(41, arg2, arg3, arg4, 0);
+    printf("%s: %d errno=%d\n", label, r, errno);
+}
+static int status_space_case(const char *self, char **argv) {
+    if (argv[3] && !strcmp(argv[3], "show")) {
+        ss_show("exec", "/proc/self/status");
+        printf("exec get: %d\n", prctl(42, 0, 0, 0, 0));
+        return 0;
+    }
+    ss_show("default", "/proc/self/status");
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    errno = 0;
+    int r = prctl(42, 1, 0, 0, 0);
+    printf("get with an argument: %d errno=%d\n", r, errno);
+    ss_try("enable with a flag", 0, 2, 0);
+    ss_try("unknown flag", 1, 4, 0);
+    ss_try("fourth argument", 1, 0, 1);
+    ss_try("disable", 7, 0, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("disabled", "/proc/self/status");
+    pthread_t t;
+    if (pthread_create(&t, NULL, ss_thread, NULL)) return 80;
+    pthread_join(t, NULL);
+    long huge = 2L << 20;
+    char *area = mmap(NULL, 2 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 81;
+    char *aligned = (char *)(((unsigned long)area + huge - 1) & ~(unsigned long)(huge - 1));
+    aligned[0] = 1;
+    errno = 0;
+    r = madvise(aligned, huge, 25);
+    printf("collapse: %d errno=%d\n", r, errno);
+    ss_try("except advised", 1, 2, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("except advised", "/proc/self/status");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ss_show("child", "/proc/self/status");
+        printf("child get: %d\n", prctl(42, 0, 0, 0, 0));
+        fflush(stdout);
+        execl(self, self, "status-space", self, "show", (char *)NULL);
+        _exit(1);
+    }
+    waitpid(child, NULL, 0);
+    ss_try("disable again", 1, 0, 0);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        execl(self, self, "status-space", self, "show", (char *)NULL);
+        _exit(1);
+    }
+    waitpid(child, NULL, 0);
+    pid_t zombie = fork();
+    if (zombie == 0) _exit(0);
+    siginfo_t info;
+    if (waitid(P_PID, zombie, &info, WEXITED | WNOWAIT)) return 82;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", zombie);
+    ss_show("zombie", path);
+    waitpid(zombie, NULL, 0);
+    ss_try("enable", 0, 0, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("enabled", "/proc/self/status");
     return 0;
 }
 
@@ -44627,6 +44837,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-link-names")) return generated_link_names_case(self);
     if (!strcmp(mode, "generated-link-ran")) return 7;
     if (!strcmp(mode, "generated-name-errors")) return generated_name_errors_case();
+    if (!strcmp(mode, "generated-rooted-links")) return generated_rooted_links_case(self);
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
@@ -44684,6 +44895,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userns-nondumpable-target")) return userns_nondumpable_target();
     if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
+    if (!strcmp(mode, "status-space")) return status_space_case(self, argv);
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "segment-registers")) return segments_case();

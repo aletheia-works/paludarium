@@ -461,6 +461,7 @@ mod linux {
                     | "multicast-groups"
                     | "multicast-groups6"
                     | "veth-ipv6-own-neighbours"
+                    | "veth-ipv6-anycast"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -736,6 +737,7 @@ mod linux {
         multicast_groups => ("multicast-groups","multicast-groups"),
         multicast_groups6 => ("multicast-groups6","multicast-groups6"),
         veth_ipv6_own_neighbours => ("veth-ipv6-own-neighbours","veth-ipv6-own-neighbours"),
+        veth_ipv6_anycast => ("veth-ipv6-anycast","veth-ipv6-anycast"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
@@ -1000,6 +1002,7 @@ mod linux {
         processes_pipe_size => ("pipe-size","process"),
         processes_poll => ("poll","process"),
         processes_proc_status => ("proc-status","process"),
+        processes_status_space => ("status-space","process"),
         processes_credentials => ("credentials","process"),
         processes_permissions => ("permissions","process"),
         processes_setuid => ("setuid","process"),
@@ -1181,6 +1184,7 @@ mod linux {
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_link_names => ("generated-link-names","process"),
         processes_generated_name_errors => ("generated-name-errors","process"),
+        processes_generated_rooted_links => ("generated-rooted-links","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),

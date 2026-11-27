@@ -742,7 +742,7 @@ impl Network {
     }
     /// Whether the device `index` has IPv6 at all (`in6_dev_get`): not a
     /// veth end of an MTU below 1280.
-    fn has_ipv6(&self, index: i32) -> bool {
+    pub(crate) fn has_ipv6(&self, index: i32) -> bool {
         self.devices().groups6_of(index).is_some()
     }
     /// Does `change` with the IPv6 groups of the device `index`, or with none
@@ -837,13 +837,16 @@ impl Network {
     /// all-routers group, a loopback having no multicast (`IFF_MULTICAST`).
     pub(crate) fn register6(&self, index: i32, now: u64) {
         self.sync6();
-        let mut devices = self.devices();
-        let Some(routes) = devices
+        let Some((veth, forwards)) = self
+            .devices()
             .by_index(index)
-            .map(|d| d.veth.is_some() && d.conf6.forwarding != 0)
+            .map(|d| (d.veth.is_some(), d.conf6.forwarding != 0))
         else {
             return;
         };
+        self.addresses().set_forwarding6(index, forwards);
+        let routes = veth && forwards;
+        let mut devices = self.devices();
         for group in NODES6 {
             join_in6(&mut devices, index, group, Mode::Exclude, now);
         }
@@ -862,11 +865,19 @@ impl Network {
         let told = destroy6(device);
         devices.told6.extend(told);
     }
-    /// The veth end `index` comes to forward IPv6 at `now`, or no longer
-    /// does (`dev_forward_change`): it joins the all-routers groups, or
-    /// leaves them.
-    pub(crate) fn forward6(&self, index: i32, on: bool, now: u64) {
+    /// The device `index` comes to forward IPv6 at `now`, or no longer
+    /// does (`dev_forward_change`): a veth end joins the all-routers
+    /// groups, or leaves them; then the device joins, or leaves, the
+    /// subnet-router anycast address of each of its addresses
+    /// ([`crate::interface::Addresses::forward6`]), what that makes given
+    /// back to tell of.
+    pub(crate) fn forward6(&self, index: i32, on: bool, now: u64) -> Vec<crate::interface::Event> {
         self.sync6();
+        self.forward_groups6(index, on, now);
+        self.addresses().forward6(index, on, now)
+    }
+    /// [`Self::forward6`]'s all-routers groups.
+    fn forward_groups6(&self, index: i32, on: bool, now: u64) {
         let mut changed = Vec::new();
         {
             let mut devices = self.devices();

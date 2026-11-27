@@ -3319,6 +3319,9 @@ struct AddressSpaceData {
     /// `mm->flags`, which `/proc/<pid>/coredump_filter` shows): a fork's
     /// copy and an `execve`'s new space keep them.
     dump_filter: u32,
+    /// What `PR_SET_THP_DISABLE` set (Linux's `MMF_DISABLE_THP_*`), which a
+    /// fork's copy and an `execve`'s new space keep too.
+    thp_disable: ThpDisable,
 }
 
 impl Drop for AddressSpaceData {
@@ -3425,6 +3428,7 @@ impl AddressSpaceData {
             peak_resident: 0,
             peak_size: 0,
             dump_filter: DEFAULT_DUMP_FILTER,
+            thp_disable: ThpDisable::No,
         }
     }
 
@@ -4408,6 +4412,7 @@ impl AddressSpaceData {
         copy.mappings = self.mappings.clone();
         copy.anon_names = self.anon_names.clone();
         copy.dump_filter = self.dump_filter;
+        copy.thp_disable = self.thp_disable;
         copy.shared = self.shared.clone();
         copy.backing = self.backing.clone();
         // Linux's `VM_COPY_ON_FORK` has `VM_MAYBE_GUARD`: the child gets the
@@ -8118,7 +8123,8 @@ impl AddressSpaceData {
     /// Linux's `madvise_collapse` of `[start, end)` in the VMA
     /// `[vma_start, vma_end)`: the VMA must be one that may hold a
     /// transparent huge page (`thp_vma_allowable_order` with
-    /// `TVA_FORCED_COLLAPSE`, `EINVAL`): without `MADV_NOHUGEPAGE`, with
+    /// `TVA_FORCED_COLLAPSE`, `EINVAL`): without `MADV_NOHUGEPAGE` or a
+    /// `PR_SET_THP_DISABLE` of the whole space ([`ThpDisable`]), with
     /// room for an aligned 2 MiB extent, and either private anonymous
     /// memory with an `anon_vma` (a page of it was written,
     /// [`Mapping::anon_vma`]) or a mapping of shmem's page cache
@@ -8145,7 +8151,10 @@ impl AddressSpaceData {
         ) && self.shared_at(vma_start).is_none()
             && self.backing_at(vma_start).is_none();
         let room = vma_end >= HUGE_PAGE && (vma_end - HUGE_PAGE) & !(HUGE_PAGE - 1) >= vma_start;
-        if mapping.huge_pages == Some(false) || !room {
+        // `vma_thp_disabled`: a forced collapse is advice enough for a
+        // space that disabled them only where not advised.
+        if mapping.huge_pages == Some(false) || self.thp_disable == ThpDisable::Completely || !room
+        {
             return Err(Errno::EINVAL);
         }
         if !anonymous {
@@ -8862,6 +8871,13 @@ impl MemoryView {
         lock_spinning(&data).dump_filter = bits & DUMP_FILTER_MASK;
         true
     }
+    /// [`AddressSpace::thp_disable`] of the space, while it lives.
+    #[must_use]
+    pub fn thp_disable(&self) -> Option<ThpDisable> {
+        let data = self.data.upgrade()?;
+        let _serialization = lock_spinning(&self.serialization);
+        Some(lock_spinning(&data).thp_disable)
+    }
     /// The first VMA that ends after `addr`, if the space still lives and
     /// has one.
     #[must_use]
@@ -9466,6 +9482,19 @@ const DUMP_FILTER_MASK: u32 = (1 << DUMP_FILTER_BITS) - 1;
 /// it): anonymous private and shared memory, ELF headers and hugetlb
 /// private memory.
 pub const DEFAULT_DUMP_FILTER: u32 = 0x33;
+/// Whether a space disabled transparent huge pages with
+/// `PR_SET_THP_DISABLE` (Linux's `MMF_DISABLE_THP_COMPLETELY` and
+/// `MMF_DISABLE_THP_EXCEPT_ADVISED`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThpDisable {
+    #[default]
+    No,
+    /// For every VMA: `MADV_COLLAPSE` too is refused.
+    Completely,
+    /// Only where `MADV_HUGEPAGE` did not ask for them
+    /// (`PR_THP_DISABLE_EXCEPT_ADVISED`).
+    ExceptAdvised,
+}
 impl Default for AddressSpace {
     fn default() -> Self {
         Self::new()
@@ -9805,6 +9834,15 @@ impl AddressSpace {
     /// Sets the core dump filter bits, the low [`DUMP_FILTER_BITS`].
     pub fn set_dump_filter(&self, bits: u32) {
         self.locked().dump_filter = bits & DUMP_FILTER_MASK;
+    }
+    /// What `PR_SET_THP_DISABLE` set ([`ThpDisable::No`] at first), which
+    /// an `execve`'s new space takes from the old.
+    #[must_use]
+    pub fn thp_disable(&self) -> ThpDisable {
+        self.locked().thp_disable
+    }
+    pub fn set_thp_disable(&self, value: ThpDisable) {
+        self.locked().thp_disable = value;
     }
     /// The kernel's `membarrier` state for this space, shared by every
     /// thread that runs in it.

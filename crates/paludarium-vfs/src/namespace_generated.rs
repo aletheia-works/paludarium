@@ -150,8 +150,14 @@ impl NamespacedFs {
     /// directory on a directory (`graft_tree`, `ENOTDIR`), and on a shared
     /// mount it is shared too, in a new peer group. A mount below the
     /// directory (`/dev/shm` of `/dev`) does not come along, even with
-    /// `MS_REC`, and when locked it is refused (`has_locked_children`).
-    pub fn bind_generated(&self, source: GeneratedSource, target: &[u8]) -> Result<(), Errno> {
+    /// `recurse` (`MS_REC`); without it, a locked one is refused
+    /// (`has_locked_children`).
+    pub fn bind_generated(
+        &self,
+        source: GeneratedSource,
+        target: &[u8],
+        recurse: bool,
+    ) -> Result<(), Errno> {
         self.swept();
         let entries = self.table.snapshot();
         let to = self.walk(&entries, target, true, false, true)?;
@@ -163,7 +169,7 @@ impl NamespacedFs {
         // `has_locked_children`: what is mounted below a directory, locked
         // in a namespace of a less privileged owner, stays covered (`EINVAL`
         // without `MS_REC`, which takes nothing along here).
-        if directory {
+        if directory && !recurse {
             let base = source.machine_path(b"/");
             if entries
                 .iter()
@@ -284,5 +290,28 @@ impl NamespacedFs {
             }
             _ => None,
         }
+    }
+    /// [`Self::generated`] for a process whose root is the resolved
+    /// `root`: an absolute symbolic link on the way starts there, and `..`
+    /// stops there, as the walk of a process under `chroot` goes.
+    #[must_use]
+    pub fn generated_in(
+        &self,
+        root: &[u8],
+        path: &[u8],
+        follow: bool,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        if root == self.root.as_slice() {
+            return self.generated(path, follow);
+        }
+        // The walk reads only the machine's file system and the table.
+        Self {
+            lower: Arc::clone(&self.lower),
+            view: Arc::clone(&self.view),
+            table: Arc::clone(&self.table),
+            root: root.to_vec(),
+            lower_devices: self.lower_devices,
+        }
+        .generated(path, follow)
     }
 }

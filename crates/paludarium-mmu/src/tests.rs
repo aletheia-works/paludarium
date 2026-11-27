@@ -774,8 +774,7 @@ fn a_userfaultfd_write_protection_faults_on_writes_while_registered() {
         .unwrap();
     m.write(page, b"i").unwrap();
     assert!(m.mappings().all(|mapping| mapping.userfault.is_none()));
-    // As does a registration that replaces it with one for missing pages
-    // alone, though not one it has the modes of already; and the release.
+    // A registration it has the modes of already keeps the protection.
     view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::WP | Userfault::MISSING)
         .unwrap();
     view.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true)
@@ -784,17 +783,34 @@ fn a_userfaultfd_write_protection_faults_on_writes_while_registered() {
         .unwrap();
     assert!(m.write(a, b"j").is_err());
     view.userfault_unregister(a.0, a.0 + PAGE_SIZE, 7).unwrap();
+    // One that replaces the mode leaves the mark, which protects nothing
+    // and shows in the pagemap, as Linux leaves `_PAGE_UFFD_WP`; with the
+    // mode registered again, it protects the page again.
+    let uffd_wp = |m: &AddressSpace| m.view().pagemap(a.0, 1).unwrap()[0] & (1 << 57) != 0;
     view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::WP)
         .unwrap();
     view.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true)
         .unwrap();
     view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::MISSING)
         .unwrap();
-    assert!(m.write(a, b"j").is_ok());
+    assert!(uffd_wp(&m));
     view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::WP)
         .unwrap();
+    assert!(m.write(a, b"j").is_err());
+    // A write without the mode makes the entry writable and keeps the
+    // mark (`wp_page_reuse`): the mode registered again does not protect
+    // it, until `UFFDIO_WRITEPROTECT` does.
+    view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    assert!(m.write(a, b"j").is_ok());
+    assert!(uffd_wp(&m));
+    view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::WP)
+        .unwrap();
+    assert!(m.write(a, b"j").is_ok());
     view.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true)
         .unwrap();
+    assert!(m.write(a, b"j").is_err());
+    // The release ends the protection.
     view.userfault_release(7);
     m.write(a, b"k").unwrap();
     // Shared memory takes write protection too.

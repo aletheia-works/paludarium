@@ -1335,8 +1335,13 @@ kernel.
   anonymous memory or a `UFFDIO_POISON` is `EEXIST` there. `mprotect` keeps the protection,
   and refuses a write it does not permit with SIGSEGV as before; a
   `fork`ed child and a move by `mremap` (without their events' features),
-  `UFFDIO_UNREGISTER`, closing the file and a registration that replaces
-  the write-protect mode take it away. With `UFFD_FEATURE_WP_ASYNC`, which brings
+  `UFFDIO_UNREGISTER` and closing the file take it away. A registration
+  that replaces the write-protect mode changes the VMA's flags alone, as
+  Linux's `userfaultfd_register_range` does: the pages keep their marks,
+  which bit 57 of `/proc/<pid>/pagemap` still shows and which protect
+  nothing; registered again, the mode protects them again, but for a page
+  a write took meanwhile, whose entry became writable with its mark kept
+  (`wp_page_reuse`), until `UFFDIO_WRITEPROTECT` protects it again. With `UFFD_FEATURE_WP_ASYNC`, which brings
   `UFFD_FEATURE_WP_UNPOPULATED` (as `/proc/<pid>/fdinfo` shows), a write
   to a write-protected page, an instruction's or a system call's, does not
   fault: it clears the page's protection and goes on, as `do_wp_page`

@@ -803,6 +803,8 @@ static void protected_fault(const char *what, int fd, void *base, struct toucher
 }
 
 /* Write protection of private anonymous memory. */
+static void wp_mode_replaced(void);
+
 static int case_wp(void) {
     int fd = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_THREAD_ID);
     char *base = anon(4 * PAGE);
@@ -917,6 +919,7 @@ static int case_wp(void) {
     printf("seen: %c byte 4: %c\n", t.seen, more[PAGE + 4]);
     close(fd);
     printf("closed, written: %c\n", (more[PAGE] = 'z'));
+    wp_mode_replaced();
     return 0;
 }
 
@@ -1357,6 +1360,46 @@ static void write_fault(const char *what, int fd, char *base, char *at) {
            err(protect(fd, (void *)((uintptr_t)at & ~(uintptr_t)(PAGE - 1)), PAGE, 0)));
     pthread_join(thread, NULL);
     printf("seen: %c\n", t.seen);
+}
+
+/* A thread's write of `at`: whether it faults to `fd` (within half a
+   second), whose protection of the page then ends. */
+static void write_or_fault(const char *what, int fd, char *at) {
+    struct toucher t = {at, 1, 0, 0};
+    pthread_t thread;
+    pthread_create(&thread, NULL, touch, &t);
+    struct pollfd waiting = {fd, POLLIN, 0};
+    int faulted = poll(&waiting, 1, 500) == 1;
+    if (faulted) {
+        struct uffd_msg msg;
+        read(fd, &msg, sizeof msg);
+        protect(fd, (void *)((uintptr_t)at & ~(uintptr_t)(PAGE - 1)), PAGE, 0);
+    }
+    pthread_join(thread, NULL);
+    printf("%s: faulted %d seen %c\n", what, faulted, t.seen);
+}
+
+/* A registration that replaces the write-protect mode changes the VMA's
+   flags alone (userfaultfd_register_range): the entries keep
+   _PAGE_UFFD_WP, which the pagemap shows and which protects nothing; the
+   mode registered again protects the page again, unless a write made the
+   entry writable meanwhile (wp_page_reuse keeps the bit). */
+static void wp_mode_replaced(void) {
+    int fd = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP);
+    char *a = anon(2 * PAGE);
+    printf("register two: %s\n", err(reg(fd, a, 2 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    a[0] = 'x';
+    a[PAGE] = 'y';
+    printf("protect two: %s\n", err(protect(fd, a, 2 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    printf("register missing alone: %s\n", err(reg(fd, a, 2 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    pagemap_show("replaced", a);
+    write_or_fault("write after the mode went", fd, a + PAGE);
+    pagemap_show("written after the mode went", a + PAGE);
+    printf("register write protection again: %s\n", err(reg(fd, a, 2 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    write_or_fault("unwritten page", fd, a);
+    write_or_fault("page written meanwhile", fd, a + PAGE);
+    pagemap_show("page written meanwhile", a + PAGE);
+    close(fd);
 }
 
 /* Write protection of shmem, whose pages that have no entry get markers,

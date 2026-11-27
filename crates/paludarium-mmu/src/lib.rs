@@ -1805,8 +1805,15 @@ struct Page {
     shrinks: u64,
     /// `UFFDIO_WRITEPROTECT` protected it (Linux's `_PAGE_UFFD_WP`): a
     /// write faults to the `userfaultfd` its mapping is registered with for
-    /// [`Userfault::WP`], which it is set only while that lasts.
+    /// [`Userfault::WP`]. A registration that replaces that mode leaves it,
+    /// as Linux leaves the bit in the entry.
     uffd_wp: bool,
+    /// With [`Self::uffd_wp`], a write took the entry while its mapping
+    /// was not registered for [`Userfault::WP`]: Linux's `do_wp_page`
+    /// reuses the page (`wp_page_reuse`), which makes the entry writable
+    /// and keeps `_PAGE_UFFD_WP`, so a write to it faults no more until
+    /// `UFFDIO_WRITEPROTECT` protects it again.
+    uffd_wp_writable: bool,
     /// Linux's `_PAGE_SOFT_DIRTY`: written since `clear_refs` cleared it,
     /// which write-protects the entry so that the next write sets it
     /// (`clear_soft_dirty`). An entry made in a mapping with `VM_SOFTDIRTY`
@@ -1840,6 +1847,7 @@ impl Page {
             cache: self.cache,
             shrinks: self.shrinks,
             uffd_wp: self.uffd_wp,
+            uffd_wp_writable: self.uffd_wp_writable,
             soft_dirty: self.soft_dirty,
             young: AtomicBool::new(false),
         }
@@ -1849,11 +1857,18 @@ impl Page {
     /// while `UFFDIO_WRITEPROTECT` protects it, as Linux's
     /// `pte_mkuffd_wp` makes the entry read-only.
     fn access(&self) -> Prot {
-        if self.uffd_wp {
+        if self.write_protected() {
             Prot(self.prot.0 & !Prot::WRITE.0)
         } else {
             self.prot
         }
+    }
+
+    /// Whether the entry is read-only for `UFFDIO_WRITEPROTECT`'s
+    /// protection: marked, and not made writable since
+    /// ([`Self::uffd_wp_writable`]).
+    fn write_protected(&self) -> bool {
+        self.uffd_wp && !self.uffd_wp_writable
     }
 
     /// What a [`ThreadTlb`] may do with it without the locks: what an
@@ -3883,6 +3898,7 @@ impl AddressSpaceData {
             // Made now, so no shrink so far can leave it past the end.
             shrinks: self.file_at(page).map_or(0, |(source, _)| source.shrinks()),
             uffd_wp: false,
+            uffd_wp_writable: false,
             soft_dirty: self.mapping_at(page).is_some_and(|m| m.soft_dirty),
             young: AtomicBool::new(true),
         }
@@ -4796,8 +4812,17 @@ impl AddressSpaceData {
             // With `WP_ASYNC`, a write to a write-protected page clears the
             // protection ([`Self::refresh`]), as `do_wp_page` does: the
             // entry's own protection decides.
+            // So does one whose mapping is no longer registered for write
+            // protection, as `userfaultfd_pte_wp` needs the VMA's
+            // `VM_UFFD_WP`, and `do_wp_page` reuses the page.
             let prot = match lookup(directory, page) {
-                Some(p) if access.is_write() && p.uffd_wp && self.wp_async(page) => Some(p.prot),
+                Some(p)
+                    if access.is_write()
+                        && p.uffd_wp
+                        && (self.wp_async(page) || !self.wp_registered(page)) =>
+                {
+                    Some(p.prot)
+                }
                 _ => self.prot_at(directory, page),
             };
             match prot {
@@ -4888,7 +4913,9 @@ impl AddressSpaceData {
             // write meets an entry's protection here too, as
             // `can_follow_write_pte` never overrides it.
             let protected = match lookup(directory, page) {
-                Some(p) => access == Access::ForceWrite && p.uffd_wp,
+                Some(p) => {
+                    access == Access::ForceWrite && p.write_protected() && self.wp_registered(page)
+                }
                 None => {
                     matches!(access, Access::Write | Access::ForceWrite) && self.uffd_marked(page)
                 }
@@ -5220,7 +5247,7 @@ impl AddressSpaceData {
             let ready = |page: u64| {
                 lookup(&directory, page).is_some_and(|p| {
                     !p.cow
-                        && !p.uffd_wp
+                        && !p.write_protected()
                         && p.soft_dirty
                         && p.frame.get().is_some()
                         && !self.may_be_truncated(page, p)
@@ -5278,6 +5305,12 @@ impl AddressSpaceData {
             let unprotect = access != Access::Setup && self.wp_async(page);
             if unprotect && let Some(Some(p)) = table.pages.get_mut(slot) {
                 p.uffd_wp = false;
+            }
+            // Without the mode, the entry keeps the mark, and becomes
+            // writable (`wp_page_reuse`).
+            let reused = access != Access::Setup && !self.wp_registered(page);
+            if reused && let Some(Some(p)) = table.pages.get_mut(slot) {
+                p.uffd_wp_writable |= p.uffd_wp;
             }
             if let Some(entry) = table.pages.get_mut(slot)
                 && !self.refresh(entry, page, prot, true)
@@ -7079,6 +7112,15 @@ impl AddressSpaceData {
                 .is_some_and(|u| u.modes & Userfault::WP != 0)
     }
 
+    /// Whether the mapping at `page` is registered for [`Userfault::WP`]
+    /// (Linux's `VM_UFFD_WP`), without which an entry's mark protects
+    /// nothing.
+    fn wp_registered(&self, page: u64) -> bool {
+        self.mapping_at(page)
+            .and_then(|m| m.userfault)
+            .is_some_and(|u| u.modes & Userfault::WP != 0)
+    }
+
     /// Whether a write to the page at `page`, if `UFFDIO_WRITEPROTECT`
     /// protected it, clears the protection rather than faulting: its
     /// mapping is registered for [`Userfault::WP`] by a `userfaultfd` with
@@ -7230,7 +7272,7 @@ impl AddressSpaceData {
             && registration.modes & Userfault::WP != 0
             && registration.modes & Userfault::WP_ASYNC == 0
             && mapping.prot.contains(Prot::WRITE)
-            && lookup(&directory, page).is_some_and(|p| p.uffd_wp)
+            && lookup(&directory, page).is_some_and(Page::write_protected)
         {
             return Some((registration.context, UserfaultReason::Protected));
         }
@@ -7269,6 +7311,7 @@ impl AddressSpaceData {
         }
         let mut entry = self.fresh(page, prot);
         entry.uffd_wp = true;
+        entry.uffd_wp_writable = false;
         self.recount(page, None, Some(&entry));
         let (dir, slot) = page_index(page);
         self.write_directory()
@@ -7288,6 +7331,7 @@ impl AddressSpaceData {
         self.for_populated(start, end, |entry| {
             if let Some(page) = entry {
                 page.uffd_wp = protect;
+                page.uffd_wp_writable = false;
             }
         });
         if !protect {
@@ -7314,7 +7358,11 @@ impl AddressSpaceData {
     /// `userfaultfd` registered (`EBUSY`). Then the part of each in the
     /// range takes the modes in place of its own, unless it has them from
     /// this one already. A part that stops being registered for
-    /// [`Userfault::WP`] loses the protection of its pages.
+    /// [`Userfault::WP`] keeps the marks of its pages, as Linux's
+    /// `userfaultfd_register_range` changes the VMA's flags alone: they
+    /// protect nothing until the write-protect mode is registered again
+    /// ([`Self::userfault_for`], [`Self::uffd_marked`]), and
+    /// `/proc/<pid>/pagemap` shows them meanwhile.
     pub fn userfault_register(
         &mut self,
         start: u64,
@@ -7346,9 +7394,6 @@ impl AddressSpaceData {
                 continue;
             }
             let (from, to) = (m.start.0.max(start), m.end().min(end));
-            if modes & Userfault::WP == 0 {
-                self.userfault_mark(from, to, false, false);
-            }
             self.split_at(from);
             self.split_at(to);
             for (_, piece) in self.mappings.range_mut(from..to) {
@@ -7592,6 +7637,7 @@ impl AddressSpaceData {
             };
         }
         entry.uffd_wp = protect;
+        entry.uffd_wp_writable = false;
         // `mfill_atomic_install_pte` makes a dirty entry; the zero page
         // of private memory (`mfill_atomic_pte_zeropage`) is not.
         entry.soft_dirty |= bytes.is_some() || shared.is_some();
@@ -7676,6 +7722,7 @@ impl AddressSpaceData {
         let mut entry = self.page(page, prot);
         self.fill_from_file(page, &entry);
         entry.uffd_wp = protect;
+        entry.uffd_wp_writable = false;
         // A dirty entry (`mfill_atomic_install_pte`).
         entry.soft_dirty = true;
         self.recount(page, None, Some(&entry));
@@ -7810,6 +7857,7 @@ impl AddressSpaceData {
                 Some(entry) if !zero => Page {
                     prot: dst_mapping.prot,
                     uffd_wp: false,
+                    uffd_wp_writable: false,
                     soft_dirty: true,
                     young: AtomicBool::new(true),
                     ..entry

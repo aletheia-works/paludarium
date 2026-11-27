@@ -1188,8 +1188,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プライベートな anonymous メモリの `UFFDIO_ZEROPAGE` と `UFFDIO_POISON` はそこでは
   `EEXIST` です。`mprotect` は保護を残し、許さない書き込みはこれまでどおり SIGSEGV です。
   （そのイベントの機能がないときの）`fork` した子と `mremap` による移動、
-  `UFFDIO_UNREGISTER`、ファイルを閉じること、書き込み保護のモードを置き換える登録で
-  保護は外れます。
+  `UFFDIO_UNREGISTER`、ファイルを閉じることで保護は外れます。書き込み保護のモードを
+  置き換える登録は、Linux の `userfaultfd_register_range` と同じく VMA のフラグだけを
+  変えます。ページは印を残し、`/proc/<pid>/pagemap` のビット 57 はそれを示し続けますが、
+  印は何も保護しません。モードをもう一度登録すると、また保護します。ただしその間に
+  書き込まれたページは、印を残したままエントリーが書き込めるようになっている
+  （`wp_page_reuse`）ので、`UFFDIO_WRITEPROTECT` でまた保護するまで保護されません。
   `UFFD_FEATURE_WP_ASYNC`（`/proc/<pid>/fdinfo` が示すとおり
   `UFFD_FEATURE_WP_UNPOPULATED` を伴います）では、書き込み保護されたページへの
   書き込みは、命令のものもシステムコールのものもフォールトせず、`do_wp_page` と

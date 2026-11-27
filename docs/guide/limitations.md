@@ -1168,9 +1168,7 @@ verified.
   before it drops the pages of any, where Linux tells and drops VMA by VMA,
   and registered mappings of one `userfaultfd` that meet are one range of
   `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of
-  its whole range once its first mapping passes the checks. A
-  registration that replaces the write-protect mode with others ends the
-  protection of the range's pages, whose marks Linux leaves in their PTEs.
+  its whole range once its first mapping passes the checks.
   `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in
   the marker's place, where Linux, whose zap keeps the marker, restarts
   the call until a signal comes.

@@ -3218,7 +3218,13 @@ kernel.
     while the end has its carrier, in the peer's, if it takes the
     address as a broadcast one (the limited one, or one its routes make
     so) from a source its reverse path filtering takes
-    (`ip_route_input_slow`). A socket connected from the unspecified
+    (`ip_route_input_slow`). Out through `lo`, to the limited broadcast
+    address from a socket bound to `lo` or to its address, or by a
+    broadcast route through it (as the local table's to
+    `127.255.255.255`), it comes back in on `lo` once, to such sockets
+    bound to `lo` or to no device, as `lo` sends it with no copy looped
+    back (`__mkroute_output` gives `ip_mc_output` to no loopback device).
+    A socket connected from the unspecified
     address has taken its route's source, and takes none. An IPv4 socket
     bound to a broadcast or multicast address keeps it as its name, which
     a UDP connect leaves, but sends from its route's source (`inet_bind`),
@@ -3228,9 +3234,9 @@ kernel.
     IPv4 fail: `EINVAL` from a group or the limited broadcast address,
     `ENETUNREACH` from a subnet's, for UDP's `sendto` and `connect` and
     TCP's `connect`. A group or the
-    limited broadcast address from a socket bound to an end's address
-    needs no route: it goes out through that end
-    (`ip_route_output_key_hash_rcu`).
+    limited broadcast address from a socket bound to an end's address, or
+    to `lo`'s while it is up, needs no route: it goes out through that
+    device (`ip_route_output_key_hash_rcu`).
   - **IPv4 multicast groups:** a UDP socket joins and leaves a group with
     `IP_ADD_MEMBERSHIP` and `IP_DROP_MEMBERSHIP` (`ip_mreqn` or `ip_mreq`),
     on the device of an index, of an address, or of the route to the group

@@ -466,12 +466,15 @@ impl Network {
     /// the guest's networks. An IPv4 unicast route through `lo` sends it
     /// out through `lo`, which takes it in as its own (as
     /// [`Self::route4_through`] says), while `lo` is down too where one of
-    /// host scope has stayed; an IPv6 one is `ENETUNREACH`, where
+    /// host scope has stayed, and a broadcast one, as `127.255.255.255`'s
+    /// of the local table, or a unicast one to the limited broadcast
+    /// address, sends a broadcast out through `lo`; an IPv6 one is
+    /// `ENETUNREACH`, where
     /// Linux's, a rejecting one (`fib6_is_reject`), sends nothing and
     /// answers with ICMPv6's no route. Before all that, a group or the
-    /// limited broadcast address from a source `from` of a veth end's goes
-    /// out through that end without a route, as `ip_route_output_key_hash_rcu`
-    /// takes the source's device for them.
+    /// limited broadcast address from a source `from` of a device's goes
+    /// out through that device without a route, as
+    /// `ip_route_output_key_hash_rcu` takes the source's device for them.
     ///
     /// Through a device `oif` other than 0, an IPv6 destination's route is
     /// looked up through it, a local one too: strictly
@@ -533,7 +536,7 @@ impl Network {
             && !src.is_unspecified()
             && (ip.is_multicast() || ip.is_broadcast())
             && let Some(index) = self.addresses_at(now).device_of4(src)
-            && index != crate::netdev::LOOPBACK_INDEX
+            && (index != crate::netdev::LOOPBACK_INDEX || self.is_up())
         {
             let cast = if ip.is_broadcast() {
                 Cast::Broadcast
@@ -574,6 +577,19 @@ impl Network {
                                 if !ip.is_multicast() && !ip.is_broadcast()) =>
                     {
                         return Ok(Dest::Veth(crate::netdev::LOOPBACK_INDEX, Cast::Unicast));
+                    }
+                    // A broadcast out through `lo`, by the local table's
+                    // broadcast route or to the limited broadcast address by
+                    // a unicast one, comes back in on it once, as `lo` sends
+                    // it with no copy looped back (`__mkroute_output` gives
+                    // `ip_mc_output` to no loopback device).
+                    Ok(Some(route))
+                        if route.oif == crate::netdev::LOOPBACK_OIF
+                            && (route.kind == Kind::Broadcast
+                                || route.kind == Kind::Unicast
+                                    && matches!(to.ip(), IpAddr::V4(ip) if ip.is_broadcast())) =>
+                    {
+                        return Ok(Dest::Veth(crate::netdev::LOOPBACK_INDEX, Cast::Broadcast));
                     }
                     _ => {}
                 }
@@ -1127,8 +1143,10 @@ impl Network {
     /// through it at once; else by the tables' routes through it only,
     /// and where none goes, out through it, on link. Through `lo` a
     /// unicast one goes so too, and comes back in on it, whatever its
-    /// address; a group comes back in too; the limited broadcast address,
-    /// and another kind of route through it, is `ENETUNREACH`.
+    /// address; a group and the limited broadcast address come back in
+    /// too, and so does an address its broadcast route has (as
+    /// `127.255.255.255`); another kind of route through it is
+    /// `ENETUNREACH`.
     fn route4_through(
         &self,
         to: SocketAddr,
@@ -1155,7 +1173,7 @@ impl Network {
             Cast::Unicast
         };
         if !lo && (u32::from(ip) & 0xffff_ff00 == 0xe000_0000 || ip.is_broadcast())
-            || lo && cast == Cast::Multicast
+            || lo && cast != Cast::Unicast
         {
             return Ok(Dest::Veth(index, cast));
         }
@@ -1179,12 +1197,13 @@ impl Network {
                 };
                 Ok(Dest::Veth(index, cast))
             }
-            // Out through `lo`, as its own route or on link takes it.
-            Ok(route) if lo && route.kind == Kind::Unicast && cast == Cast::Unicast => {
-                Ok(Dest::Veth(index, cast))
+            // Out through `lo`, as its own route or on link takes it, or
+            // its broadcast route, of the local table.
+            Ok(route) if lo && route.kind == Kind::Unicast => Ok(Dest::Veth(index, cast)),
+            Ok(route) if lo && route.kind == Kind::Broadcast => {
+                Ok(Dest::Veth(index, Cast::Broadcast))
             }
             Ok(_) => Err(ENETUNREACH),
-            Err(_) if lo && cast != Cast::Unicast => Err(ENETUNREACH),
             // On link, through it.
             Err(_) => Ok(Dest::Veth(index, cast)),
         }

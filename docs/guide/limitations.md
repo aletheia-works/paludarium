@@ -243,7 +243,7 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Broadcast datagrams reach no one but through a veth end (below). A
+    Broadcast datagrams reach no one but through a veth end or `lo` (below). A
     datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
@@ -1247,9 +1247,7 @@ verified.
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
-  gave. Bound to `lo`, an IPv4 socket's packet to the limited broadcast
-  address or `127.255.255.255` is `ENETUNREACH`, where Linux sends it
-  through `lo`. Neighbour discovery sends no advertisement unasked, and no
+  gave. Neighbour discovery sends no advertisement unasked, and no
   redirect; the
   probe a delaying neighbour sends teaches the peer nothing, where
   Linux's, from the end's link-local address, makes it a neighbour of

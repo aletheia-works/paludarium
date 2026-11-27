@@ -348,6 +348,11 @@ pub enum ReadHint {
     Random,
 }
 
+/// What an install of guards that has to start again gives
+/// ([`AddressSpaceData::guard`]): Linux's `ERESTARTNOINTR`, which the
+/// system call turns into a restart, and never the guest's error.
+pub const GUARD_RESTART: Errno = Errno(513);
+
 /// The page faults that the calling host thread's accesses take, which
 /// count to its guest thread as they are taken, as Linux's
 /// `mm_account_fault` counts them to `current` (`perf`'s `page-faults`).
@@ -367,11 +372,6 @@ pub enum ReadHint {
 /// works for it ([`set_kernel`]); a host thread no guest thread is bound to
 /// keeps its faults itself, for [`take`] and [`take_forced`] or for the
 /// first [`bind`].
-/// What an install of guards that has to start again gives
-/// ([`AddressSpaceData::guard`]): Linux's `ERESTARTNOINTR`, which the
-/// system call turns into a restart, and never the guest's error.
-pub const GUARD_RESTART: Errno = Errno(513);
-
 pub mod faults {
     use core::cell::{Cell, RefCell};
     use std::sync::Arc;

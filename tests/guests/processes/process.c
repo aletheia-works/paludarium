@@ -19820,6 +19820,19 @@ static int th_mount(const char *m, const char *options) {
     printf("mount %s=%d\n", options, r);
     return r;
 }
+/* umount(m), retried for up to 5 s while it is EBUSY. Linux can still hold
+   a closed file of the mount for a moment after its last munmap and close:
+   khugepaged scans a huge-eligible mapping's file with a reference of its
+   own, and its fput of the last reference, from a kernel thread, waits for
+   delayed_fput's work. The emulator holds none, so it is the
+   first try's result there. */
+static int th_umount(const char *m) {
+    for (int tries = 0;; tries++) {
+        int r = tl_err(umount(m));
+        if (r != -EBUSY || tries == 500) return r;
+        usleep(10000);
+    }
+}
 static int th_file(const char *m, const char *name, long size) {
     char path[320];
     snprintf(path, sizeof path, "%s/%s", m, name);
@@ -19865,7 +19878,7 @@ static int th_inner(const char *m) {
     printf("nohugepage=%ld\n", th_fault("nohugepage", f, at + 3 * huge + (64 << 10), 64 << 10, 15));
     munmap(at, 5 * huge);
     close(a), close(b), close(c), close(d), close(e), close(f);
-    printf("umount=%d\n", tl_err(umount(m)));
+    printf("umount=%d\n", th_umount(m));
     if (th_mount(m, "huge=advise")) return 0;
     if (!(at = th_aligned(2 * huge))) return 82;
     a = th_file(m, "a", 2 * huge);
@@ -19877,7 +19890,7 @@ static int th_inner(const char *m) {
     printf("blocks=%ld\n", sf_blocks(a));
     munmap(at, 2 * huge);
     close(a);
-    printf("umount=%d\n", tl_err(umount(m)));
+    printf("umount=%d\n", th_umount(m));
     /* One page: a write, fallocate and a fault each take a page alone,
        and with it full, a fault is SIGBUS and a fill ENOMEM. */
     if (th_mount(m, "size=4k,huge=always")) return 0;
@@ -19907,7 +19920,7 @@ static int th_inner(const char *m) {
     printf("zeropage=%ld %lld blocks=%ld\n", zeroed, (long long)zero[3], sf_blocks(b));
     munmap(at, 4 * 4096);
     close(a), close(b), close(u);
-    printf("umount=%d\n", tl_err(umount(m)));
+    printf("umount=%d\n", th_umount(m));
     return 0;
 }
 /* The tmpfs-huge-placement case: a mapping of a file of a tmpfs mount with
@@ -19952,7 +19965,7 @@ static int thp_inner(const char *m) {
     printf("blocks=%ld\n", sf_blocks(g));
     munmap(a, 2 * huge), munmap(b, 2 * huge), munmap(c, 2 * huge), munmap(d, huge);
     close(f), close(g);
-    printf("umount=%d\n", tl_err(umount(m)));
+    printf("umount=%d\n", th_umount(m));
     return 0;
 }
 static int tmpfs_huge_placement_case(void) {

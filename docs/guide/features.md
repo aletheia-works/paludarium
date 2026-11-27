@@ -4345,7 +4345,7 @@ kernel.
   space and inodes are what it holds, and a mounted host directory with the
   host filesystem's own numbers. `/proc/self/mountinfo` and `/proc/self/mounts`
   list the mounts of the caller's mount namespace, and so does `/proc/mounts`,
-  a symbolic link to `self/mounts` (0777, of size 11) as Linux's
+  a symbolic link to `self/mounts` (0777, of size 11), as on Linux
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
   `proc` for `/proc`, `devtmpfs` for `/dev` and the tmpfs on `/dev/shm`
   from start-up,

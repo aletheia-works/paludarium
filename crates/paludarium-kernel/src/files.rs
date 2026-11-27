@@ -8336,6 +8336,9 @@ fn open_path(
             crate::proc::directory_stat(),
         ))
     } else if let Some(entry) = crate::proc::system_entry(p) {
+        // Its 0444 mode checked as any file's (`may_open`): a write takes
+        // what only root's `CAP_DAC_OVERRIDE` overrides.
+        own_open_check(c, p, flags)?;
         system_file(c, entry, flags)
     } else if let Some(entry) = own_entry(c, p) {
         own_open_check(c, p, flags)?;

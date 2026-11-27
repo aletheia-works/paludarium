@@ -22743,15 +22743,22 @@ static int proc_system_case(void) {
         for (int i = 0; i < 8; i++) listed += !strcmp(e->d_name, names_[i]) && e->d_type == DT_REG;
     if (proc) closedir(proc);
     printf("listed=%d\n", listed);
-    /* Past one, as past any file; a write, as to a file with no write. */
+    /* Past one, as past any file. An open for writing is checked against
+       the 0444 mode, which only root overrides; root's write then fails, as
+       the files have no write. */
     errno = 0;
     int r = open("/proc/version/x", O_RDONLY);
     printf("past open=%d errno=%d\n", r, errno);
-    int fd = open("/proc/filesystems", O_WRONLY);
     errno = 0;
-    long w = write(fd, "x", 1);
-    printf("write open=%d write=%ld errno=%d\n", fd >= 0, w, errno);
-    close(fd);
+    int fd = open("/proc/filesystems", O_WRONLY);
+    printf("write root=%d open=%d errno=%d", geteuid() == 0, fd >= 0, fd >= 0 ? 0 : errno);
+    if (fd >= 0) {
+        errno = 0;
+        long w = write(fd, "x", 1);
+        printf(" write=%ld errno=%d", w, errno);
+        close(fd);
+    }
+    printf("\n");
     return 0;
 }
 

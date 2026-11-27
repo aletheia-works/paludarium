@@ -1213,30 +1213,37 @@ verified.
   connect"; a CI kernel without that fix keeps the device the scope ID
   gave. Bound to `lo`, an IPv4 socket's packet to the limited broadcast
   address or `127.255.255.255` is `ENETUNREACH`, where Linux sends it
-  through `lo`. Neighbour discovery makes none of
-  the neighbours of the groups router solicitation, MLD reports and
-  duplicate address detection send to (`ff02::2`, `ff02::16`, the
-  solicited-node ones), no advertisement unasked, and no redirect; the
+  through `lo`. Neighbour discovery sends no advertisement unasked, and no
+  redirect; the
   probe a delaying neighbour sends teaches the peer nothing, where
   Linux's, from the end's link-local address, makes it a neighbour of
-  that address. Its duplicate address detection sends no probe, finds
-  no duplicate and ends 1.5 seconds after it begins (half of
-  `rtr_solicit_delay`, then a probe and a retransmit time), where Linux's
+  that address. Its duplicate address detection finds no duplicate and
+  ends 1.5 seconds after it begins (half of `rtr_solicit_delay`, then its
+  probe and a retransmit time), where Linux's
   ends 1 to 2 seconds on after a random delay; its link-local address is always made from its
-  Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
-  solicitation nor MLD report. Traffic through
+  Ethernet address (EUI-64, `addr_gen_mode` 0). What IPv6 sends of
+  itself, its MLD reports, duplicate address detection's probes and the
+  router solicitation, makes the neighbours of the groups it goes to
+  (`ff02::16`, the solicited-node ones, `ff02::2`), but reaches no peer:
+  a peer that forwards learns no neighbour of the end's link-local
+  address from the solicitation (`ndisc_recv_rs`). A report goes at once,
+  where Linux's goes two ticks on (`mld_ifc_start_work`); each goes once,
+  so a neighbour of one that is deleted is not made again by those Linux
+  sends on (`mld_ifc_work`, `mld_dad_work`, `addrconf_rs_timer`); and a
+  change of a group's sources sends none (`ip6_mc_add_src`,
+  `ip6_mc_del_src`). IGMP's reports make no neighbour of the group they
+  go to. Traffic through
   an end moves no counters; a namespace forwards nothing
   on to another. A multicast group is one of the guest's namespaces alone:
   the first has no device to the host's network, so no route to one, and
   joining one there without naming a device is `ENODEV`.
-  No IGMP or MLD packet is sent: nothing in the guest would see one, as
-  raw sockets are `EPERM` and there are no packet sockets (`AF_PACKET`).
+  No IGMP or MLD packet reaches anything: nothing in the guest would see
+  one, as raw sockets are `EPERM` and there are no packet sockets
+  (`AF_PACKET`).
   Anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`, and a device
   that forwards IPv6 has no subnet-router anycast address
   (`addrconf_join_anycast`), so it joins no solicited-node group of one.
-  An address added to a device up without its carrier does not load the
-  device's groups again (`ipv6_find_idev`'s `ipv6_mc_up`), which only
-  `igmp6`'s flags would show. `RTM_GETMULTICAST` of Linux master's
+  `RTM_GETMULTICAST` of Linux master's
   link-layer groups (`AF_PACKET`, `dev_mc_dump`) is `EOPNOTSUPP`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
@@ -1302,9 +1309,7 @@ verified.
   `fib_multipath_hash_fields` or `fib_multipath_use_neigh` is taken whole and leaves the file where it
   was, as Linux 7.0 to 7.2 do; master takes what it reads and
   moves the file on (`proc_vec`).
-  IPv6's `forwarding` joins no router anycast address, and an end made
-  while `default`'s is on is in all three all-routers groups, where
-  Linux's is in ff02::2 alone; a
+  IPv6's `forwarding` joins no router anycast address; a
   write of `all`'s tells of the devices in the order of their indices,
   where Linux's goes in the order they came. A netconf notification gives
   the settings that have no file (proxy ARP and NDP, multicast and

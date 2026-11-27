@@ -4127,6 +4127,13 @@ fn change_address(
     };
     let flags = flags & crate::interface::V6_ASKED;
     let mut addresses = network.addresses();
+    // `ipv6_find_idev`: a device up loads its groups and reports them again
+    // (`ipv6_mc_up`), whatever comes of the request.
+    if (device == LOOPBACK_INDEX && up) || (device != LOOPBACK_INDEX && dev.up) {
+        addresses
+            .changes6
+            .push(crate::multicast::Change6::Up(device, now));
+    }
     let exists = addresses
         .v6
         .iter()
@@ -6100,6 +6107,8 @@ fn neighbour_dump(
     if !matches!(master, 0 | u32::MAX) {
         return Ok(Vec::new());
     }
+    // What the devices have sent of themselves makes neighbours first.
+    network.sync6();
     let addresses = network.addresses();
     let neighbours = addresses.neighbours().to_vec();
     let mut messages = Vec::new();
@@ -6645,6 +6654,7 @@ pub(crate) fn tell_groups(network: &Network) {
 /// `arp_ifdown` once they have gone; all before the device's
 /// `RTM_DELLINK`.
 pub(crate) fn addresses_gone(network: &Network, index: i32) -> Vec<Notice> {
+    network.sync6();
     let (events, now) = {
         let mut addresses = network.addresses();
         let (mut events, now) = addresses.device_gone4(index);
@@ -6728,6 +6738,7 @@ pub(crate) fn device_changed4(
     up: bool,
     carrier: bool,
 ) -> Vec<Notice> {
+    network.sync6();
     let events = {
         let mut addresses = network.addresses();
         if up {

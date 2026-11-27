@@ -3249,7 +3249,7 @@ kernel.
     loopback's but; and, a veth end, ff02::2, ff01::2 and ff05::2 as it
     comes to forward, which it leaves as it stops (`dev_forward_change`).
     Down, it keeps them, unloaded (`ipv6_mc_down`), until it is ready
-    again (`ipv6_mc_up`); going, it leaves ff02::1 and, as it forwards,
+    again or, up, is given an address (`ipv6_mc_up`, `ipv6_find_idev`); going, it leaves ff02::1 and, as it forwards,
     ff02::2, and forgets the rest (`ipv6_mc_destroy_dev`). A
     datagram to a group comes back where its device is in the group,
     unless `IPV6_MULTICAST_LOOP` is off, and then with an
@@ -3746,7 +3746,18 @@ kernel.
     of its own end, not tentative (`ndisc_recv_ns`); and its advertisement
     goes back through the neighbour it learns, which so delays at once. A
     request with `NTF_USE` or `NTF_MANAGED` solicits from the end's
-    link-local address. An end going down takes its
+    link-local address. What IPv6 sends of itself makes the neighbour of
+    the group it goes to, `NUD_NOARP` and without a word, on `lo` as on a
+    veth end: an MLDv2 report to ff02::16 as a device up joins anew or
+    leaves for good a group it reports (not ff02::1, nor one of a scope
+    below the link's: `MAF_NOREPORT`), and of its groups as its IPv6 comes
+    up, has its carrier again while ready, or is given an address
+    (`ipv6_mc_up`); duplicate address detection's probe to the address's
+    solicited-node group, half a second after it begins
+    (`addrconf_dad_work`); and, as the detection of a veth end's only
+    link-local address ends, a report again (`ipv6_mc_dad_complete`) and,
+    unless the end forwards, a router solicitation to ff02::2
+    (`addrconf_dad_completed`). An end going down takes its
     neighbours, each told of with `RTM_DELNEIGH` after its
     `RTM_NEWLINK`, IPv4's, then IPv6's; its peer losing its carrier, all
     but the permanent ones (`neigh_carrier_down`); and an end that goes or

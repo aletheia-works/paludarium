@@ -75,6 +75,9 @@ pub(crate) const KERNEL_LL: u8 = 3;
 /// (`dad_transmits`) and a retransmit time after it (1 second): 1.5
 /// seconds, where Linux's take 1 to 2.
 pub(crate) const DAD_TIME: u64 = SECOND + SECOND / 2;
+/// How long before the end of duplicate address detection its probe goes
+/// (`RETRANS_TIME`, 1 second).
+const DAD_PROBE: u64 = SECOND;
 /// The tables Linux has by name (`RT_TABLE_*`).
 pub(crate) const TABLE_DEFAULT: u32 = 253;
 pub(crate) const TABLE_MAIN: u32 = 254;
@@ -1356,6 +1359,10 @@ pub(crate) struct Addresses {
     /// The changes of the devices' own IPv6 groups not yet made, in their
     /// order ([`crate::inet::Network::sync6`]).
     pub(crate) changes6: Vec<crate::multicast::Change6>,
+    /// The probes duplicate address detection is to send
+    /// (`addrconf_dad_work`'s `ndisc_send_ns`): of the address of the
+    /// device of the index, at the time.
+    probes6: Vec<(i32, Ipv6Addr, u64)>,
     /// The seed of the hash that chooses among a multipath route's hops.
     pub multipath_seed: crate::multipath::Seed,
     /// IPv4's `fib_multipath_hash_policy` and `fib_multipath_hash_fields`.
@@ -1469,6 +1476,7 @@ impl Addresses {
             proxies: Vec::new(),
             ready6: Vec::new(),
             changes6: Vec::new(),
+            probes6: Vec::new(),
             multipath_seed: crate::multipath::Seed::default(),
             serials6: Serials6::default(),
             multipath4: crate::multipath::Policy::default(),
@@ -1493,6 +1501,19 @@ impl Addresses {
             let mut neighbour = Neighbour::new(ip, 0, now);
             neighbour.kind = kind;
             self.neighbours.push(neighbour);
+        }
+    }
+    /// A packet the kernel sends of itself to the IPv6 group `to` (an MLD
+    /// report, or a solicitation of neighbour discovery) goes out through
+    /// the device `index` at `now`, as `ip6_finish_output2` makes the
+    /// group's neighbour, silently, if there is none: the loopback's
+    /// ([`Self::output`]), or a veth end's `NUD_NOARP` one
+    /// ([`Neighbour::nd`]).
+    pub(crate) fn send6(&mut self, index: i32, to: Ipv6Addr, now: u64) {
+        if index == LOOPBACK_INDEX {
+            self.output(IpAddr::V6(to), now);
+        } else {
+            self.end_neighbour(index, IpAddr::V6(to), now);
         }
     }
     /// Adds or changes a neighbour of the device of `index`, `lo` or a veth
@@ -2048,7 +2069,7 @@ impl Addresses {
             self.ready6.push(LOOPBACK_INDEX);
         }
         self.changes6
-            .push(crate::multicast::Change6::Up(LOOPBACK_INDEX));
+            .push(crate::multicast::Change6::Up(LOOPBACK_INDEX, now));
         for address in self.v6.clone() {
             if address.index == LOOPBACK_INDEX
                 && address.flags & PERMANENT != 0
@@ -2117,18 +2138,23 @@ impl Addresses {
         if !gone.is_empty() {
             self.serials6.all();
         }
+        let now = self.seen;
         for a in &gone {
-            self.solicit_gone(a);
+            self.solicit_gone(a, now, false);
         }
         gone.into_iter().map(Event::DelAddr6).collect()
     }
     /// The device of `gone`, a loopback's but, leaves its solicited-node
-    /// group once as it goes.
-    fn solicit_gone(&mut self, gone: &V6) {
+    /// group once as it goes at `now`, reporting it unless the device is
+    /// going down (`report`); its probe, if any, is not sent.
+    fn solicit_gone(&mut self, gone: &V6, now: u64, report: bool) {
+        self.probes6
+            .retain(|&(i, a, _)| (i, a) != (gone.index, gone.address));
         if gone.index != LOOPBACK_INDEX {
             let group = crate::multicast::solicited(gone.address);
-            self.changes6
-                .push(crate::multicast::Change6::Leave(gone.index, group));
+            self.changes6.push(crate::multicast::Change6::Leave(
+                gone.index, group, now, report,
+            ));
         }
     }
     /// The IPv6 of the device `index` goes down, once ready
@@ -2180,10 +2206,15 @@ impl Addresses {
     ) -> Vec<Event> {
         let mut events = Vec::new();
         if self.ready6.contains(&index) {
+            // Ready already, it reports its groups again
+            // (`addrconf_notify`'s `NETDEV_CHANGE`).
+            self.changes6
+                .push(crate::multicast::Change6::Up(index, now));
             return events;
         }
         self.ready6.push(index);
-        self.changes6.push(crate::multicast::Change6::Up(index));
+        self.changes6
+            .push(crate::multicast::Change6::Up(index, now));
         let oif = index.unsigned_abs();
         // `rt6_sync_up`: its routes are no longer dead, nor down, as it
         // has its carrier.
@@ -2216,6 +2247,10 @@ impl Addresses {
         for address in self.v6.iter_mut() {
             if address.index == index && address.dad == Some(u64::MAX) {
                 address.dad = Some(done);
+                if dad {
+                    self.probes6
+                        .push((index, address.address, done - DAD_PROBE));
+                }
             }
         }
         let eui = [
@@ -2238,6 +2273,9 @@ impl Addresses {
         link.life.created = now;
         link.life.changed = now;
         link.dad = Some(done);
+        if dad {
+            self.probes6.push((index, link.address, done - DAD_PROBE));
+        }
         if let Some(route) = link.prefix_route() {
             self.kernel_add6(route, &mut events);
         }
@@ -2545,6 +2583,9 @@ impl Addresses {
             events.push(Event::NewAddr6(new.clone(), true));
             if let Some(at) = dad {
                 new.dad = Some(at);
+                if at != u64::MAX {
+                    self.probes6.push((new.index, new.address, at - DAD_PROBE));
+                }
                 self.insert_v6(new);
                 return Ok(events);
             }
@@ -2695,7 +2736,7 @@ impl Addresses {
     /// prefix route ([`Self::prefix_gone`]), unless it had none.
     fn remove_v6(&mut self, found: usize, now: u64) -> Vec<Event> {
         let gone = self.v6.remove(found);
-        self.solicit_gone(&gone);
+        self.solicit_gone(&gone, now, true);
         self.serials6.all();
         let mut events = vec![Event::DelAddr6(gone.clone())];
         self.kernel_del6(&gone.local_route(), &mut events);
@@ -2749,8 +2790,23 @@ impl Addresses {
             }
             i += 1;
         }
+        // The probes due (`addrconf_dad_work`), each to its address's
+        // solicited-node group.
+        let mut due: Vec<(i32, Ipv6Addr, u64)> = Vec::new();
+        self.probes6.retain(|&probe| {
+            let sent = probe.2 <= now;
+            if sent {
+                due.push(probe);
+            }
+            !sent
+        });
+        due.sort_by_key(|&(.., at)| at);
+        for (index, address, at) in due {
+            self.send6(index, crate::multicast::solicited(address), at);
+        }
         // Duplicate address detection that has ended (`addrconf_dad_completed`):
-        // each address as it is, then its local route.
+        // each address as it is, then its local route; a veth end's only
+        // link-local address reports and solicits (`ipv6_lonely_lladdr`).
         let mut done: Vec<(u64, usize)> = self
             .v6
             .iter()
@@ -2758,12 +2814,16 @@ impl Addresses {
             .filter_map(|(i, a)| a.dad.filter(|&at| at <= now).map(|at| (at, i)))
             .collect();
         done.sort_by_key(|&(at, _)| at);
-        for (_, i) in done {
+        for (at, i) in done {
             self.v6[i].dad = None;
             self.serials6.all();
             let address = self.v6[i].clone();
             events.push(Event::NewAddr6(address.clone(), false));
             self.kernel_add6(address.local_route(), &mut events);
+            if address.index != LOOPBACK_INDEX && self.lonely(&address) {
+                self.changes6
+                    .push(crate::multicast::Change6::Done(address.index, at));
+            }
         }
         let expired: Vec<Route6> = self
             .dump6()
@@ -2788,6 +2848,18 @@ impl Addresses {
         stale.sort_by_key(|&(at, _)| at);
         events.extend(stale.into_iter().map(|(_, n)| Event::NewNeighbour(n)));
         events
+    }
+    /// Whether `address` is of link scope and its device has no other such
+    /// address permanent and not tentative (`ipv6_lonely_lladdr`).
+    fn lonely(&self, address: &V6) -> bool {
+        address.scope() == SCOPE_LINK
+            && !self.v6.iter().any(|a| {
+                a.index == address.index
+                    && a.address != address.address
+                    && a.scope() == SCOPE_LINK
+                    && a.flags & PERMANENT != 0
+                    && !a.tentative()
+            })
     }
     /// The primary address whose subnet `secondary` is in, or itself.
     fn primary_of(&self, address: &V4) -> Ipv4Addr {
@@ -6574,6 +6646,57 @@ mod tests {
             told(&a.expire(SECOND + 1)),
             ["-route 254 2001:db8:8::/64 Unicast 256"]
         );
+    }
+
+    #[test]
+    fn duplicate_address_detection_probes_and_the_only_link_local_address_solicits() {
+        use crate::multicast::Change6;
+        let mut a = Addresses::isolated();
+        let mac = [2, 0, 0, 0, 0, 0xa];
+        // An address waiting for the end to be ready, then the end's
+        // link-local one: both probe half a second on.
+        let mut global = v6("2001:db8::1", 64);
+        global.index = 1000;
+        a.add_v6(global, Lifetimes::FOREVER, false, false, Some(u64::MAX), 0)
+            .unwrap();
+        a.link_ready6(1000, (mac, true), SECOND);
+        let keys = |a: &Addresses| {
+            a.neighbours()
+                .iter()
+                .map(|n| (n.index, n.ip.to_string(), n.state, n.made))
+                .collect::<Vec<_>>()
+        };
+        let _ = a.expire(SECOND);
+        assert!(keys(&a).is_empty());
+        let _ = a.expire(SECOND + SECOND / 2);
+        let probe = SECOND + SECOND / 2;
+        assert_eq!(
+            keys(&a),
+            [
+                (1000, "ff02::1:ff00:1".to_string(), NUD_NOARP, probe),
+                (1000, "ff02::1:ff00:a".to_string(), NUD_NOARP, probe),
+            ]
+        );
+        // Done, the link-local one alone reports and solicits.
+        a.changes6.clear();
+        let _ = a.expire(SECOND + DAD_TIME);
+        assert_eq!(a.changes6, [Change6::Done(1000, SECOND + DAD_TIME)]);
+        // A second link-local address is not alone, and a gone one sends
+        // no probe.
+        let mut second = v6("fe80::2", 64);
+        second.index = 1000;
+        let dad = Some(2 * SECOND + DAD_TIME);
+        a.add_v6(second, Lifetimes::FOREVER, false, true, dad, 2 * SECOND)
+            .unwrap();
+        let mut third = v6("fe80::3", 64);
+        third.index = 1000;
+        a.add_v6(third, Lifetimes::FOREVER, false, true, dad, 2 * SECOND)
+            .unwrap();
+        let _ = a.del_v6(1000, "fe80::3".parse().unwrap(), 64, 2 * SECOND);
+        a.changes6.clear();
+        let _ = a.expire(2 * SECOND + DAD_TIME);
+        assert_eq!(keys(&a).len(), 3);
+        assert!(a.changes6.is_empty());
     }
 
     #[test]

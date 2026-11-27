@@ -1473,13 +1473,15 @@ impl Network {
         addresses
     }
     /// What has run out by `now`, as [`Self::addresses_at`] takes it, after
-    /// what a socket found before, in the order it went.
+    /// what a socket found before, in the order it went; then what the
+    /// devices send of themselves meanwhile goes ([`Self::sync6`]), as it
+    /// did while they were as they are.
     pub(crate) fn expire(&self, now: u64) -> Vec<crate::interface::Event> {
-        let mut addresses = self.addresses();
-        let fresh = addresses.expire(now);
+        let fresh = self.addresses().expire(now);
         let mut events =
             core::mem::take(&mut *self.expired.lock().unwrap_or_else(PoisonError::into_inner));
         events.extend(fresh);
+        self.sync6();
         events
     }
     /// The address a packet to `to` of the protocol `proto` leaves from at
@@ -1594,6 +1596,8 @@ impl Network {
     /// `None` when it already is, else what happened to the addresses and
     /// routes at `now`, for netlink to tell ([`crate::netlink::set_up`]).
     pub(crate) fn set_up(&self, up: bool, now: u64) -> Option<Vec<crate::interface::Event>> {
+        // What the loopback sent as it was goes first.
+        self.sync6();
         // The devices, alone, before the addresses.
         let v6 = !self.ipv6_off();
         let mut addresses = self.addresses();

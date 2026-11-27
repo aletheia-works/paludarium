@@ -122,6 +122,7 @@ cases!(
     pwait_ready_restores_mask=>77, pwait_invalid_restores_mask=>78,
     event_et_output_read=>79, socket_et_output_partial_drain=>80,
     socket_et_output_write_boundaries=>81,
+    stdout_epipe_blocked=>82, stdout_sigpipe=>83,
 );
 #[test]
 fn tokio_timer() {

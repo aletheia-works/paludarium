@@ -44,6 +44,15 @@ static I fill_stream(int fd,I *partial,U *queued) {
 }
 static I run(I *o) {
  U x=0;struct Ev out[4]={{0,0}};I fd=-1,e=-1,d=-1;int p[2]={-1,-1};char b[8]={0};int id=CASE;
+ /* 82 and 83 run with a stdout whose reader is gone, and report on stderr:
+    a write there is EPIPE and raises SIGPIPE, which 82 blocks (pending
+    after it) and 83 leaves to kill the process. */
+ if(CASE>=82) {
+  U blocked=1UL<<12,pending=0;struct{const char *base;U len;}iov={"b",1};
+  if(CASE==82)sc(14,0,(U)&blocked,0,8,0,0);
+  o[0]=S(1,1,"a",1);sc(127,(U)&pending,8,0,0,0,0);o[1]=pending;
+  o[2]=S(20,1,&iov,1);o[3]=S(1,1,"",0);return 0;
+ }
  if(CASE>=79) {
   e=ep();
   if(CASE==79){fd=event(2,NB|1);ctl(e,1,fd,4|ET,79);o[0]=wait(e,out,1,0);get(fd,&x);o[1]=wait(e,out,1,0);o[2]=x;o[3]=wait(e,out,1,0);return 0;}
@@ -185,5 +194,5 @@ static I run(I *o) {
  case 63:sc(53,1,1|NB,0,(U)p,0,0);closefd(p[0]);o[0]=sc(44,p[1],(U)"a",1,0x4000,0,0);break;
  }return 0;
 }
-void start(void){I out[4]={0};run(out);S(1,1,out,sizeof(out));S(231,0,0,0);__builtin_unreachable();}
+void start(void){I out[4]={0};run(out);S(1,CASE>=82?2:1,out,sizeof(out));S(231,0,0,0);__builtin_unreachable();}
 __asm__(".global _start\n_start: and $-16,%rsp; call start");

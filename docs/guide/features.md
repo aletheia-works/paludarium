@@ -856,7 +856,9 @@ kernel.
     (`O_NONBLOCK`, `O_APPEND`, …), which never reach the host's descriptor;
     with `O_NONBLOCK`, a read of standard input that finds nothing is
     `EAGAIN`, and so is a write to standard output or standard error that
-    the host has no room for.
+    the host has no room for. A write to either once its reader is gone (a
+    pipe into a `head` that has exited) is `EPIPE` and raises `SIGPIPE`, as
+    a write to any pipe with no reader.
   - **TCP and UDP sockets** ([Network](#network)), as Linux's TCP signals:
     `POLL_OUT` when a connection opens, `POLL_ERR` when it fails, `POLL_IN`
     when data arrives, and for the peer's end `POLL_IN` (`POLL_HUP` once

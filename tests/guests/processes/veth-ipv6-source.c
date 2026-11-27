@@ -8,7 +8,9 @@
    the peer of the device whose address it is from, and where a lookup of
    its flow, of the protocol, says. The hash's key is random, so what is
    shown is how many of the 64 destinations that holds for, and whether each
-   device took some, which no key changes but with a chance of 2^-63. */
+   device took some, which no key changes but with a chance of 2^-63. A
+   carrier, and an address done (its local route, which Linux adds after
+   the request is answered), are waited for on netlink. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -78,8 +80,10 @@ struct body {
 };
 
 static unsigned seq;
-/* RTNLGRP_LINK of the first namespace, where carriers are waited for. */
-static int events = -1;
+/* RTNLGRP_LINK and RTNLGRP_IPV6_ROUTE of the first namespace, where
+   carriers and addresses done are waited for; and RTNLGRP_IPV6_ROUTE of the
+   other, where its addresses done are. */
+static int events = -1, far_routes = -1;
 
 static long result(long r) { return r < 0 ? -errno : r; }
 
@@ -175,24 +179,42 @@ static int is(const struct nl_header *h, int index, int carrier) {
     }
     return 0;
 }
-/* Waits, up to 5 s however much else comes, for the device of `index`
-   to have its carrier `carrier`. */
-static void wait_carrier(int index, int carrier, const char *label) {
+static unsigned char wanted[16];
+/* Whether `h` is the local route of `wanted`: its address done. */
+static int is_local(const struct nl_header *h) {
+    const unsigned char *body = (const unsigned char *)(h + 1);
+    int len = (int)(h->len - sizeof *h);
+    if (h->type != RTM_NEWROUTE || len < 12 || body[0] != AF_INET6 || body[7] != 2) return 0;
+    for (int a = 12; a + 4 <= len;) {
+        unsigned short alen, kind;
+        memcpy(&alen, body + a, 2);
+        memcpy(&kind, body + a + 2, 2);
+        if (alen < 4 || a + alen > len) break;
+        if (kind == RTA_DST && alen == 20) return !memcmp(body + a + 4, wanted, 16);
+        a += (alen + 3) & ~3;
+    }
+    return 0;
+}
+/* Waits, up to 5 s however much else comes, on `fd` for the local route
+   of `ip`, or, with no `ip`, for the device of `index` to have its carrier
+   `carrier`. */
+static void wait_for(int fd, int index, int carrier, const char *ip, const char *label) {
     static unsigned char buf[65536];
+    if (ip) inet_pton(AF_INET6, ip, wanted);
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (;;) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         long left = 5000 - ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
         if (left <= 0) break;
-        struct pollfd ready = {.fd = events, .events = POLLIN};
+        struct pollfd ready = {.fd = fd, .events = POLLIN};
         if (poll(&ready, 1, (int)(left < 1000 ? left : 1000)) <= 0) continue;
         long n;
-        while ((n = recv(events, buf, sizeof buf, MSG_DONTWAIT)) > 0)
+        while ((n = recv(fd, buf, sizeof buf, MSG_DONTWAIT)) > 0)
             for (long at = 0; at + (long)sizeof(struct nl_header) <= n;) {
                 const struct nl_header *h = (const void *)(buf + at);
                 if (h->len < sizeof *h || at + h->len > n) break;
-                if (is(h, index, carrier)) return;
+                if (ip ? is_local(h) : is(h, index, carrier)) return;
                 at += (h->len + 3) & ~3u;
             }
     }
@@ -219,7 +241,9 @@ static void make_pair(int ctl, int a, const char *name_a, int b, const char *nam
     request(ctl, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &m, "make a pair");
 }
 
-static void address6(int fd, int index, const char *ip, int prefix, const char *label) {
+/* Adds the IPv6 address `ip`/`prefix` of the device of `index`,
+   IFA_F_NODAD, and waits on `done` for its local route. */
+static void address6(int fd, int done, int index, const char *ip, int prefix, const char *label) {
     struct body b = {0};
     const unsigned char m[8] = {AF_INET6, (unsigned char)prefix, IFA_F_NODAD, 0, (unsigned char)index,
                                 (unsigned char)(index >> 8), 0, 0};
@@ -228,7 +252,8 @@ static void address6(int fd, int index, const char *ip, int prefix, const char *
     raw(&b, m, sizeof m);
     put(&b, IFA_LOCAL, in, 16);
     put32(&b, IFA_FLAGS, IFA_F_NODAD);
-    request(fd, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &b, label);
+    drain(done);
+    if (request(fd, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &b, label) == 0) wait_for(done, 0, 0, ip, label);
 }
 /* Adds a route to 2001:db8:2::/64 by 2001:db8::2 through va and
    2001:db8:1::2 through vc. */
@@ -368,11 +393,12 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("unshare=%ld\n", result(unshare(CLONE_NEWNET)));
     int ctl = route_socket(0);
-    events = route_socket(1);
+    events = route_socket(1 | 0x400);
     int ns = open("/proc/self/ns/net", O_RDONLY);
     sysctl("/proc/sys/net/ipv6/conf/default/accept_dad", "0");
     printf("unshare=%ld\n", result(unshare(CLONE_NEWNET)));
     int far = route_socket(0);
+    far_routes = route_socket(0x400);
     sysctl("/proc/sys/net/ipv6/conf/default/accept_dad", "0");
     make_pair(ctl, VA, "va", VB, "vb", 0x0a);
     make_pair(ctl, VC, "vc", VD, "vd", 0x0c);
@@ -382,19 +408,19 @@ int main(int argc, char **argv) {
     set_link(far, VD, 1, "up vd");
     drain(events);
     set_link(ctl, VA, 1, "up va");
-    wait_carrier(VA, 1, "va's carrier");
+    wait_for(events, VA, 1, NULL, "va's carrier");
     drain(events);
     set_link(ctl, VC, 1, "up vc");
-    wait_carrier(VC, 1, "vc's carrier");
-    address6(ctl, VA, "2001:db8::1", 64, "add va's address");
-    address6(ctl, VC, "2001:db8:1::1", 64, "add vc's address");
-    address6(far, VB, "2001:db8::2", 64, "add vb's address");
-    address6(far, VD, "2001:db8:1::2", 64, "add vd's address");
+    wait_for(events, VC, 1, NULL, "vc's carrier");
+    address6(ctl, events, VA, "2001:db8::1", 64, "add va's address");
+    address6(ctl, events, VC, "2001:db8:1::1", 64, "add vc's address");
+    address6(far, far_routes, VB, "2001:db8::2", 64, "add vb's address");
+    address6(far, far_routes, VD, "2001:db8:1::2", 64, "add vd's address");
     for (int i = 1; i <= COUNT; i++) {
         struct sockaddr_in6 to = destination(i, 0);
         char text[64];
         inet_ntop(AF_INET6, &to.sin6_addr, text, sizeof text);
-        address6(far, 1, text, 128, text);
+        address6(far, far_routes, 1, text, 128, text);
     }
     bound(0, "vb");
     bound(1, "vd");

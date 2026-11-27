@@ -2881,14 +2881,19 @@ impl InetSocket {
                         }
                         None => {
                             let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
-                            if self.network.allows(address, now) {
+                            // A loopback port a guest socket holds is the
+                            // guest's, though the policy allows the host's
+                            // loopback there: an entry with no port.
+                            let held = to.is_some_and(|to| self.ports().held(to, &self.this));
+                            if !held && self.network.allows(address, now) {
                                 let stream = c.host.connect(address)?;
                                 stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
                                 stream.set_clock(realtime(&self.host));
                                 stream
                             } else if let Some(to) = to {
                                 // Nothing listens there on the guest's own
-                                // loopback, which answers with a reset, back
+                                // loopback, or it is held, and the loopback
+                                // answers with a reset, back
                                 // to the address the connection leaves from.
                                 let from = match s.bound.map(|b| b.ip()).or(s.address) {
                                     Some(ip) if !ip.is_unspecified() => ip,

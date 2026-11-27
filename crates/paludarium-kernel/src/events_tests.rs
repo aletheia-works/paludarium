@@ -4972,3 +4972,30 @@ fn proc_net_lists_the_sockets() {
             .starts_with("0000000000000000 0 77 00000011 0 0 0 2 0 ")
     );
 }
+#[test]
+fn a_loopback_port_a_guest_socket_holds_is_not_the_hosts() {
+    // The policy allows the host's loopback on every port.
+    let mut f = network_fixture(&["127.0.0.1"]);
+    let held = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 5000);
+    assert_eq!(f.ret(49, [held, DATA + 0x100, 16, 0, 0, 0]), 0);
+    // Bound but not listening: the guest's loopback refuses it, and
+    // nothing goes to the host.
+    let fd = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    assert!(f.host.streams.lock().unwrap().is_empty());
+    assert_eq!(int_option(&mut f, fd, 1, 4), (0, 111));
+    // A port no guest socket holds goes to the host.
+    let other = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 5001);
+    assert_eq!(
+        f.ret(42, [other, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    let streams = f.host.streams.lock().unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].peer(), "127.0.0.1:5001".parse().unwrap());
+}

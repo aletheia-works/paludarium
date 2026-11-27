@@ -7013,7 +7013,9 @@ one only with an `--allow-net`.
   or, for port 0, an ephemeral one from 32768–60999 (none of the ports
   that an `--allow-net` entry with a port reaches the host's loopback at,
   where a connection would reach the host's socket; an entry for every
-  port leaves none out), with Linux's checks in
+  port leaves none out, but a connection to a loopback port a guest socket
+  holds is refused on the guest's loopback, not sent to the host), with
+  Linux's checks in
   its order: `EADDRNOTAVAIL` for another address, `EINVAL` once bound,
   `EADDRINUSE` for a port another socket holds on an address both cover (a
   listener's, a connection it accepted, a client's), unless both set

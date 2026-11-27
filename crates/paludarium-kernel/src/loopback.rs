@@ -801,6 +801,13 @@ impl Binding {
             IpAddr::V6(_) => self.v6,
         }
     }
+    /// Whether it holds the port of `to` on an address that covers `to`'s.
+    fn covers(&self, to: SocketAddr) -> bool {
+        let bound = self.address.ip();
+        self.address.port() == to.port()
+            && self.carries(to.ip())
+            && (bound.is_unspecified() || bound == to.ip())
+    }
     /// Whether the two hold the same port on an address both cover, as
     /// Linux's `inet_rcv_saddr_equal` with wildcards.
     fn overlaps(&self, other: &Binding) -> bool {
@@ -1139,6 +1146,15 @@ impl Ports {
         let best = self.best_listener(to, dif)?;
         self.shared(best, from, to, |_| true).owner.upgrade()
     }
+    /// Whether a socket other than `except` holds the port of `to` on an
+    /// address that covers it, also in `TIME_WAIT`: a connection there is
+    /// for the guest's loopback to answer, never the host's.
+    pub(crate) fn held(&mut self, to: SocketAddr, except: &Weak<InetSocket>) -> bool {
+        self.live();
+        self.bindings
+            .iter()
+            .any(|binding| !binding.is(except) && binding.covers(to))
+    }
     /// Whether a socket listens where a connection to `to` in on `dif`
     /// reaches.
     pub(crate) fn listens(&mut self, to: SocketAddr, dif: u32) -> bool {
@@ -1449,6 +1465,23 @@ mod tests {
         // A port named itself is still taken.
         let named = ports.bind(binding("127.0.0.1:32770", false)).unwrap();
         assert_eq!(named.port(), 32770);
+    }
+
+    #[test]
+    fn a_binding_covers_its_port_on_its_address_or_every_one() {
+        let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let one = binding("127.0.0.2:5000", false);
+        assert!(one.covers(at("127.0.0.2:5000")));
+        assert!(!one.covers(at("127.0.0.1:5000")));
+        assert!(!one.covers(at("127.0.0.2:5001")));
+        let every = binding("0.0.0.0:5001", false);
+        assert!(every.covers(at("127.0.0.1:5001")));
+        // An IPv4 socket's port is not one of IPv6's; an IPv6 one on `::`
+        // holds it for both.
+        assert!(!every.covers(at("[::1]:5001")));
+        let both = binding("[::]:5001", true);
+        assert!(both.covers(at("[::1]:5001")));
+        assert!(both.covers(at("127.0.0.1:5001")));
     }
 
     #[test]

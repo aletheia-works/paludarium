@@ -21662,6 +21662,9 @@ static int oc_shared(void *unused) {
     return 0;
 }
 static int proc_oom_case(void) {
+    /* The setting is inherited from whatever started the test (500 under
+       CI's runner), so the case starts from 0. */
+    printf("set 0: %ld\n", OC_SET("0"));
     printf("text: [");
     oc_read("/proc/self/oom_score_adj");
     printf("%s] [", oc_text);

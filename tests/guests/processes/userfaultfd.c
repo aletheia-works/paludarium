@@ -74,6 +74,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1347,6 +1348,109 @@ static void pagemap_show(const char *what, void *at) {
            (int)(e >> 57 & 1));
 }
 
+/* The signals the guard install below took, and where the last one
+   leaves it. */
+static volatile sig_atomic_t alarms;
+static sigjmp_buf alarmed;
+static void on_alarm(int sig) {
+    (void)sig;
+    if (++alarms == 2) siglongjmp(alarmed, 1);
+}
+
+/* Whether the page at `at` is a guard page in /proc/self/pagemap. */
+static int guarded(void *at) {
+    int f = open("/proc/self/pagemap", O_RDONLY);
+    uint64_t e = 0;
+    pread(f, &e, sizeof e, (off_t)((uintptr_t)at / PAGE * sizeof e));
+    close(f);
+    return (int)(e >> 58 & 1);
+}
+
+/* MADV_GUARD_INSTALL over shmem whose second page has a uffd-wp marker,
+   once its zap leaves one for a protected entry: Linux's
+   madvise_guard_install puts a guard on the first page, stops at the
+   marker, which its zap keeps (zap_install_uffd_wp_if_needed), and
+   restarts the call (ERESTARTNOINTR) until a signal comes, and after its
+   handler too, without SA_RESTART. The second signal's handler leaves. */
+static void guard_over_marker(void) {
+    int fd = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP);
+    int file = shmem_file(3);
+    char *view = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    printf("register for the guard: %s\n", err(reg(fd, view, 3 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    view[PAGE] = 'w';
+    printf("protect the last two: %s\n", err(protect(fd, view + PAGE, 2 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    struct sigaction sa = {0}, old;
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, &old);
+    struct itimerval every = {{0, 50000}, {0, 50000}}, off = {{0, 0}, {0, 0}};
+    alarms = 0;
+    long ret = 1;
+    if (sigsetjmp(alarmed, 1) == 0) {
+        setitimer(ITIMER_REAL, &every, NULL);
+        ret = madvise(view, 3 * PAGE, MADV_GUARD_INSTALL);
+    }
+    setitimer(ITIMER_REAL, &off, NULL);
+    sigaction(SIGALRM, &old, NULL);
+    printf("guard over a marker: returned %s signals %d\n", ret == 1 ? "no" : err(ret), (int)alarms);
+    for (int i = 0; i < 3; i++) {
+        char what[32];
+        snprintf(what, sizeof what, "page %d guard=%d", i, guarded(view + i * PAGE));
+        pagemap_show(what, view + i * PAGE);
+    }
+    close(fd);
+    close(file);
+}
+
+/* The pipe a SIGUSR1 handler writes to, to tell that it ran. */
+static int handled_pipe = -1;
+static void on_usr1(int sig) {
+    (void)sig;
+    write(handled_pipe, "h", 1);
+}
+
+/* The same install through process_madvise, in a child of its own (a
+   fork copies no marker of shmem): Linux's vector_madvise tries again
+   until a fatal signal, and runs no handler meanwhile, so a SIGUSR1 is
+   not taken, the call does not return, and SIGKILL ends it. */
+static void guard_over_marker_vectored(void) {
+    int pipes[2];
+    if (pipe(pipes)) return;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pipes[0]);
+        int fd = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP);
+        int file = shmem_file(3);
+        char *view = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+        reg(fd, view, 3 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL);
+        view[PAGE] = 'w';
+        protect(fd, view + PAGE, 2 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP);
+        handled_pipe = pipes[1];
+        struct sigaction sa = {0};
+        sa.sa_handler = on_usr1;
+        sigaction(SIGUSR1, &sa, NULL);
+        int pidfd = (int)syscall(434 /* pidfd_open */, getpid(), 0);
+        struct iovec iov = {view, 3 * PAGE};
+        write(pipes[1], "r", 1);
+        syscall(440 /* process_madvise */, pidfd, &iov, 1, MADV_GUARD_INSTALL, 0);
+        write(pipes[1], "!", 1);
+        _exit(0);
+    }
+    close(pipes[1]);
+    char got[8] = {0};
+    read(pipes[0], got, 1);
+    usleep(100000);
+    kill(child, SIGUSR1);
+    usleep(100000);
+    kill(child, SIGKILL);
+    int status = 0;
+    waitpid(child, &status, 0);
+    long more = read(pipes[0], got + 1, sizeof got - 2);
+    close(pipes[0]);
+    printf("vectored guard over a marker: ready %c after it \"%s\" killed %d\n", got[0],
+           more > 0 ? got + 1 : "", WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+}
+
 /* A write to `at` by a thread of its own, which faults to `fd`: the
    message, then the end of the protection of its page, and what the
    thread wrote. */
@@ -1505,6 +1609,8 @@ static int case_wp_shmem(void) {
     pagemap_show("moved", to + 2 * PAGE);
     printf("written: %c\n", (to[2 * PAGE] = 'm'));
     close(fd);
+    guard_over_marker();
+    guard_over_marker_vectored();
     return 0;
 }
 

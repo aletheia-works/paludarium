@@ -1049,7 +1049,8 @@ pub struct ThreadState {
     /// For a call a signal took back from a seccomp listener, which Linux
     /// runs again whatever the call is: after a stop or a SA_RESTART
     /// handler (ERESTARTSYS, `false`), or after any handler (ERESTARTNOINTR,
-    /// `true`). Taken with `restart`.
+    /// `true`), as also for an install of guards that has to start again
+    /// ([`syscalls::restart_guard_install`]). Taken with `restart`.
     pub(crate) seccomp_restart: Option<bool>,
     /// What the thread keeps of ptrace ([`ptrace::Local`]).
     pub(crate) ptrace: ptrace::Local,

@@ -1866,8 +1866,13 @@ static int case_throttle(void) {
     }
     /* A member's throttling stops its group (perf_event_throttle_group):
        a cpu-clock leader that counts and a member that counts leave out
-       the rest of each tick after the sampling member's interrupt, about
-       nine tenths of the time, which a cpu-clock outside the group counts. */
+       the rest of each tick after the sampling member's second interrupt,
+       which a cpu-clock outside the group counts. The sampler runs every
+       10 us, the least a cpu-clock's timer takes, and the group's counts
+       are measured against the outside clock's: a thread that other work
+       on its CPU preempts is unthrottled each time it runs again
+       (event_sched_in), so that with 100 us and the group's own running
+       time a busy machine showed no stop. */
     struct attr counting = software(0);
     counting.read_format = FORMAT_RUNNING;
     counting.flags |= DISABLED;
@@ -1876,7 +1881,7 @@ static int case_throttle(void) {
     counting.flags &= ~DISABLED;
     int member = (int)open_event(&counting, 0, -1, leader, 0);
     struct attr sampling = counting;
-    sampling.sample_period = 100000;
+    sampling.sample_period = 10000;
     sampling.sample_type = SAMPLE_TID;
     int sampler = (int)open_event(&sampling, 0, -1, leader, 0);
     int grouped = leader >= 0 && alone >= 0 && member >= 0 && sampler >= 0;
@@ -1896,7 +1901,7 @@ static int case_throttle(void) {
     say("restored %d", write_sysctl(RATE, saved));
     say("mapped %d", mapped);
     say("group: opened %d leader stopped %d member stopped %d alone counts all %d", grouped,
-        of[0].value * 2 < of[0].running, of[1].value * 2 < of[1].running,
+        of[0].value * 2 < of[2].value, of[1].value * 2 < of[2].value,
         of[2].value * 10 >= of[2].running * 9);
     if (!mapped) return 1;
     uint64_t tail = 0;

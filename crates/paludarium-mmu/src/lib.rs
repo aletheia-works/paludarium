@@ -348,6 +348,11 @@ pub enum ReadHint {
     Random,
 }
 
+/// What an install of guards that has to start again gives
+/// ([`AddressSpaceData::guard`]): Linux's `ERESTARTNOINTR`, which the
+/// system call turns into a restart, and never the guest's error.
+pub const GUARD_RESTART: Errno = Errno(513);
+
 /// The page faults that the calling host thread's accesses take, which
 /// count to its guest thread as they are taken, as Linux's
 /// `mm_account_fault` counts them to `current` (`perf`'s `page-faults`).
@@ -8107,6 +8112,8 @@ impl AddressSpaceData {
     /// Linux's `zap_vma_range` does, but keeps the guards already there,
     /// and gives private anonymous memory its `anon_vma`
     /// ([`Mapping::anon_vma`]). A hole gives `ENOMEM` once the rest is done.
+    /// An install that meets a uffd-wp marker its zap keeps ends with
+    /// [`GUARD_RESTART`] at that VMA ([`Self::install_guards`]).
     pub fn guard(&mut self, addr: u64, end: u64, install: bool) -> Result<(), Errno> {
         let fragments: Vec<Mapping> = self
             .mappings
@@ -8132,7 +8139,9 @@ impl AddressSpaceData {
             }
             let (from, to) = (m.start.0.max(addr), m.end().min(end));
             if install {
-                self.install_guards(&m, from, to);
+                if !self.install_guards(&m, from, to) {
+                    return Err(GUARD_RESTART);
+                }
             } else {
                 self.clear_guards(from, to);
             }
@@ -8146,16 +8155,32 @@ impl AddressSpaceData {
 
     /// Puts guards on `[from, to)` of the mapping `m`: drops its pages as
     /// [`Self::discard`] would, and its entries of shared memory, which
-    /// keeps its contents.
-    fn install_guards(&mut self, m: &Mapping, from: u64, to: u64) {
+    /// keeps its contents. Whether all of it took them: as Linux's
+    /// `madvise_guard_install` walks the range, the zap between its tries
+    /// keeps a uffd-wp marker of memory that is not anonymous, and leaves
+    /// one for a write-protected entry (`zap_install_uffd_wp_if_needed`),
+    /// which `guard_install_pte_entry` takes for a page and stops at: the
+    /// pages before the first marker take guards, the rest are dropped, and
+    /// the call restarts (`restart_syscall`).
+    fn install_guards(&mut self, m: &Mapping, from: u64, to: u64) -> bool {
         let shared = self.shared_at(from).is_some();
         let file = matches!(m.kind, MappingKind::ElfSegment | MappingKind::File);
         // As in `discard`: a file mapping without its file has nothing to
         // read its pages from again, and keeps them.
         if shared || !file || self.backing_at(from).is_some() {
+            self.keep_uffd_markers(from, to);
             self.clear_populated(from, to);
             self.refill(from, to);
         }
+        let marked = self
+            .uffd_markers
+            .within(from, to)
+            .into_iter()
+            .flat_map(|(start, end)| (start..end).step_by(PAGE_SIZE as usize))
+            .find(|&page| !self.guarded(page));
+        // The zap before the markers go in takes any poison marker away.
+        self.poisons.clear(from, to);
+        let to = marked.unwrap_or(to);
         if !shared && !file {
             self.mark_written(GuestAddr(from), to - from);
         }
@@ -8164,14 +8189,9 @@ impl AddressSpaceData {
                 mapping.maybe_guard = true;
             }
         }
-        // The zap before the markers go in (`madvise_guard_install`) takes
-        // any poison marker away too. A uffd-wp marker the zap leaves on
-        // memory that is not anonymous makes Linux restart the call until
-        // a signal; here the guard takes its place.
-        self.poisons.clear(from, to);
-        self.uffd_markers.clear(from, to);
         self.add_guards(from, to);
         self.bump_code_generation();
+        marked.is_none()
     }
 
     /// Whether the page at `page` is a guard page.

@@ -2744,10 +2744,12 @@ impl Kernel {
             members.is_empty()
         };
         drop(core);
-        // The last thread's exit ends the process's use of its program
-        // (`exit_mm`).
+        // The last thread's exit ends the process's use of its program and
+        // of its address space's contexts (`exit_mm`, `exit_aio`), before
+        // the exit is told.
         if alone {
             self.group.release_program();
+            self.group.aio().release();
         }
         // `exit_notify`'s `forget_original_parent`: the children it made
         // go to a thread still alive, and learn of it.

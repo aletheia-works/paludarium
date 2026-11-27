@@ -469,6 +469,7 @@ mod linux {
                     | "veth-ipv6-own-neighbours"
                     | "veth-ipv6-anycast"
                     | "veth-dev-mcast"
+                    | "net-dev-counters"
                     | "veth-igmp-neighbours"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
@@ -747,6 +748,7 @@ mod linux {
         veth_ipv6_own_neighbours => ("veth-ipv6-own-neighbours","veth-ipv6-own-neighbours"),
         veth_ipv6_anycast => ("veth-ipv6-anycast","veth-ipv6-anycast"),
         veth_dev_mcast => ("veth-dev-mcast","veth-dev-mcast"),
+        net_dev_counters => ("net-dev-counters","net-dev-counters"),
         veth_igmp_neighbours => ("veth-igmp-neighbours","veth-igmp-neighbours"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),

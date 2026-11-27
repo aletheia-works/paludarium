@@ -28,7 +28,7 @@ const MULTICAST: u32 = 2;
 const LOOPED: u32 = 5;
 /// The loopback's index (`LOOPBACK_IFINDEX`) and MTU.
 const LO_INDEX: u32 = 1;
-const LO_MTU: usize = 65_536;
+pub(super) const LO_MTU: usize = 65_536;
 /// `sysctl_ip_default_ttl` and IPv6's `hop_limit`.
 pub(super) const HOPS: u8 = 64;
 /// `IPPROTO_UDP` and `IPPROTO_TCP`.

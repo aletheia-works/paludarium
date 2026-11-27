@@ -105,8 +105,8 @@ pub(crate) fn ioctl_flags(device: &Device) -> u16 {
 /// the peer's index (`IFLA_LINK`, 0 once it has gone), and the queueing
 /// discipline it has since it opened, `noqueue`, or `noop` for one
 /// `going`. It has one queue each way, where Linux's has one for each
-/// possible CPU, and no `IFLA_AF_SPEC`; its statistics are zero, and left
-/// out with `RTEXT_FILTER_SKIP_STATS` in `mask`.
+/// possible CPU, and no `IFLA_AF_SPEC`; its statistics are left out with
+/// `RTEXT_FILTER_SKIP_STATS` in `mask`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn link_message(
     network: &Arc<Network>,
@@ -208,8 +208,9 @@ pub(super) fn link_message(
     attribute(&mut body, IFLA_ADDRESS, &v.mac);
     attribute(&mut body, super::IFLA_BROADCAST, &[0xff; 6]);
     if stats {
-        attribute(&mut body, super::IFLA_STATS64, &[0; super::STATS64_LEN]);
-        attribute(&mut body, super::IFLA_STATS, &[0; super::STATS_LEN]);
+        let (wide, narrow) = device.stats_attributes();
+        attribute(&mut body, super::IFLA_STATS64, &wide);
+        attribute(&mut body, super::IFLA_STATS, &narrow);
     }
     let mut xdp = Vec::new();
     attribute(&mut xdp, super::IFLA_XDP_ATTACHED, &[0]);

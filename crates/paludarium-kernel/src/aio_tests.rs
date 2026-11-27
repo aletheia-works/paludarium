@@ -186,6 +186,17 @@ fn ring_events(host: &RecordingHost, nr: u32) -> u32 {
 }
 
 #[test]
+fn the_last_threads_exit_ends_the_contexts_before_the_process_goes() {
+    let mut f = fixture();
+    f.setup(5);
+    assert_ne!(f.aio_nr(), 0);
+    // As `exit_aio` in `exit_mm`, before `exit_notify`: a parent's wait
+    // that ends sees them gone, though the process is not reaped yet.
+    f.kernel.finish_thread(&f.thread, &f.mem);
+    assert_eq!(f.aio_nr(), 0);
+}
+
+#[test]
 fn setup_maps_a_ring_and_destroy_ends_it() {
     let mut f = fixture();
     // *ctxp is read first, and must be 0, and nr_events not.

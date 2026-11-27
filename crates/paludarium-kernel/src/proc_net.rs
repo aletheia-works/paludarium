@@ -156,7 +156,7 @@ fn name(network: &Network, index: u32) -> Option<String> {
         .map(|d| String::from_utf8_lossy(&d.name).into_owned())
 }
 /// `dev`, as `dev_seq_show` prints it: the devices in the order of their
-/// indices, with counters of 0, as nothing counts here.
+/// indices, with their statistics ([`crate::netdev::Device::stats64`]).
 fn dev(network: Option<&Network>) -> String {
     let mut out = String::from(
         "Inter-|   Receive                                                |  Transmit\n \
@@ -166,11 +166,30 @@ fn dev(network: Option<&Network>) -> String {
     let Some(network) = network else { return out };
     for device in network.devices().iter() {
         let name = String::from_utf8_lossy(&device.name);
+        let s = device.stats64();
+        // `dev_seq_printf_stats`: rx_packets 0, tx_packets 1, rx_bytes 2,
+        // tx_bytes 3, errors 4 and 5, dropped 6 and 7, multicast 8,
+        // collisions 9, and the errors that make up the rest.
         let _ = writeln!(
             out,
-            "{name:>6}: {0:7} {0:7} {0:4} {0:4} {0:4} {0:5} {0:10} {0:9} \
-             {0:8} {0:7} {0:4} {0:4} {0:4} {0:5} {0:7} {0:10}",
-            0
+            "{name:>6}: {:7} {:7} {:4} {:4} {:4} {:5} {:10} {:9} \
+             {:8} {:7} {:4} {:4} {:4} {:5} {:7} {:10}",
+            s[2],
+            s[0],
+            s[4],
+            s[6] + s[15],
+            s[14],
+            s[10] + s[11] + s[12] + s[13],
+            s[21],
+            s[8],
+            s[3],
+            s[1],
+            s[5],
+            s[7],
+            s[18],
+            s[9],
+            s[17] + s[16] + s[20] + s[19],
+            s[22],
         );
     }
     out

@@ -4511,7 +4511,12 @@ impl Kernel {
         Ok(done)
     }
     /// `madvise` of the caller's own memory, for `process_madvise`, whose
-    /// discards the `userfaultfd`s are told of as `madvise`'s are.
+    /// discards the `userfaultfd`s are told of as `madvise`'s are. An
+    /// install of guards that has to start again
+    /// ([`paludarium_mmu::GUARD_RESTART`]) is tried again here, until a
+    /// fatal signal, which gives `EINTR`, as Linux's `vector_madvise` loops
+    /// on `-ERESTARTNOINTR` rather than repeat the ranges before it: the
+    /// signals in between run no handler.
     fn advise_own(
         &mut self,
         thread: &mut Thread,
@@ -4535,21 +4540,30 @@ impl Kernel {
             group: &self.group,
             processes: &self.processes,
         };
-        let mut removing = |from, to| crate::userfaultfd::remove(&mut c, from, to);
-        let mut poisoned = None;
-        let result = crate::syscalls::advise(
-            mem,
-            &credentials,
-            start,
-            len,
-            advice,
-            &mut removing,
-            &mut poisoned,
-        );
-        if let Some(page) = poisoned {
-            crate::signals::queue(c.process, crate::syscalls::poisoned_sigbus(page));
+        loop {
+            let mut removing = |from, to| crate::userfaultfd::remove(&mut c, from, to);
+            let mut poisoned = None;
+            let result = crate::syscalls::advise(
+                mem,
+                &credentials,
+                start,
+                len,
+                advice,
+                &mut removing,
+                &mut poisoned,
+            );
+            if let Some(page) = poisoned {
+                crate::signals::queue(c.process, crate::syscalls::poisoned_sigbus(page));
+            }
+            if result != Err(paludarium_mmu::GUARD_RESTART) {
+                return result;
+            }
+            if crate::seccomp::fatal_pending(&mut c) {
+                return Err(Errno(4));
+            }
+            let ticket = c.files.readiness.token.value();
+            crate::seccomp::wait_through_signals(&c, ticket);
         }
-        result
     }
     /// `process_mrelease(pidfd, flags)`, as Linux master's: `flags` must be
     /// 0 (`EINVAL`); then the task, `PIDFD_SELF_THREAD` or

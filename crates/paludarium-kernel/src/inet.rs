@@ -4529,17 +4529,17 @@ impl InetSocket {
         Ok(self.join(&self.network, s, (bound, from), to, options, None))
     }
     /// A connection to `to` out through the veth end `index`, or `lo`,
-    /// where no answer comes ([`Self::reach`]), from the
-    /// address its route leaves from on a port bound now, as on the
-    /// loopback ([`Self::loopback_source`]); `EINVAL` from a loopback
-    /// address, which Linux's `__mkroute_output` sends out of no other
-    /// device. Where it comes and its answers come back, it is the
-    /// listener's there, as on the loopback, or `None` when nothing
-    /// listens there, which answers with a reset. Else it fails in time:
-    /// unanswered, with `EHOSTUNREACH` once ARP gives up, as ICMP's host
-    /// unreachable tells it over the loopback, or with `ETIMEDOUT` once
-    /// the handshake's tries are over where that loopback is down; one
-    /// whose answers go nowhere with `ETIMEDOUT` too.
+    /// from the address its route leaves from on a port bound now, as on
+    /// the loopback ([`Self::loopback_source`]); `EINVAL` from a loopback
+    /// address through a veth end, as Linux's `__mkroute_output` sends one
+    /// out through `lo` alone. Where it comes and its answers come back,
+    /// it is the listener's there, as on the loopback, or `None` when
+    /// nothing listens there, which answers with a reset. Else it fails in
+    /// time: unanswered, with `EHOSTUNREACH` once ARP gives up, as ICMP's
+    /// host unreachable tells it over the loopback, or with `ETIMEDOUT`
+    /// once the handshake's tries are over where that loopback is down;
+    /// one whose answers go nowhere with `ETIMEDOUT` too, as does each
+    /// through `lo`, whose SYN no answer comes back to ([`Self::reach`]).
     fn open_veth(
         &self,
         s: &mut State,

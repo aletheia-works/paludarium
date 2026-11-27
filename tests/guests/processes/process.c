@@ -18894,6 +18894,83 @@ static int generated_link_names_case(const char *self) {
     return 0;
 }
 
+/* The generated-name-errors case: the calls that make, remove or rename
+   a name in a directory of /proc or /dev, in Linux's order: the directory,
+   the last name (`.`), the lookup (procfs finds nothing it does not have,
+   ENOENT), the trailing slash, the permission to write the directory
+   (procfs's own: a process's directory is immutable, its fd its own, no
+   directory of /proc/sys writable), and then EPERM (procfs has no such
+   operation), EXDEV between file systems. As root for /proc only, then as
+   nobody for /proc and /dev too, where nothing can change. Only errno
+   values are printed. */
+static char gne_base[] = "/tmp/paludarium-generated-names-XXXXXX";
+static int gne_e(int rc) { return rc < 0 ? errno : 0; }
+static void gne_rows(const char *const *names, unsigned count) {
+    char file[256], other[256];
+    snprintf(file, sizeof file, "%s/file", gne_base);
+    snprintf(other, sizeof other, "%s/other", gne_base);
+    printf("name unlink rmdir mkdir mknod symlink creat link-to link-from rename-out rename-in "
+           "rename-within\n");
+    for (unsigned i = 0; i < count; i++) {
+        const char *p = names[i];
+        char sibling[256];
+        snprintf(sibling, sizeof sibling, "%s", p);
+        char *slash = strrchr(sibling, '/');
+        if (slash && slash[1]) strcpy(slash + 1, "y8");
+        int u = gne_e(unlink(p));
+        int r = gne_e(rmdir(p));
+        int m = gne_e(mkdir(p, 0755));
+        int k = gne_e(mknod(p, S_IFIFO | 0644, 0));
+        int s = gne_e(symlink("x", p));
+        int fd = open(p, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        int c = fd < 0 ? errno : 0;
+        if (fd >= 0) close(fd);
+        int lt = gne_e(link(file, p));
+        int lf = gne_e(link(p, other));
+        int ro = gne_e(rename(p, other));
+        int ri = gne_e(rename(file, p));
+        int rw = gne_e(rename(p, sibling));
+        printf("%s %d %d %d %d %d %d %d %d %d %d %d\n", p, u, r, m, k, s, c, lt, lf, ro, ri, rw);
+    }
+}
+static int generated_name_errors_case(void) {
+    if (!mkdtemp(gne_base)) return 1;
+    chmod(gne_base, 0777);
+    char file[256];
+    snprintf(file, sizeof file, "%s/file", gne_base);
+    close(open(file, O_CREAT | O_WRONLY, 0666));
+    chmod(file, 0666);
+    static const char *const proc_names[] = {
+        "/proc/x8",       "/proc/uptime",    "/proc/self",      "/proc/sys",        "/proc/self/comm",
+        "/proc/self/fd",  "/proc/self/exe",  "/proc/self/x8",   "/proc/sys/kernel", "/proc/sys/x8",
+        "/proc/sys/kernel/ostype", "/proc/self/fd/0", "/proc/self/fd/x8", "/proc/x8/",  "/proc/uptime/",
+        "/proc/self/",    "/proc/sys/",      "/proc/.",         "/proc/self/.",     "/proc/self/..",
+        "/proc/thread-self/comm"};
+    static const char *const dev_names[] = {"/dev/null", "/dev/x8", "/dev/pts", "/dev/null/", "/dev/."};
+    unsigned procs = sizeof proc_names / sizeof proc_names[0];
+    printf("root\n");
+    gne_rows(proc_names, procs);
+    /* /proc and /dev themselves, in the root's directory. */
+    printf("tops unlink=%d,%d rmdir=%d,%d mknod=%d symlink=%d\n", gne_e(unlink("/proc")),
+           gne_e(unlink("/dev/")), gne_e(rmdir("/proc")), gne_e(rmdir("/dev")),
+           gne_e(mknod("/proc", S_IFIFO | 0644, 0)), gne_e(symlink("x", "/dev")));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        printf("nobody\n");
+        gne_rows(proc_names, procs);
+        gne_rows(dev_names, sizeof dev_names / sizeof dev_names[0]);
+        printf("tops unlink=%d rmdir=%d\n", gne_e(unlink("/proc")), gne_e(rmdir("/dev")));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("status=%d\n", reaped(child));
+    unlink(file);
+    printf("cleaned=%d\n", rmdir(gne_base) == 0);
+    return 0;
+}
+
 /* The generated-noexec case: /proc and /dev are noexec mounts, so an
    executable mapping of a file there is EPERM before anything else is
    checked, and mprotect to one EACCES; a file reached through a link
@@ -44543,6 +44620,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-link-names")) return generated_link_names_case(self);
     if (!strcmp(mode, "generated-link-ran")) return 7;
+    if (!strcmp(mode, "generated-name-errors")) return generated_name_errors_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

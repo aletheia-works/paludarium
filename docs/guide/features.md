@@ -4416,8 +4416,25 @@ kernel.
   elsewhere under `/proc` is `ENOENT`, as a name procfs does not have is on
   Linux, whatever the filesystem holds there (with `--mount /:/`, the
   host's own `/proc`): `/proc` is a mount of its own from start-up, as
-  `/dev` is, so calls that would make, remove or rename such a name are
-  `ENOENT` too.
+  `/dev` is.
+
+- The calls that make, remove or rename a name in a directory of `/proc`
+  or `/dev` (`mkdir`, `mknod`, `symlink`, `link`, `unlink`, `rmdir`,
+  `rename`, `renameat2` and an `open` with `O_CREAT`, with their `*at`
+  forms) give Linux's errors in its order: the directory, a last name of
+  `.` or `..` (`EEXIST`, `EISDIR`, `EINVAL`, `ENOTEMPTY`, `EBUSY`), the
+  lookup (procfs finds no name it does not have, `ENOENT`, where a name
+  that is there is `EEXIST` to make), the trailing slash (`ENOTDIR`,
+  `EISDIR`), the permission to write the directory and then `EPERM`, as
+  procfs and devpts have no such operation; `link` and `rename` between
+  `/proc`, `/dev` and another file system are `EXDEV` first. The
+  permission is procfs's own: a process's and a thread's directory are
+  immutable (`EPERM`, root's too), a process's `fd` lets its own threads
+  write, no directory of `/proc/sys` may be written (`EACCES`, root's
+  too), and the rest go by their mode, as `/dev` (0755 root) does, so
+  another user gets `EACCES`. `/proc` and `/dev` themselves are mount
+  points in the root's directory: `rmdir` and `rename` of them are
+  `EBUSY`, `unlink` `EISDIR` and the calls that make them `EEXIST`.
 
 - `/proc` lists the files above, and nothing the filesystem has there (with
   `--mount /:/`, none of the host's own entries), and then a directory for every process of the guest, zombies included, as

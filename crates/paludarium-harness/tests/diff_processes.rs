@@ -211,6 +211,8 @@ mod linux {
             // other users or make it another user's, the proc-fd-links case,
             // which reads links from a chroot of its own mount namespace,
             // the maps-root case, which reads maps across a chroot,
+            // the generated-name-errors case, which makes, removes and
+            // renames names in /proc as root and then becomes nobody,
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
@@ -236,6 +238,7 @@ mod linux {
                     | "timer-waits-default"
                     | "proc-mem"
                     | "chroot-names"
+                    | "generated-name-errors"
                     | "maps-root"
                     | "path-flags"
                     | "permissions"
@@ -1177,6 +1180,7 @@ mod linux {
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_link_names => ("generated-link-names","process"),
+        processes_generated_name_errors => ("generated-name-errors","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),

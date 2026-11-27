@@ -1,6 +1,7 @@
 //! Linux x86-64 file ABI and descriptor table. All guest memory is checked.
 use crate::syscalls::{Context, Outcome};
 pub(crate) mod attributes;
+mod generated_names;
 pub(crate) mod splice;
 mod tasks;
 mod xattrs;
@@ -2639,7 +2640,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
             descriptor_followed(c.files, c.files.descriptor(old_dir)?)?
         }
     } else {
-        let (old, _) = lookup_linked(c, old_dir, old_raw, follow)?;
+        let (old, _) = lookup_linked(c, old_dir, old_raw.clone(), follow)?;
         match followed(c, &old, follow)? {
             Some(target) => target,
             // A dangling symbolic link leads nowhere (ENOENT).
@@ -2655,6 +2656,11 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     };
     let new_raw = path(c, new_ptr)?;
     let new = c.files.named_parent_linked(new_dir, new_raw.clone())?;
+    if let Followed::Path { path, .. } = &target
+        && let Some(found) = generated_names::link_from(c, &old_raw, path, follow)
+    {
+        found?;
+    }
     let old = match target {
         Followed::Path { path, follow: true } => resolved(c.files, &path).unwrap_or(path),
         Followed::Path { path, .. } => path,
@@ -2671,6 +2677,9 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
             return Err(EXDEV);
         }
     };
+    if let Some(error) = generated_names::link_to(c, &old, &new_raw, &new) {
+        return Err(error);
+    }
     // A file of `/proc` or `/dev` (a link in `/proc/self/fd` not followed)
     // is on procfs or devtmpfs, which the new name is not.
     if generated(&old) {
@@ -6139,6 +6148,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 let walks = ((old_dir, &old_raw[..]), (new_dir, &new_raw[..]));
                 return rename_queue(c, (&old, &new), walks, names, flags);
             }
+            if let Some(renamed) =
+                generated_names::rename(c, (&old_raw, &old), (&new_raw, &new), flags)
+            {
+                return renamed;
+            }
             crate::bpf_fs::lookup(c, &old)?;
             crate::bpf_fs::lookup(c, &new)?;
             crate::permissions::rename(
@@ -6221,8 +6235,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     landlock_name(c, &p, crate::landlock::MAKE_DIR)
                 });
             }
-            // A generated directory, `/proc` and `/dev` too, is there,
-            // with a trailing slash or through a link as by its name.
+            if let Some(error) = generated_names::make(c, &raw, &p, true, crate::landlock::MAKE_DIR)
+            {
+                return Err(error);
+            }
+            // `/proc` and `/dev` are there, with a trailing slash or
+            // through a link as by their names.
             let end = p.iter().rposition(|&b| b != b'/').map_or(1, |i| i + 1);
             let named = &p[..end];
             if (generated(named) || named == b"/proc" || named == b"/dev")
@@ -6275,6 +6293,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     landlock_name(c, &p, request)
                 });
             }
+            if let Some(error) = generated_names::remove(c, &raw, &p, dir) {
+                return Err(error);
+            }
             crate::permissions::delete(c.files, &c.process.credentials, at_dir, &raw)?;
             crate::permissions::removable_name(c.files, at_dir, &raw, dir)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_some()) {
@@ -6304,6 +6325,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return crate::mqueue::make_mounted(c, &name, None, || {
                     landlock_name(c, &p, crate::landlock::MAKE_SYM)
                 });
+            }
+            if let Some(error) =
+                generated_names::make(c, &raw, &p, false, crate::landlock::MAKE_SYM)
+            {
+                return Err(error);
             }
             crate::bpf_fs::lookup(c, &p)?;
             let created =
@@ -7550,8 +7576,10 @@ pub(crate) fn open_with(
     let fd = reserve
         .then(|| c.files.reserve(c.group.nofile()))
         .transpose()?;
+    let made = generated_names::open_create(c, &raw, &p, flags);
     let credentials = &c.process.credentials;
     let opened = match crate::bpf_fs::lookup(c, &p)
+        .and_then(|()| made.map_or(Ok(()), Err))
         .and_then(|()| crate::permissions::open(c.files, credentials, dir, &raw, flags))
     {
         Ok(created) => landlock_before_open(c, &p, flags).and_then(|landlock| {
@@ -9196,7 +9224,7 @@ fn link_queue(
             }
         }
         None => {
-            let (old, _) = lookup_linked(c, old_dir, old_raw, follow)?;
+            let (old, _) = lookup_linked(c, old_dir, old_raw.clone(), follow)?;
             if generated_stat(c, &old, follow)?.is_none() {
                 c.files.fs().metadata(&old, follow)?;
             }
@@ -9937,6 +9965,10 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
                 landlock_name(c, &p, crate::landlock::make_access(kind, dev))
             })
             .map(|_| ());
+        }
+        let access = crate::landlock::make_access(kind, u64::from(dev));
+        if let Some(error) = generated_names::make(c, raw, &p, false, access) {
+            return Err(error);
         }
     }
     match kind {

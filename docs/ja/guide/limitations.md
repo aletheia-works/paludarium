@@ -176,13 +176,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   取ります。Linux master で新しく入った `fchroot` はありません（`ENOSYS`）。
 - **独自のルートの下での `/dev` と `/proc` の中を指すリンク**：そこでは、ほかの場所から
   その中を指すシンボリックリンクを、生成されるファイルまでたどりません。
-- **`/dev` と `/proc` の名前**：`/dev` に名前を作る呼び出しはありません（`mkdir`、
-  `mknod`、`symlink`、`O_CREAT` 付きの `open`、そこへの `rename` は `ENOENT` です）。
-  Linux の devtmpfs は受け付けます。生成される名前を消す、名前を変える呼び出しも
-  `ENOENT` です。Linux は、`/proc` のファイルの `unlink` に `EPERM`、そこのリンクの
-  `rmdir` に `ENOTDIR`、`/dev/pts` の `rmdir` に `EBUSY`、`/proc` から外への `rename` に
-  `EXDEV` を返します。`/proc` の新しい名前への `link` は `EXDEV` です。Linux は先に
-  名前を探して見つけられません（`ENOENT`）。
+- **`/dev` の名前**：root では、`/dev` に名前を作る呼び出し（`mkdir`、`mknod`、`symlink`、
+  `O_CREAT` 付きの `open`）は `ENOENT`、そこの名前の `unlink`、`rmdir`、`rename` は `EPERM`
+  です。Linux の devtmpfs は名前を作り、消し、変えます。ほかのユーザーには Linux と同じく
+  `EACCES` です。
 - **`/dev/tty` の `O_PATH`**：ほかの `open` と同じように制御端末を開くので、制御端末が
   なければ失敗します（`ENOENT`）。Linux の `O_PATH` は、デバイスを開かずに名前を開きます。
 - **生成されるファイルの変更（一部）**：`/dev` とそのデバイスやリンク、`/proc`、`/proc` の

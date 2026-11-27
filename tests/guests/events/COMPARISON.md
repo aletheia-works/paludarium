@@ -2,7 +2,7 @@
 
 ## Catalog
 
-raw Linux ABI guestは0〜85の86件、Rust target guest timer/unixの2件、計88件を固定する。元69件のgreen source aeb7d59c8c611bc3120380ea60707e0369dfa683と品質証拠は歴史として保持する。追加67〜81はET未読追加writeとpwait一時mask境界のnative先行観測待ちであり、製品修正前にfixture-only CIで期待を取得する。保存期待fixtureは作らない。
+raw Linux ABI guestは0〜87の88件、Rust target guest timer/unixの2件、計90件を固定する。元69件のgreen source aeb7d59c8c611bc3120380ea60707e0369dfa683と品質証拠は歴史として保持する。追加67〜81はET未読追加writeとpwait一時mask境界のnative先行観測待ちであり、製品修正前にfixture-only CIで期待を取得する。保存期待fixtureは作らない。
 
 | ID | ケース | 比較 |
 | --- | --- | --- |
@@ -92,6 +92,8 @@ raw Linux ABI guestは0〜85の86件、Rust target guest timer/unixの2件、計
 | 83 | stdout_sigpipe | 読み手のいないstdoutへのwriteでSIGPIPEにより終了 |
 | 84 | pipe_epipe_after_part_blocked | 128KiBのpipe writeの途中（64KiB充填後）に唯一の読み手の子が終了。書いた64KiBを返しSIGPIPEはblockしてそのwrite直後にpending、次のwriteはEPIPE |
 | 85 | pipe_sigpipe_after_part | 84と同じwriteの途中で読み手が終了し、次のwriteを待たずSIGPIPEにより終了 |
+| 86 | pipe_nosignal_after_part | 84と同じ128KiBをpwritev2のRWF_NOSIGNALで書く。64KiBを返し、次の1バイトはEPIPE、どちらもSIGPIPEを出さない（両方の後にpendingなし） |
+| 87 | sendfile_pipe_takes_what_fits | 60KiB（15ページ）入ったblocking pipeへmemfdから8KiBをsendfile。入る1ページ4096を返し、それ以上を待たない（splice_file_to_pipe）。待てばalarmで終了 |
 | timer | tokio1.48.0 multi-thread runtimeの2timer完了 | stdout/stderr/exit/timeout |
 | unix | std UnixStream::pair双方向write/read | stdout/stderr/exit/timeout |
 
@@ -109,4 +111,4 @@ raw Linux ABI guestは0〜85の86件、Rust target guest timer/unixの2件、計
 
 case66はclone共有Threadがrelease atomicを受けてpeerをdrainし、親のblocking writeを進め、clear-child-TID futexで終了を回収する。releaseはsyscall開始前なので実Host waitへの到達をこのguestだけで保証しない。実待機開始後の解除は内部Host同期テストで別に確かめた。Node/実Safariでは非threaded0〜65とunixを含め、timerと66のguest threadingはwasm境界として明示する。登録/通知競合とtimer metadataの内部同期テストは製品実装後の単体テストで検証した。現moduleのNode/実Safari結果は最終原本取得まで未検証。
 
-新しいobservable syscall動作が必要になれば追加guestをnative先行で取得し、この固定88ケースを削らず追加する。Wasmは0〜81のうち66を除く81 Cケース+unix=82件、既存21との合計103件を予定し、全新結果は未検証。DGRAM/SEQPACKETとネットワーク通信は承認済み対応範囲と区別する。固定ゲストプログラムのprobe全量、wasm guest Worker達成を有限結果から推測しない。
+新しいobservable syscall動作が必要になれば追加guestをnative先行で取得し、この固定90ケースを削らず追加する。Wasmは0〜81のうち66を除く81 Cケース+unix=82件、既存21との合計103件を予定し、全新結果は未検証。DGRAM/SEQPACKETとネットワーク通信は承認済み対応範囲と区別する。固定ゲストプログラムのprobe全量、wasm guest Worker達成を有限結果から推測しない。

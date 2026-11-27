@@ -159,7 +159,8 @@ kernel.
   system take neither. On a macOS or Windows host, whose file systems Linux
   has no number for, a host file is taken as ext4's. `RWF_NOSIGNAL` spares a write to
   a pipe or socket with no reader its `SIGPIPE` (it still gives `EPIPE`), as
-  since Linux 6.18. `RWF_NOAPPEND` turns an `O_APPEND` file's append off
+  since Linux 6.18, also one to a pipe whose last reader leaves after part
+  of it went, which returns that part. `RWF_NOAPPEND` turns an `O_APPEND` file's append off
   for the call: a write goes to the offset (growing the file past its end)
   or, at -1, to the position, which then moves past it; an append-only file
   (`FS_APPEND_FL`) gives `EPERM`, for a read too. `RWF_APPEND` writes a
@@ -169,8 +170,10 @@ kernel.
 - `copy_file_range` copies between two regular files on one mount (`EXDEV`
   across mounts), stopping at the input's end, with Linux's checks in order
   (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in
-  one file). `sendfile` reads a regular file into any writable file, a pipe
-  taking at most its capacity per call. Both update the given offsets or the
+  one file). `sendfile` reads a regular file into any writable file; into a
+  pipe it is a `splice`, as Linux's `splice_file_to_pipe`: once the pipe has
+  room it takes what fits and does not wait for more, waiting first only
+  when the pipe is not `O_NONBLOCK`. Both update the given offsets or the
   file positions; `sendfile` writes its offset back even after an error.
 
 - `splice` moves bytes between a pipe (or FIFO) and a regular file, a

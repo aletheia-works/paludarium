@@ -47,15 +47,29 @@ static I run(I *o) {
  /* 82 and 83 run with a stdout whose reader is gone, and report on stderr:
     a write there is EPIPE and raises SIGPIPE, which 82 blocks (pending
     after it) and 83 leaves to kill the process. */
+ /* 87 sendfiles 8 KiB from a memfd into a blocking pipe that 60 KiB in
+    15 pages fill: it gives the one page that fits, not waiting for more,
+    as do_sendfile's splice_file_to_pipe (an alarm ends a wait). */
+ if(CASE==87) {
+  static char page[8192];U at=0;int queued=0;I m=sc(319,(U)"s",0,0,0,0,0);
+  char *fill=(char *)sc(9,0,61440,3,0x22,(U)-1,0);
+  if(m<0||S(1,m,page,8192)!=8192||sc(293,(U)p,0,0,0,0,0)!=0)return 1;
+  o[0]=S(1,p[1],fill,61440);S(37,5,0,0);
+  o[1]=sc(40,p[1],m,(U)&at,8192,0,0);S(37,0,0,0);
+  S(16,p[0],0x541B,&queued);o[2]=queued;o[3]=(I)at;return 0;
+ }
  /* 84 and 85 write 128 KiB to a pipe at once; a child holding its only
     read end waits until 64 KiB fill it, which the parent is still inside
     the write for, and exits. The write gives the 64 KiB with SIGPIPE, which
     84 blocks (pending right after it; a next write is EPIPE) and 85
-    leaves to kill the process before it writes again. */
- if(CASE>=84) {
+    leaves to kill the process before it writes again. 86 writes with
+    pwritev2's RWF_NOSIGNAL, which spares SIGPIPE after the part and with
+    the next write's EPIPE (none pending after both). */
+ if(CASE>=84&&CASE<=86) {
   U blocked=1UL<<12,pending=0;int queued=0;I pid,status=0;
   char *big=(char *)sc(9,0,131072,3,0x22,(U)-1,0);
-  if(CASE==84)sc(14,0,(U)&blocked,0,8,0,0);
+  struct{char *base;U len;}iov={big,131072};
+  if(CASE!=85)sc(14,0,(U)&blocked,0,8,0,0);
   if(sc(293,(U)p,0,0,0,0,0)!=0)return 1;
   pid=S(57,0,0,0);
   if(pid==0){
@@ -64,7 +78,11 @@ static I run(I *o) {
    S(60,0,0,0);__builtin_unreachable();
   }
   closefd(p[0]);
-  o[0]=S(1,p[1],big,131072);
+  if(CASE==86){
+   o[0]=sc(328,p[1],(U)&iov,1,(U)-1,0,0x100);iov.len=1;
+   if(o[0]<0)S(62,pid,9,0); /* no pwritev2: the reader would wait on */
+   o[2]=sc(328,p[1],(U)&iov,1,(U)-1,0,0x100);
+  }else o[0]=S(1,p[1],big,131072);
   sc(127,(U)&pending,8,0,0,0,0);o[1]=pending;
   sc(61,pid,(U)&status,0,0,0,0);o[3]=status;
   if(CASE==84)o[2]=S(1,p[1],big,1);

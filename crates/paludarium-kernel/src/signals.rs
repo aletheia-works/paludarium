@@ -175,6 +175,7 @@ impl Discards {
                 .and_then(|i| self.0.get(i))
                 .is_none_or(|slot| slot.load(Ordering::SeqCst) <= signal.born)
         });
+        refresh_own(state);
     }
 }
 /// `si_pid`, `si_status` and the CPU time (`si_utime`) of a SIGCHLD.
@@ -334,8 +335,10 @@ pub(crate) fn queue(process: &mut ThreadState, signal: PendingSignal) {
     if signal.number == 18 {
         process.stopped = false;
         process.pending.retain(|s| !matches!(s.number, 19..=22));
+        refresh_own(process);
     } else if matches!(signal.number, 19..=22) {
         process.pending.retain(|s| s.number != 18);
+        refresh_own(process);
     }
     // Standard signals coalesce; each real-time number retains FIFO order.
     if signal.number < 32
@@ -369,10 +372,16 @@ pub(crate) fn own_set(process: &ThreadState) -> u64 {
 /// next drain.
 pub(crate) fn take_pending(process: &mut ThreadState, index: usize) -> PendingSignal {
     let signal = process.pending.remove(index);
+    refresh_own(process);
+    signal
+}
+/// Tells `process`'s [`crate::targets::Tif`] its own pending standard
+/// signals after some of them went away, so that one of their numbers sent
+/// next is counted as it is sent, not only at the thread's next drain.
+pub(crate) fn refresh_own(process: &ThreadState) {
     if let Some(tif) = process.seat.tif() {
         tif.set_own(own_set(process));
     }
-    signal
 }
 /// Whether Linux would queue `signal` for `process`, and so wake a signal
 /// file (`signalfd_notify`): not when it is unblocked and ignored, which

@@ -673,6 +673,47 @@ mod signals_time_tests {
         assert_eq!(one.others_arrivals(), 2);
     }
 
+    /// Nor is one that a discard took away (`flush_sigqueue_mask`), or that
+    /// SIGCONT, or a stop signal, took away as it was queued.
+    #[test]
+    fn a_discarded_signal_is_pending_no_more() {
+        let count = Arc::<AtomicU64>::default();
+        let actions = crate::threads::ActionSlot::default();
+        let [one, two] = [SignalInbox::default(), SignalInbox::default()];
+        for inbox in [&one, &two] {
+            inbox.attach(Arc::default(), Arc::clone(&count));
+            inbox.follow_actions(Arc::clone(&actions));
+        }
+        let mut state = ThreadState::default();
+        state.seat.take(two.tif(), 0);
+        two.send_thread(10, 0).unwrap();
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 1);
+        // The caller's own discard.
+        let discards = signals::Discards::default();
+        discards.mark(10);
+        discards.apply(&mut state);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 2);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 2);
+        // Another thread's, which it drops at its next drain.
+        discards.mark(10);
+        two.tif().forget_own(10);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 3);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 3);
+        assert_eq!(state.pending.len(), 1);
+        // SIGCONT takes a pending SIGTSTP away as it is queued.
+        two.send_thread(20, 0).unwrap();
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 4);
+        signals::queue(&mut state, signals::PendingSignal::thread(18, 0));
+        two.send_thread(20, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 5);
+    }
+
     #[test]
     fn queued_arrivals_count_a_standard_signal_once() {
         let inbox = SignalInbox::default();

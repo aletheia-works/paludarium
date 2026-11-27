@@ -1113,6 +1113,7 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner);
         pending.pending.retain(|signal| signal.number != number);
         drop(pending);
+        self.targets.forget_own(number);
         self.inbox_of_process().purge(number);
         for inbox in self
             .members
@@ -2320,6 +2321,7 @@ impl ThreadGroup {
     /// themselves; `local`, the caller's, drops them now.
     pub(crate) fn discard_pending(&self, number: i32, local: &mut ThreadState) {
         self.discards.mark(number);
+        self.targets.forget_own(number);
         self.discards.apply(local);
         let mut pending = self
             .process_pending

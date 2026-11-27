@@ -39,10 +39,10 @@ pub(crate) struct Tif {
     killable: AtomicBool,
     /// What wakes it from such a wait.
     wake: Arc<AtomicBool>,
-    /// Its own pending standard signals as its last drain left them, or
-    /// more: all of them until that first drain, and those queued for it
-    /// since then without its inbox, which it has not drained yet
-    /// ([`Self::queues`] counts on no fewer).
+    /// Its own pending standard signals as its last drain, take or discard
+    /// left them, or more: all of them until that first drain, and those
+    /// queued for it since then without its inbox, which it has not drained
+    /// yet ([`Self::queues`] counts on no fewer).
     own: AtomicU64,
 }
 
@@ -59,6 +59,15 @@ impl Tif {
     }
     pub(crate) fn set_own(&self, set: u64) {
         self.own.store(set, Ordering::SeqCst);
+    }
+    /// No standard signal `number` is pending for the thread any more: a
+    /// discard took them all away, though the thread drops its own only at
+    /// its next drain.
+    pub(crate) fn forget_own(&self, number: i32) {
+        if (1..32).contains(&number) {
+            self.own
+                .fetch_and(!(1u64 << (number - 1)), Ordering::SeqCst);
+        }
     }
     /// Whether Linux's `__send_signal_locked` queues signal `number` sent to
     /// this thread alone, and so wakes the process's signal files
@@ -232,6 +241,13 @@ impl Targets {
         let mut list = self.list();
         (list.leader, list.current) = (tid, tid);
         list.threads = vec![(tid, Arc::clone(tif))];
+    }
+    /// A discard took every pending signal `number` away from the threads
+    /// (`flush_sigqueue_mask` on each): one sent next counts as it is sent.
+    pub(crate) fn forget_own(&self, number: i32) {
+        for (_, tif) in &self.list().threads {
+            tif.forget_own(number);
+        }
     }
     /// No thread is in a group stop any more: SIGCONT came.
     pub(crate) fn resume(&self) {

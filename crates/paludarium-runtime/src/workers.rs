@@ -146,6 +146,7 @@ impl Execution {
             // With the trap flag set, one instruction runs and traps; checked
             // once per run here, so a run without it pays nothing more.
             let breakpoints = thread.breakpoints();
+            let traced = thread.cpu.rflags & flag::TF != 0;
             // RF holds back only an execute breakpoint for one instruction.
             if breakpoints.is_none() {
                 thread.cpu.rflags &= !flag::RF;
@@ -197,6 +198,11 @@ impl Execution {
             } else {
                 run_cached(&mut thread.cpu, memory, budget, &mut decode)
             };
+            // One instruction at a time with the trap flag (set before the
+            // run or by it) or a tracer's breakpoints: not a whole run.
+            if traced || breakpoints.is_some() || thread.cpu.rflags & flag::TF != 0 {
+                kernel.run_cut_short();
+            }
             let next = kernel.handle(thread, memory, reason);
             if let Some(replacement) = kernel.take_exec_memory() {
                 *memory = replacement;

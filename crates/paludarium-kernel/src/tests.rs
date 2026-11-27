@@ -14327,4 +14327,11 @@ fn a_sampling_clock_ends_each_run_about_when_it_is_to_fire() {
     host.set_clock(paludarium_host::ClockId::Monotonic, 2_000_000);
     kernel.pace.ran(&*host);
     assert_eq!(kernel.pace.rate, Some((PACE_FLOOR, 10_000)));
+    // Nor does a run cut short, as one with the trap flag.
+    kernel.pace.due = Some(50_000);
+    assert_eq!(kernel.run_budget(100_000), 25_000);
+    kernel.run_cut_short();
+    host.set_clock(paludarium_host::ClockId::Monotonic, 2_000_100);
+    kernel.pace.ran(&*host);
+    assert_eq!(kernel.pace.rate, Some((PACE_FLOOR, 10_000)));
 }

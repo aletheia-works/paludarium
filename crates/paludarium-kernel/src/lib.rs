@@ -1582,6 +1582,14 @@ impl Kernel {
         n
     }
 
+    /// The thread's run may have ended before it ran all that
+    /// [`Kernel::run_budget`] gave it, though it ends with a used-up
+    /// budget: with the trap flag, or a tracer's breakpoints, it runs one
+    /// instruction at a time. It tells nothing of the rate.
+    pub fn run_cut_short(&mut self) {
+        self.pace.run = None;
+    }
+
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // Its writes to user memory, a signal frame's and the rseq area's,

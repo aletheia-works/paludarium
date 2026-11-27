@@ -4476,7 +4476,15 @@ fn sys_rt_sigaction(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .get(&key)
         .copied()
         .unwrap_or_default();
-    if old.flags & signals::SA_IMMUTABLE != 0 {
+    // The group's, which a process sharing the actions may have made
+    // immutable since this thread synced its copy.
+    let shared = c.group.shared_actions();
+    let immutable = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .is_some_and(|action| action.flags & signals::SA_IMMUTABLE != 0);
+    if immutable || old.flags & signals::SA_IMMUTABLE != 0 {
         return err(Errno::EINVAL);
     }
     old.flags &= signals::UAPI_SA_FLAGS;

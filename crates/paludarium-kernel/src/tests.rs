@@ -12341,6 +12341,41 @@ fn a_seccomp_kill_leaves_sigsys_immutable() {
         }
     );
 }
+
+/// A thread whose own copy of the actions predates another process's
+/// seccomp kill still finds SIGSYS's shared action immutable, and a change
+/// published over it keeps it so, as Linux's siglock orders the two.
+#[test]
+fn an_action_made_immutable_since_the_last_sync_stays_so() {
+    let mut f = fixture();
+    let forced = |a: crate::SignalAction| crate::SignalAction {
+        handler: 0,
+        flags: a.flags | crate::signals::SA_IMMUTABLE,
+        ..a
+    };
+    f.kernel.group.set_action(31, SignalAction::default());
+    f.kernel.group.force_exit_action(31);
+    // The thread's own copy is still the old one.
+    f.thread
+        .state
+        .signal_actions
+        .insert(31, SignalAction::default());
+    assert_eq!(
+        f.ret(nr::RT_SIGACTION, &[31, 0, DATA + 0x100, 8]),
+        errno(Errno::EINVAL)
+    );
+    let new = SignalAction {
+        handler: 0x5000,
+        flags: 0x0400_0004,
+        restorer: 0x6000,
+        mask: 2,
+    };
+    f.kernel.group.set_action(31, new);
+    assert_eq!(
+        f.kernel.group.shared_actions().lock().unwrap()[&31],
+        forced(new)
+    );
+}
 #[test]
 fn vsyscall_calls_go_through_seccomp() {
     // time is ERRNO(EACCES), getcpu TRAP, gettimeofday the listener's.

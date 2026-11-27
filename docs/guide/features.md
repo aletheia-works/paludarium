@@ -5469,7 +5469,9 @@ kernel.
   changes), the last two made by the kernel and so left out with
   `exclude_kernel`, as Linux leaves them out; `major-faults` (the faults of
   the kernel's accesses that a `userfaultfd` had try again, which
-  `page-faults` counts too and `minor-faults` does not); and
+  `page-faults` counts too and `minor-faults` does not; `page-faults`
+  alone counts a fault of the thread's code whose `userfaultfd` wait a
+  signal ends, as it is not tried again); and
   `alignment-faults`,
   `emulation-faults`, `dummy` and `bpf-output`, which count nothing, as on
   x86-64. An event of a thread on one CPU, as `perf record` opens one for

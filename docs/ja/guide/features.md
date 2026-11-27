@@ -4691,7 +4691,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `context-switches`（眠るたび）と `cpu-migrations`（`getcpu` の返す CPU が変わるたび）。
   後の二つはカーネルが起こすので、Linux と同じく `exclude_kernel` で除きます。
   `userfaultfd` がやり直させたカーネルのアクセスのフォールトを数える `major-faults`
-  （`page-faults` も数え、`minor-faults` は数えません）と、x86-64 と同じく何も数えない
+  （`page-faults` も数え、`minor-faults` は数えません。シグナルが `userfaultfd` の待ちを
+  終わらせたスレッドのコードのフォールトはやり直さないので、`page-faults` だけが数えます）と、
+  x86-64 と同じく何も数えない
   `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。
   `perf record` が CPU ごとに開くような、一つの CPU のスレッドのイベントは、スレッドが
   その CPU にいる間だけ数えて動き（`event_filter_match`）、有効な時間はその間ずっと

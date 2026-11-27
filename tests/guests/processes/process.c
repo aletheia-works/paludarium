@@ -22744,21 +22744,26 @@ static int proc_system_case(void) {
     if (proc) closedir(proc);
     printf("listed=%d\n", listed);
     /* Past one, as past any file. An open for writing is checked against
-       the 0444 mode, which only root overrides; root's write then fails, as
-       the files have no write. */
+       the 0444 mode, which only root overrides: a child, a user other than
+       root on both sides, tries it. */
     errno = 0;
     int r = open("/proc/version/x", O_RDONLY);
     printf("past open=%d errno=%d\n", r, errno);
-    errno = 0;
-    int fd = open("/proc/filesystems", O_WRONLY);
-    printf("write root=%d open=%d errno=%d", geteuid() == 0, fd >= 0, fd >= 0 ? 0 : errno);
-    if (fd >= 0) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(90);
         errno = 0;
-        long w = write(fd, "x", 1);
-        printf(" write=%ld errno=%d", w, errno);
-        close(fd);
+        int fd = open("/proc/filesystems", O_WRONLY);
+        printf("write open=%d errno=%d\n", fd >= 0, fd >= 0 ? 0 : errno);
+        fflush(stdout);
+        _exit(0);
     }
-    printf("\n");
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("write child=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
 }
 

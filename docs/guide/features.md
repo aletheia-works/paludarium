@@ -5062,12 +5062,23 @@ kernel.
     runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
     each IPv6 group of each device with IPv6, the newest first, with its
     users and its flags, `MAF_NOREPORT` for ff02::1 and a group of a scope
-    below a link's and `MAF_LOADED` for the rest while their device is up,
-    and no timer, as no MLDv1 report is waited for. `mcfilter` and `mcfilter6`
+    below a link's and `MAF_LOADED` for the rest from when they are joined
+    or their device comes up until it goes down, and no timer, as no MLDv1
+    report is waited for. `mcfilter` and `mcfilter6`
     (`igmp_mcf_seq_show`, `igmp6_mcf_seq_show`), the sources the
     memberships of each group name, with how many include and how many
     exclude each, from the first device whose newest group names one, as
     Linux's begin there.
+  - `dev_mcast` (`dev_mc_seq_show`), the link-layer multicast addresses
+    each device takes packets to, in the order of their indexes, each
+    device's in the order they came, with how many of its groups map to
+    each and whether it is global, which none is. A veth end maps each
+    IPv4 group in its filter to an Ethernet address (`ip_eth_mc_map`), and
+    each IPv6 group of a link's scope or wider (`ipv6_eth_mc_map`), as it is
+    joined or the device comes up, from the all-hosts group, the rest the
+    newest first (`ip_mc_up`, `ipv6_mc_up`); down or with its IPv6 off,
+    they come out (`ip_mc_down`, `ipv6_mc_down`), but a group joined then
+    comes in all the same. The loopback maps none.
   - `tcp`, `tcp6`, `udp` and `udp6`, the sockets `sock_diag` tells of, but
     for TCP ones bound alone, in the format of Linux 7.0's `tcp4_seq_show` and
     the like: first the listeners, then the connections, with those in

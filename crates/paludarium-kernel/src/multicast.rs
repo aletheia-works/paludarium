@@ -118,6 +118,79 @@ impl<A: Copy + PartialEq> Filter<A> {
 /// those that include.
 pub(crate) type Counts = [u32; 2];
 
+/// The link-layer multicast addresses a device takes packets to
+/// (`dev->mc`), each with how many of its groups map to it (`refcount`),
+/// in the order they came: those a group in its filter maps to
+/// (`ip_mc_filter_add`, `igmp6_group_added`). A loopback maps none
+/// (`arp_mc_map`, `ndisc_mc_map`); a veth end maps its groups to Ethernet
+/// addresses. Nothing here adds one by itself (`SIOCADDMULTI`,
+/// `dev_mc_add_global`), so none is global.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Links {
+    ethernet: bool,
+    list: Vec<([u8; 6], u32)>,
+}
+impl Links {
+    /// Those of a device of Ethernet addresses, none yet.
+    pub(crate) fn ethernet() -> Self {
+        Self {
+            ethernet: true,
+            list: Vec::new(),
+        }
+    }
+    /// `group` comes into the device's filter (`dev_mc_add`): its address
+    /// once more, or last, anew.
+    fn add(&mut self, group: impl Linked) {
+        let Some(address) = group.link().filter(|_| self.ethernet) else {
+            return;
+        };
+        match self.list.iter_mut().find(|(a, _)| *a == address) {
+            Some((_, users)) => *users += 1,
+            None => self.list.push((address, 1)),
+        }
+    }
+    /// And goes from it (`dev_mc_del`): its address once less, gone with
+    /// its last.
+    fn remove(&mut self, group: impl Linked) {
+        let Some(address) = group.link().filter(|_| self.ethernet) else {
+            return;
+        };
+        self.list.retain_mut(|(a, users)| {
+            if *a == address {
+                *users -= 1;
+            }
+            *users > 0
+        });
+    }
+    /// Every address goes (`dev_mc_flush`).
+    pub(crate) fn flush(&mut self) {
+        self.list.clear();
+    }
+    /// Each address, in its order, with its users.
+    pub(crate) fn listed(&self) -> &[([u8; 6], u32)] {
+        &self.list
+    }
+}
+/// A group of an address family, which an Ethernet device takes the
+/// packets to at an address.
+pub(crate) trait Linked: Copy + PartialEq {
+    /// That address, if the group comes into a filter at all.
+    fn link(self) -> Option<[u8; 6]>;
+}
+impl Linked for Ipv4Addr {
+    /// `ip_eth_mc_map`.
+    fn link(self) -> Option<[u8; 6]> {
+        Some(ethernet(IpAddr::V4(self)))
+    }
+}
+impl Linked for Ipv6Addr {
+    /// `ipv6_eth_mc_map`, of a group of link-local scope or wider
+    /// (`igmp6_group_added`).
+    fn link(self) -> Option<[u8; 6]> {
+        (scope6(self) >= 2).then(|| ethernet(IpAddr::V6(self)))
+    }
+}
+
 /// A group a device has joined (`ip_mc_list`, `ifmcaddr6`): how many times
 /// it has been, by memberships of which modes (`sfcount`), and the sources
 /// their filters name (`ip_sf_list`), each by how many of which modes.
@@ -152,14 +225,18 @@ impl<A: Copy + PartialEq> Groups<A> {
     }
     /// The device joins `group` once more at `now`, by a membership that
     /// begins with `mode` (`____ip_mc_inc_group`, `__ipv6_dev_mc_inc`):
-    /// whether it had not.
-    pub(crate) fn join(&mut self, group: A, mode: Mode, now: u64) -> bool {
+    /// whether it had not. A new group comes into its filter, `links`.
+    pub(crate) fn join(&mut self, group: A, mode: Mode, now: u64, links: &mut Links) -> bool
+    where
+        A: Linked,
+    {
         let new = match self.group(group) {
             Some(g) => {
                 g.users += 1;
                 false
             }
             None => {
+                links.add(group);
                 self.list.insert(
                     0,
                     Group {
@@ -180,8 +257,12 @@ impl<A: Copy + PartialEq> Groups<A> {
     /// The device leaves `group` once, as a membership of `filter` does, for
     /// good with its last user (`ip_mc_leave_src` and `__ip_mc_dec_group`,
     /// `ip6_mc_leave_src` and `__ipv6_dev_mc_dec`): when it was joined, if
-    /// it is left for good.
-    fn leave(&mut self, group: A, filter: &Filter<A>) -> Option<u64> {
+    /// it is left for good, when it goes from the filter, `links`, if it is
+    /// there.
+    fn leave(&mut self, group: A, filter: &Filter<A>, links: &mut Links) -> Option<u64>
+    where
+        A: Linked,
+    {
         self.remove(group, filter.mode, filter.sources(), false);
         let mut gone = None;
         self.list.retain_mut(|g| {
@@ -189,6 +270,9 @@ impl<A: Copy + PartialEq> Groups<A> {
                 g.users -= 1;
                 if g.users == 0 {
                     gone = Some(g.created);
+                    if g.loaded {
+                        links.remove(group);
+                    }
                 }
             }
             g.users > 0
@@ -205,16 +289,35 @@ impl<A: Copy + PartialEq> Groups<A> {
     pub(crate) fn loaded(&self) -> impl Iterator<Item = (A, u32, bool)> + '_ {
         self.list.iter().map(|g| (g.group, g.users, g.loaded))
     }
-    /// Its device's IPv6 comes up, or goes down, for every group
-    /// (`ipv6_mc_up`, `ipv6_mc_down`).
-    fn load(&mut self, up: bool) {
+    /// Its device comes up, or goes down, for every group, the newest first
+    /// (`ip_mc_up` and `ipv6_mc_up`, `ip_mc_down` and `ipv6_mc_down`): each
+    /// not in its filter, `links`, comes into it, or each there goes.
+    fn load(&mut self, up: bool, links: &mut Links)
+    where
+        A: Linked,
+    {
         for g in &mut self.list {
-            g.loaded = up;
+            if g.loaded != up {
+                g.loaded = up;
+                if up {
+                    links.add(g.group);
+                } else {
+                    links.remove(g.group);
+                }
+            }
         }
     }
-    /// Every group goes, without a word (`ipv6_mc_destroy_dev`'s last).
-    fn clear(&mut self) {
-        self.list.clear();
+    /// Every group goes, without a word, from the filter too
+    /// (`ipv6_mc_destroy_dev`'s last, after `ipv6_mc_down`).
+    fn clear(&mut self, links: &mut Links)
+    where
+        A: Linked,
+    {
+        for g in self.list.drain(..) {
+            if g.loaded {
+                links.remove(g.group);
+            }
+        }
     }
     /// A membership of `mode` there names `sources`, as another or, as
     /// `only` those, one there already (`ip_mc_add_src`, `ip6_mc_add_src`).
@@ -304,8 +407,12 @@ impl<A> Told<A> {
 }
 /// The device `index`, of `groups`, out of its namespace, leaves the
 /// all-hosts group once (`ip_mc_down`): what netlink tells of it.
-pub(crate) fn leave_all_hosts(groups: &mut Groups<Ipv4Addr>, index: i32) -> Option<Told4> {
-    let created = groups.leave(ALL_HOSTS, &Filter::new(Mode::Exclude))?;
+pub(crate) fn leave_all_hosts(device: &mut crate::netdev::Device) -> Option<Told4> {
+    let index = device.index;
+    let created =
+        device
+            .groups4
+            .leave(ALL_HOSTS, &Filter::new(Mode::Exclude), &mut device.links)?;
     Some(Told4 {
         index,
         group: ALL_HOSTS,
@@ -362,7 +469,7 @@ const ROUTERS6: [Ipv6Addr; 3] = [
 pub(crate) fn all_nodes(now: u64) -> Groups<Ipv6Addr> {
     let mut groups = Groups::default();
     for group in NODES6 {
-        groups.join(group, Mode::Exclude, now);
+        groups.join(group, Mode::Exclude, now, &mut Links::default());
     }
     groups
 }
@@ -520,8 +627,8 @@ impl Network {
     /// of as it does it anew ([`Network::groups_told4`]).
     fn join_group4(&self, index: i32, group: Ipv4Addr, mode: Mode, now: u64) {
         let mut devices = self.devices();
-        if let Some((groups, told)) = devices.groups4_of(index)
-            && groups.join(group, mode, now)
+        if let Some((groups, links, told)) = devices.groups4_of(index)
+            && groups.join(group, mode, now, links)
         {
             told.push(Told4 {
                 index,
@@ -535,8 +642,8 @@ impl Network {
     /// does, kept for netlink to tell of as it leaves it for good.
     fn leave_group4(&self, index: i32, group: Ipv4Addr, filter: &Filter<Ipv4Addr>) {
         let mut devices = self.devices();
-        if let Some((groups, told)) = devices.groups4_of(index)
-            && let Some(created) = groups.leave(group, filter)
+        if let Some((groups, links, told)) = devices.groups4_of(index)
+            && let Some(created) = groups.leave(group, filter, links)
         {
             told.push(Told4 {
                 index,
@@ -544,6 +651,21 @@ impl Network {
                 joined: false,
                 created,
             });
+        }
+    }
+    /// The veth end `index` comes up at `now` (`ip_mc_up`): it joins the
+    /// all-hosts group, then puts its other groups back in its filter; or
+    /// goes down (`ip_mc_down`): it takes them all out, then leaves the
+    /// all-hosts group once.
+    pub(crate) fn up4(&self, index: i32, up: bool, now: u64) {
+        if up {
+            self.join_group4(index, ALL_HOSTS, Mode::Exclude, now);
+        }
+        if let Some((groups, links, _)) = self.devices().groups4_of(index) {
+            groups.load(up, links);
+        }
+        if !up {
+            self.leave_group4(index, ALL_HOSTS, &Filter::new(Mode::Exclude));
         }
     }
     /// What the IPv4 groups' changes since the last call were, in their
@@ -738,7 +860,7 @@ impl Network {
         let source = (!source.is_unspecified()).then_some(source);
         self.devices()
             .groups6_of(index)
-            .is_some_and(|(groups, _)| groups.takes(group, source))
+            .is_some_and(|(groups, ..)| groups.takes(group, source))
     }
     /// Whether the device `index` has IPv6 at all (`in6_dev_get`): not a
     /// veth end of an MTU below 1280.
@@ -1104,12 +1226,12 @@ fn apply6(
         },
         None => (false, false),
     };
-    let (groups, told) = match out {
+    let (groups, links, told) = match out {
         Some((device, told)) if device.index == index => {
             if device.veth.as_ref().is_some_and(|v| v.mtu < 1280) {
                 return;
             }
-            (&mut device.groups6, told)
+            (&mut device.groups6, &mut device.links, told)
         }
         _ => match devices.groups6_of(index) {
             Some(found) => found,
@@ -1119,7 +1241,7 @@ fn apply6(
     let reports = |groups: &Groups<Ipv6Addr>| groups.loaded().any(|(g, ..)| reported6(g));
     match change {
         Change6::Join(index, group, now) => {
-            if groups.join(group, Mode::Exclude, now) {
+            if groups.join(group, Mode::Exclude, now, links) {
                 told.push(Told6 {
                     index,
                     group,
@@ -1132,7 +1254,7 @@ fn apply6(
             }
         }
         Change6::Leave(index, group, now, report) => {
-            if let Some(created) = groups.leave(group, &Filter::new(Mode::Exclude)) {
+            if let Some(created) = groups.leave(group, &Filter::new(Mode::Exclude), links) {
                 told.push(Told6 {
                     index,
                     group,
@@ -1145,12 +1267,12 @@ fn apply6(
             }
         }
         Change6::Up(index, now) => {
-            groups.load(true);
+            groups.load(true, links);
             if up && reports(groups) {
                 sends.push((index, REPORTS6, now));
             }
         }
-        Change6::Down(_) => groups.load(false),
+        Change6::Down(_) => groups.load(false, links),
         Change6::Done(index, now) => {
             if up {
                 if reports(groups) {
@@ -1176,7 +1298,7 @@ pub(crate) fn destroy6(device: &mut crate::netdev::Device) -> Vec<Told6> {
         .into_iter()
         .take(1 + usize::from(routes))
     {
-        if let Some(created) = device.groups6.leave(group, &filter) {
+        if let Some(created) = device.groups6.leave(group, &filter, &mut device.links) {
             told.push(Told6 {
                 index,
                 group,
@@ -1185,7 +1307,7 @@ pub(crate) fn destroy6(device: &mut crate::netdev::Device) -> Vec<Told6> {
             });
         }
     }
-    device.groups6.clear();
+    device.groups6.clear(&mut device.links);
     told
 }
 /// The device `index` of `devices` joins the IPv6 `group` at `now`, kept
@@ -1197,10 +1319,10 @@ fn join_in6(
     mode: Mode,
     now: u64,
 ) -> bool {
-    let Some((groups, told)) = devices.groups6_of(index) else {
+    let Some((groups, links, told)) = devices.groups6_of(index) else {
         return false;
     };
-    if !groups.join(group, mode, now) {
+    if !groups.join(group, mode, now, links) {
         return false;
     }
     told.push(Told6 {
@@ -1219,10 +1341,10 @@ fn leave_in6(
     group: Ipv6Addr,
     filter: &Filter<Ipv6Addr>,
 ) -> bool {
-    let Some((groups, told)) = devices.groups6_of(index) else {
+    let Some((groups, links, told)) = devices.groups6_of(index) else {
         return false;
     };
-    let Some(created) = groups.leave(group, filter) else {
+    let Some(created) = groups.leave(group, filter, links) else {
         return false;
     };
     told.push(Told6 {
@@ -1297,18 +1419,52 @@ mod tests {
     fn a_device_leaves_with_its_last_user() {
         let mut groups = Groups::default();
         let any = Filter::new(Mode::Exclude);
-        assert!(groups.join(GROUP, Mode::Exclude, 7));
-        assert!(!groups.join(GROUP, Mode::Exclude, 8));
+        assert!(groups.join(GROUP, Mode::Exclude, 7, &mut Links::default()));
+        assert!(!groups.join(GROUP, Mode::Exclude, 8, &mut Links::default()));
         assert_eq!(groups.listed().collect::<Vec<_>>(), [(GROUP, 2, 7)]);
-        assert_eq!(groups.leave(GROUP, &any), None);
+        assert_eq!(groups.leave(GROUP, &any, &mut Links::default()), None);
         assert!(groups.takes(GROUP, None));
-        assert_eq!(groups.leave(GROUP, &any), Some(7));
+        assert_eq!(groups.leave(GROUP, &any, &mut Links::default()), Some(7));
         assert!(!groups.takes(GROUP, None));
         // One never joined, nothing.
-        assert_eq!(groups.leave(GROUP, &any), None);
+        assert_eq!(groups.leave(GROUP, &any, &mut Links::default()), None);
         groups.add(GROUP, Mode::Include, &[GROUP], false);
         groups.remove(GROUP, Mode::Include, &[GROUP], false);
         assert_eq!(groups, Groups::default());
+    }
+
+    #[test]
+    fn a_device_maps_its_groups_in_its_filter_to_ethernet_addresses() {
+        let ip4 = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let ip6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        let any = Filter::new(Mode::Exclude);
+        let mut links = Links::ethernet();
+        let (mut v4, mut v6) = (Groups::default(), Groups::default());
+        v4.join(ip4("224.1.1.1"), Mode::Exclude, 0, &mut links);
+        v4.join(ip4("225.1.1.1"), Mode::Exclude, 0, &mut links);
+        v6.join(ip6("ff01::5"), Mode::Exclude, 0, &mut links);
+        v6.join(ip6("ff02::1:2"), Mode::Exclude, 0, &mut links);
+        let mac = [0x01, 0x00, 0x5e, 1, 1, 1];
+        let mac6 = [0x33, 0x33, 0, 1, 0, 2];
+        assert_eq!(links.listed(), [(mac, 2), (mac6, 1)]);
+        // Down, all go; joined down, one comes; up, the rest, the newest
+        // first.
+        v4.load(false, &mut links);
+        v6.load(false, &mut links);
+        assert!(links.listed().is_empty());
+        v4.join(ip4("224.2.2.2"), Mode::Exclude, 0, &mut links);
+        v6.load(true, &mut links);
+        v4.load(true, &mut links);
+        let other = [0x01, 0x00, 0x5e, 2, 2, 2];
+        assert_eq!(links.listed(), [(other, 1), (mac6, 1), (mac, 2)]);
+        v4.leave(ip4("224.1.1.1"), &any, &mut links);
+        assert_eq!(links.listed(), [(other, 1), (mac6, 1), (mac, 1)]);
+        v6.clear(&mut links);
+        assert_eq!(links.listed(), [(other, 1), (mac, 1)]);
+        // A loopback maps none.
+        let mut lo = Links::default();
+        Groups::default().join(ip4("224.1.1.1"), Mode::Exclude, 0, &mut lo);
+        assert!(lo.listed().is_empty());
     }
 
     #[test]
@@ -1316,7 +1472,7 @@ mod tests {
         let [a, b] = [1, 2].map(|last| Ipv4Addr::new(10, 0, 0, last));
         let mut groups = Groups::default();
         let mut one = Filter::new(Mode::Include);
-        groups.join(GROUP, Mode::Include, 0);
+        groups.join(GROUP, Mode::Include, 0, &mut Links::default());
         let takes = |groups: &Groups<_>| [a, b].map(|s| groups.takes(GROUP, Some(s)));
         assert_eq!(takes(&groups), [false, false]);
         assert!(groups.takes(GROUP, None));
@@ -1325,7 +1481,7 @@ mod tests {
         assert_eq!(takes(&groups), [true, false]);
         // Another that excludes one: the other comes.
         let mut other = Filter::new(Mode::Exclude);
-        groups.join(GROUP, Mode::Exclude, 0);
+        groups.join(GROUP, Mode::Exclude, 0, &mut Links::default());
         assert_eq!(takes(&groups), [true, true]);
         for (source, then) in [(b, [true, false]), (a, [true, false])] {
             let block = (true, Mode::Exclude, 2);
@@ -1335,7 +1491,7 @@ mod tests {
         // Its last included source is not taken away.
         let drop = (false, Mode::Include, 2);
         assert_eq!(one.change(&mut groups, GROUP, drop, a), Ok(true));
-        groups.leave(GROUP, &one);
+        groups.leave(GROUP, &one, &mut Links::default());
         assert_eq!(takes(&groups), [false, false]);
         // As one with a list stays of its mode.
         let wrong = other.change(&mut groups, GROUP, add, a);
@@ -1353,7 +1509,7 @@ mod tests {
         assert_eq!(other.change(&mut groups, GROUP, add, a), Ok(false));
         let again = other.change(&mut groups, GROUP, add, a);
         assert_eq!(again, Err(EADDRNOTAVAIL));
-        groups.leave(GROUP, &other);
+        groups.leave(GROUP, &other, &mut Links::default());
         assert_eq!(groups, Groups::default());
     }
 

@@ -117,6 +117,8 @@ pub(crate) struct Device {
     pub groups4: crate::multicast::Groups<core::net::Ipv4Addr>,
     /// The IPv6 ones its sockets have.
     pub groups6: crate::multicast::Groups<core::net::Ipv6Addr>,
+    /// The link-layer multicast addresses its groups map to.
+    pub links: crate::multicast::Links,
     /// A veth end's state; `None` for the loopback.
     pub veth: Option<Veth>,
 }
@@ -135,6 +137,7 @@ impl Device {
             },
             groups4: crate::multicast::Groups::default(),
             groups6: crate::multicast::all_nodes(0),
+            links: crate::multicast::Links::default(),
             veth: None,
         }
     }
@@ -158,6 +161,7 @@ impl Device {
             conf6: conf.1,
             groups4: crate::multicast::Groups::default(),
             groups6: crate::multicast::Groups::default(),
+            links: crate::multicast::Links::ethernet(),
             veth: Some(Veth {
                 mac,
                 mtu,
@@ -252,33 +256,35 @@ impl Devices {
     pub(crate) fn by_index_mut(&mut self, index: i32) -> Option<&mut Device> {
         self.list.iter_mut().find(|d| d.index == index)
     }
-    /// The IPv4 groups of the device of `index`, with the changes to tell
-    /// of ([`Devices::told4`]).
+    /// The IPv4 groups of the device of `index`, with its link-layer
+    /// addresses and the changes to tell of ([`Devices::told4`]).
     pub(crate) fn groups4_of(
         &mut self,
         index: i32,
     ) -> Option<(
         &mut crate::multicast::Groups<core::net::Ipv4Addr>,
+        &mut crate::multicast::Links,
         &mut Vec<crate::multicast::Told4>,
     )> {
         let device = self.list.iter_mut().find(|d| d.index == index)?;
-        Some((&mut device.groups4, &mut self.told4))
+        Some((&mut device.groups4, &mut device.links, &mut self.told4))
     }
     /// The IPv6 groups of the device of `index`, if it has IPv6 (not a veth
-    /// end of an MTU below 1280, `in6_dev_get`), with the changes to tell
-    /// of ([`Devices::told6`]).
+    /// end of an MTU below 1280, `in6_dev_get`), with its link-layer
+    /// addresses and the changes to tell of ([`Devices::told6`]).
     pub(crate) fn groups6_of(
         &mut self,
         index: i32,
     ) -> Option<(
         &mut crate::multicast::Groups<core::net::Ipv6Addr>,
+        &mut crate::multicast::Links,
         &mut Vec<crate::multicast::Told6>,
     )> {
         let device = self.list.iter_mut().find(|d| d.index == index)?;
         if device.veth.as_ref().is_some_and(|v| v.mtu < 1280) {
             return None;
         }
-        Some((&mut device.groups6, &mut self.told6))
+        Some((&mut device.groups6, &mut device.links, &mut self.told6))
     }
     /// The index a new device takes (`dev_index_reserve`): `asked`, if
     /// positive, which another has (`EBUSY`); else the next free from where

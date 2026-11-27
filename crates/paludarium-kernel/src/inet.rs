@@ -416,7 +416,7 @@ impl Network {
                 let mut devices = crate::netdev::Devices::new();
                 if let Some(lo) = devices.by_index_mut(crate::netdev::LOOPBACK_INDEX) {
                     lo.groups4
-                        .join(crate::multicast::ALL_HOSTS, Mode::Exclude, 0);
+                        .join(crate::multicast::ALL_HOSTS, Mode::Exclude, 0, &mut lo.links);
                 }
                 Mutex::new(devices)
             },
@@ -6403,21 +6403,25 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             let asked = Membership6::read(&raw);
             let member = (asked.index, asked.group);
             let now = socket.now().unwrap_or_default();
-            let mut s = socket.lock();
-            if name == 27 {
-                let admin = c
-                    .process
-                    .credentials
-                    .capable_in(CAP_NET_ADMIN, socket.network.owner());
-                let all = socket.network.devices().all6.forwarding != 0;
-                socket
-                    .network
-                    .join_anycast6(&mut s.anycast6, member, (admin, all), now)?;
-            } else {
-                socket
-                    .network
-                    .leave_anycast6(&mut s.anycast6, member, now)?;
-            }
+            let events = {
+                let mut s = socket.lock();
+                if name == 27 {
+                    let admin = c
+                        .process
+                        .credentials
+                        .capable_in(CAP_NET_ADMIN, socket.network.owner());
+                    let all = socket.network.devices().all6.forwarding != 0;
+                    socket
+                        .network
+                        .join_anycast6(&mut s.anycast6, member, (admin, all), now)?
+                } else {
+                    socket
+                        .network
+                        .leave_anycast6(&mut s.anycast6, member, now)?
+                }
+            };
+            // Told of once the socket is let go, as its groups are.
+            socket.network.tell_anycast(events, now);
         }
         // A device that joins a group anew or leaves it for good is told
         // of as it does (`inet_ifmcaddr_notify`), whatever the option

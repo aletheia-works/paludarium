@@ -130,11 +130,14 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
-- **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `if_inet6`, `igmp`,
-  `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route` and those of the
-  sockets (see [features](./features)) alone; `dev_mcast`, `snmp`,
+- **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `dev_mcast`,
+  `if_inet6`, `igmp`, `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route`
+  and those of the sockets (see [features](./features)) alone; `snmp`,
   `sockstat` and the rest are `ENOENT`, and no counter is kept, so those of
-  `dev` are 0. A session with no network has files of no device and no
+  `dev` are 0. `SIOCADDMULTI` and `SIOCDELMULTI` are not supported, so
+  `dev_mcast` has only the addresses the devices' groups map to, none of
+  them global; nor is the `RTM_GETMULTICAST` dump of those addresses
+  (`AF_PACKET`) that Linux master has. A session with no network has files of no device and no
   Internet socket. Of a socket, its address in the kernel is 0, its
   references are the same for each of a kind, the memory its unsent
   datagrams and messages take is 0, and so is a TCP connection's `quick` with

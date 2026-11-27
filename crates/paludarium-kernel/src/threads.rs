@@ -17,6 +17,12 @@ use std::{
     },
 };
 
+/// The signal actions a group's threads share (Linux's `sighand_struct`),
+/// which `CLONE_SIGHAND` shares with another process too, in the slot that
+/// `execve` puts the process's own copy in.
+pub(crate) type Actions = Arc<Mutex<BTreeMap<i32, SignalAction>>>;
+pub(crate) type ActionSlot = Arc<Mutex<Actions>>;
+
 pub struct ThreadGroup {
     exec_owner: AtomicU32,
     retired: Mutex<BTreeSet<u32>>,
@@ -73,7 +79,7 @@ pub struct ThreadGroup {
     leader_exit: AtomicI32,
     /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
     /// with another process (Linux's `sighand_struct`).
-    actions: Mutex<Arc<Mutex<BTreeMap<i32, SignalAction>>>>,
+    actions: ActionSlot,
     process_inbox: Mutex<Arc<SignalInbox>>,
     process_pending: Mutex<ThreadState>,
     /// The threads one of which a signal for the process wakes.
@@ -266,7 +272,7 @@ impl Default for ThreadGroup {
             seccomp_syncs: AtomicU64::new(0),
             status: Mutex::new(None),
             leader_exit: AtomicI32::new(0),
-            actions: Mutex::default(),
+            actions: ActionSlot::default(),
             process_inbox: Mutex::new(Arc::new(process_inbox)),
             process_pending: Mutex::new(ThreadState::default()),
             targets,
@@ -667,7 +673,7 @@ impl ThreadGroup {
             Arc::new(Mutex::new(copy))
         };
         Self {
-            actions: Mutex::new(actions),
+            actions: Arc::new(Mutex::new(actions)),
             nofile: AtomicU64::new(self.nofile()),
             fsize: AtomicU64::new(self.fsize()),
             memlock: Arc::new(AtomicU64::new(self.memlock.load(Ordering::SeqCst))),
@@ -1419,6 +1425,7 @@ impl ThreadGroup {
     }
     pub(crate) fn register(&self, tid: u32, inbox: Arc<SignalInbox>) {
         inbox.attach(Arc::clone(&self.discards), Arc::clone(&self.arrivals));
+        inbox.follow_actions(Arc::clone(&self.actions));
         let wake = inbox.wake_token();
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         let owner = self.exec_owner.load(Ordering::SeqCst);

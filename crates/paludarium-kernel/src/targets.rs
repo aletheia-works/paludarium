@@ -39,6 +39,11 @@ pub(crate) struct Tif {
     killable: AtomicBool,
     /// What wakes it from such a wait.
     wake: Arc<AtomicBool>,
+    /// Its own pending standard signals as its last drain left them, or
+    /// more: all of them until that first drain, and those queued for it
+    /// since then without its inbox, which it has not drained yet
+    /// ([`Self::queues`] counts on no fewer).
+    own: AtomicU64,
 }
 
 impl Tif {
@@ -46,10 +51,26 @@ impl Tif {
         Self {
             // A new thread looks, as `calculate_sigpending` has it.
             look: AtomicBool::new(true),
+            own: AtomicU64::new(u64::MAX),
             asleep,
             wake,
             ..Self::default()
         }
+    }
+    pub(crate) fn set_own(&self, set: u64) {
+        self.own.store(set, Ordering::SeqCst);
+    }
+    /// Whether Linux's `__send_signal_locked` queues signal `number` sent to
+    /// this thread alone, and so wakes the process's signal files
+    /// (`signalfd_notify`): `prepare_signal` does not drop it as ignored,
+    /// as it does one neither blocked, nor waited for (`real_blocked`), nor
+    /// for a traced thread, whose action ignores it (`ignored`); and no
+    /// standard signal of its number is pending for the thread already
+    /// (`legacy_queue`).
+    pub(crate) fn queues(&self, number: i32, ignored: bool) -> bool {
+        let bit = 1u64 << (number - 1);
+        let kept = self.blocked() & bit != 0 || self.traced.load(Ordering::SeqCst) || !ignored;
+        kept && (number >= 32 || self.own.load(Ordering::SeqCst) & bit == 0)
     }
     pub(crate) fn blocked(&self) -> u64 {
         self.blocked.load(Ordering::SeqCst)

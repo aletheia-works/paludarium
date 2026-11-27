@@ -85,6 +85,10 @@ pub(crate) struct PendingSignal {
     pub queued: Option<[u8; 48]>,
     /// The discard generation it was sent in ([`Discards`]).
     pub born: u64,
+    /// It was counted as an arrival as it was sent to its thread
+    /// ([`crate::SignalInbox::send_to`]), so [`queue`] does not count it
+    /// again.
+    pub counted: bool,
 }
 /// The signal a refused segment-register load gives, as Linux's
 /// `exc_general_protection` (SIGSEGV) and `exc_segment_not_present` and
@@ -92,6 +96,7 @@ pub(crate) struct PendingSignal {
 /// vector and error code in the frame's `trapno` and `err`.
 pub(crate) fn segment_fault(trap: u8, error: u16) -> PendingSignal {
     PendingSignal {
+        counted: false,
         target: PendingTarget::Thread,
         number: if trap == 13 {
             paludarium_types::signal::SIGSEGV
@@ -274,6 +279,7 @@ pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128
 impl PendingSignal {
     pub fn user(number: i32, code: i32) -> Self {
         Self {
+            counted: false,
             target: PendingTarget::Process,
             number,
             code,
@@ -341,7 +347,7 @@ pub(crate) fn queue(process: &mut ThreadState, signal: PendingSignal) {
         return;
     }
     process.pending.push(signal);
-    if wakes(process, &signal) {
+    if !signal.counted && wakes(process, &signal) {
         process.arrivals = process.arrivals.wrapping_add(1);
     }
 }

@@ -6362,7 +6362,8 @@ kernel.
   forked child's inherited file reads the child's signals. Edge-triggered
   `epoll` gets an edge for each signal queued to the process or any of its
   threads while one of the file's signals is pending for the waiter, as Linux's `signalfd_notify`
-  wakes the file for each: another real-time signal of a number already
+  wakes the file for each, as it is sent, even when another thread has yet
+  to take it in: another real-time signal of a number already
   waiting counts, a standard signal already pending or one ignored and
   unblocked does not; a new mask is an edge too. `signalfd` on a
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);

@@ -6232,7 +6232,9 @@ kernel.
   packet shorter than its header (`EINVAL`). A socket filter cannot change
   the packet, so its checksum never changes (`EBADMSG`). The program
   reads the socket of the run as one of its own (`bpf_dummy_proto`), with
-  a cookie of its own and root of the network namespace as its owner.
+  a cookie of its own and, as its owner, root of the user namespace that
+  owns the network namespace, as that namespace sees it: 0, or the
+  overflow ID while it maps no root.
 
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`

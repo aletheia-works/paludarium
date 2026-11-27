@@ -120,9 +120,10 @@
    every field a filter reads, without a context and with one, and the
    context that comes back; the MAC header, and classic loads from the
    data and the headers; the helpers of the task and of the run's own
-   socket (its owner, and a cookie that each run has its own of); cb[]
-   through repeated runs and a map that counts them; a packet in pages,
-   with data_end and without; and the checks of the call and of its
+   socket (its owner, also where the network namespace's user namespace
+   maps no root and once it does, and a cookie that each run has its own
+   of); cb[] through repeated runs and a map that counts them; a packet in
+   pages, with data_end and without; and the checks of the call and of its
    context, in their order. Not printed: the time a run took, and what
    master and the test machines' Linux 7.0 do differently (a short IPv4
    or IPv6 header, IPX, and a packet in pages cut by data_size_out).
@@ -168,6 +169,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -2676,7 +2678,6 @@ static long value0(int fd, void *out) {
 /* A filter that copies struct __sk_buff's fields into the map's value,
    one u32 each, and keeps the datagram. */
 #define FIELD(i, off) LDX_W(1, 6, off), STX_W(0, 1, 4 * (i))
-static const int field_offsets[] = {0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 68, 84, 164, 176};
 static const char *const field_names[] = {"len", "pkt_type", "mark", "queue_mapping", "protocol",
                                           "vlan_present", "vlan_tci", "vlan_proto", "priority",
                                           "ingress_ifindex", "ifindex", "tc_index", "hash", "napi_id",
@@ -3449,8 +3450,32 @@ static int case_testrun(void) {
     say("pid_tgid %ld is the thread %d", r, t.retval == (uint32_t)syscall(SYS_gettid));
     t = run_of(PROGRAM(CALL(15), EXIT()), 64); /* bpf_get_current_uid_gid */
     test_run("uid_gid", &t);
-    t = run_of(PROGRAM(CALL(SOCKET_UID), EXIT()), 64);
+    int socket_uid = PROGRAM(CALL(SOCKET_UID), EXIT());
+    t = run_of(socket_uid, 64);
     test_run("socket uid", &t);
+    /* That owner is root of the user namespace that owns the network
+       namespace, as that namespace sees it: the overflow ID while it maps
+       no root, then 0. */
+    {
+        unsigned outer = (unsigned)geteuid();
+        fflush(stdout);
+        pid_t child = fork();
+        if (child == 0) {
+            say("unshare user and net %d", unshare(CLONE_NEWUSER | CLONE_NEWNET) ? -errno : 0);
+            t = run_of(socket_uid, 64);
+            test_run("socket uid, no root mapped", &t);
+            char line[32];
+            int n = snprintf(line, sizeof line, "0 %u 1\n", outer);
+            int fd = open("/proc/self/uid_map", O_WRONLY);
+            say("uid_map %ld", fd < 0 ? -errno : (long)(write(fd, line, (size_t)n) == n ? 0 : -errno));
+            if (fd >= 0) close(fd);
+            t = run_of(socket_uid, 64);
+            test_run("socket uid, root mapped", &t);
+            _exit(0);
+        }
+        int status = 0;
+        say("socket uid child %d", child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status));
+    }
     /* Each run's socket has a cookie of its own, the same in each repeat. */
     int cm = map(2, 4, 16, 1, 0);
     int cookie = PROGRAM(MOV_REG(6, 1), KEY4(cm), CALL(LOOKUP), JEQ(0, 0, 7), MOV_REG(7, 0), MOV_REG(1, 6),

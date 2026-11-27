@@ -17,8 +17,9 @@
 //! never finds a checksum that differs (`EBADMSG`).
 //!
 //! What a socket filter reads of the socket (`skb->sk`) is a socket of its
-//! own (`bpf_dummy_proto`), whose owner is root of the network namespace
-//! (`sock_init_data` with no `struct socket`).
+//! own (`bpf_dummy_proto`), whose owner is root of the user namespace that
+//! owns the network namespace (`sock_init_data` with no `struct socket`):
+//! the overflow ID while that namespace maps no root.
 
 use std::sync::Arc;
 
@@ -190,6 +191,20 @@ fn device(c: &Context<'_>, index: u32) -> Result<Device, Errno> {
     })
 }
 
+/// The owner `bpf_get_socket_uid` gives of the run's own socket: root of
+/// the user namespace that owns the caller's network namespace
+/// (`make_kuid(net->user_ns, 0)`), as that namespace sees it
+/// (`from_kuid_munged`): 0, or the overflow ID while it maps no root.
+fn lone_owner(c: &Context<'_>) -> u32 {
+    let maps_root = c.network().is_none_or(|network| {
+        network
+            .owner()
+            .kernel_of(crate::users::Ids::User, 0)
+            .is_some()
+    });
+    if maps_root { 0 } else { crate::users::OVERFLOW }
+}
+
 /// `bpf_prog_test_run_skb` of a socket filter, which is neither an L2
 /// program nor one with direct packet access.
 fn run_skb(
@@ -275,7 +290,7 @@ fn run_skb(
         uid: c.process.credentials.uid,
         gid: c.process.credentials.gid,
         socket: crate::bpf_prog::FilterSocket::Lone(Arc::default()),
-        owner: 0,
+        owner: lone_owner(c),
     };
     // `bpf_test_run`: the same packet each time, whose `cb[]` the program
     // may change for the next, until `repeat` runs or a signal comes

@@ -1274,6 +1274,34 @@ fn field(off: i16) -> [Insn; 2] {
     [ldx_w(0, 1, off), exit()]
 }
 
+/// The run's own socket is owned by root of the user namespace that owns
+/// the network namespace, as that namespace sees it (`sock_init_data`,
+/// `bpf_get_socket_uid`): the overflow ID while it maps no root, then 0.
+#[test]
+fn a_test_run_s_socket_is_root_s_of_the_network_namespace_s_users() {
+    const WRITE: u64 = 1;
+    const UNSHARE: u64 = 272;
+    const CLONE_NEWUSER: u64 = 0x1000_0000;
+    const CLONE_NEWNET: u64 = 0x4000_0000;
+    const O_WRONLY: u64 = 1;
+    let mut e = Env::new();
+    let uid = e.program(&[call(47), exit()]);
+    assert!(uid >= 0, "{uid}");
+    e.packet([0; 6], 0x0800, 64);
+    assert_eq!(e.test_run(&TestRun::of(uid, 64)).retval, 0);
+    assert_eq!(
+        e.call(UNSHARE, [CLONE_NEWUSER | CLONE_NEWNET, 0, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(e.test_run(&TestRun::of(uid, 64)).retval, 65534);
+    let map = e.open("/proc/self/uid_map", O_WRONLY);
+    assert!(map >= 0, "{map}");
+    e.put(IN, b"0 0 1");
+    assert_eq!(e.call(WRITE, [map as u64, IN, 5, 0, 0, 0]), 5);
+    e.close(map);
+    assert_eq!(e.test_run(&TestRun::of(uid, 64)).retval, 0);
+}
+
 /// `BPF_PROG_TEST_RUN` of a socket filter runs it on the packet after its
 /// Ethernet header, as the loopback receives it, and gives back its
 /// result, the packet with that header zeroed, and its size.

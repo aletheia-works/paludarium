@@ -1114,10 +1114,11 @@ fn reg_name(reg: Reg) -> &'static str {
 /// An 8-byte stack slot as its `slot_type` has it: a register spilled
 /// whole (`STACK_SPILL`); a scalar spilled into its first `size` bytes,
 /// an aligned store narrower than the slot, whose value a read from its
-/// start takes; or bytes a read takes as a scalar. A privileged loader may read slots never written
-/// (`allow_uninit_stack`), so those are bytes too. `zeros` has bit `i`
-/// set where `slot_type[i]` is `STACK_ZERO`, which a store of 0 that is
-/// no spill makes: byte `i` is the one `i + 1` below the slot's top.
+/// start takes; or bytes a read takes as a scalar. A privileged loader
+/// may read slots never written (`allow_uninit_stack`), so those are bytes
+/// too. `zeros` has bit `i` set where `slot_type[i]` is `STACK_ZERO`,
+/// which a store of 0 that is no spill makes: byte `i` is the one `i + 1`
+/// below the slot's top.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot {
     Bytes(u8),

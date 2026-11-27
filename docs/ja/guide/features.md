@@ -4873,7 +4873,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
   `size` 96、データのオフセットと大きさ、`cap_bit0_is_deprecated` があり
   `cap_user_rdpmc` はなく、インデックス 0、そしてシーケンスロックの 2 回の増加の間に
-  数と有効な時間と動いた時間があります。`PERF_EVENT_IOC_SET_OUTPUT` と、開くときに
+  数と有効な時間と動いた時間があります。これらは `mmap`、イベントの有効化、
+  リセットのとき、そしてスレッドが眠りやほかの CPU への移動の後でまた動くとき、
+  つまり Linux がイベントをスケジュールするとき（`perf_swevent_add`、時計の `add`）に更新し、
+  眠らないシステムコールでは変わりません。`PERF_EVENT_IOC_SET_OUTPUT` と、開くときに
   グループのディスクリプタで指す `PERF_FLAG_FD_OUTPUT` は、Linux の
   `perf_event_set_output` と同じく、イベントの出力をほかのイベントのバッファへ向けます。
   相手はイベントで（`EBADF`）、同じイベントではなく、同じ CPU の、すべての CPU の

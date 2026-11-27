@@ -229,6 +229,9 @@ pub(crate) struct CpuAccount {
     /// lowest its mask allows; `None` for a virtual CPU of `rseq`, which is
     /// not looked up again.
     on: Option<(u32, Option<u64>)>,
+    /// Whether the thread has slept or moved to another CPU since perf last
+    /// looked ([`Kernel::scheduled_in`]).
+    resumed: bool,
 }
 impl Clone for CpuAccount {
     fn clone(&self) -> Self {
@@ -916,6 +919,7 @@ pub(crate) fn account_cpu(
     let used = usage.ran(now.saturating_sub(base));
     let switches = paludarium_host::switches::take();
     if switches != 0 {
+        account.resumed = true;
         usage.switches.fetch_add(switches, Ordering::SeqCst);
         // Its sleeps since its last account were on the CPU it was on
         // then, though another thread's `sched_setaffinity` moved its
@@ -939,6 +943,7 @@ pub(crate) fn account_cpu(
     // new one's.
     usage.arrive(seen.0);
     if was.is_some_and(|was| was != seen.0) {
+        account.resumed = true;
         usage.migrations.fetch_add(1, Ordering::SeqCst);
     }
     usage.time().arrive(seen.0);
@@ -1757,8 +1762,12 @@ impl Kernel {
         // its last system call too, as Linux's tick does, and so do the
         // sampling perf events, whose clocks overflow as it runs.
         let sampling = perf::sampling(&self.processes.perf_events);
-        if self.group.cpu_timers_armed() || sampling {
+        // So does a thread that slept, whose events' user pages show it.
+        let slept = perf::buffers_mapped(&self.processes.perf_events)
+            && paludarium_host::switches::pending();
+        if self.group.cpu_timers_armed() || sampling || slept {
             account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
+            self.scheduled_in(thread);
         }
         if sampling {
             self.perf_samples(thread, mem);
@@ -2464,6 +2473,15 @@ impl Kernel {
         }
     }
 
+    /// After [`account_cpu`]: a thread that slept or moved to another CPU
+    /// since its last account was scheduled in again, which updates its
+    /// events' user pages ([`perf::scheduled_in`]).
+    fn scheduled_in(&self, thread: &mut Thread) {
+        if std::mem::take(&mut thread.state.cpu.resumed) {
+            perf::scheduled_in(&self.processes.perf_events, &self.group, thread.tid);
+        }
+    }
+
     fn syscall(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         self.sync_actions(thread);
         self.group.take_landlock(&mut thread.state.credentials);
@@ -2472,6 +2490,7 @@ impl Kernel {
         self.group.apply_discards(&mut thread.state);
         self.group.sync_timer(&mut thread.state);
         account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
+        self.scheduled_in(thread);
         if perf::sampling(&self.processes.perf_events) {
             self.perf_samples(thread, mem);
         }
@@ -2619,6 +2638,7 @@ impl Kernel {
         // (`__set_cpus_allowed_ptr`): what it does next is the new CPU's.
         if number == syscalls::nr::SCHED_SETAFFINITY {
             account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
+            self.scheduled_in(thread);
         }
         self.inbox.drain(&mut thread.state);
         match outcome {

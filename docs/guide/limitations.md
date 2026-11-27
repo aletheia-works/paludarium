@@ -427,9 +427,13 @@ verified.
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
   written. When `REFRESH`'s last overflow disables the event, its count
   stops there, but its times (a clock's apart) and its group's other
-  events go on up to that point. Its user page shows the count and times as of the
-  `mmap`, the event's enabling and its reset, where Linux updates them
-  each time the event is scheduled in, and `cap_user_time` is never set.
+  events go on up to that point. Its user page shows the count and
+  times as of the `mmap`, the event's enabling and its reset, and of its
+  thread's return from each sleep and move to another CPU, which is when
+  Linux schedules the event in again here, as a thread here is switched
+  out only when it sleeps. An event of a CPU's is not updated at those,
+  where Linux also updates it each time it is scheduled in again.
+  `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
   mapping's are the error here. The cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,

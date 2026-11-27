@@ -25,6 +25,7 @@ mod build_id;
 mod sample;
 mod side_band;
 
+pub(crate) use buffer::{buffers_mapped, scheduled_in};
 pub(crate) use sample::{Task, Who, clock_due, overflow, samples_faults, sampling};
 pub(crate) use side_band::{Space, comm, wanted};
 
@@ -544,6 +545,10 @@ pub(crate) struct Events {
     /// that a thread's runs look for the next to fire
     /// ([`sample::clock_due`]) only then.
     clocks: std::sync::atomic::AtomicBool,
+    /// Whether an event's ring buffer has been mapped, so that a thread's
+    /// return from a sleep looks for user pages to update
+    /// ([`buffer::scheduled_in`]) only then.
+    mapped: std::sync::atomic::AtomicBool,
     /// Whether an event has asked for side-band records, so that
     /// the hooks look for those that take them only then ([`side_band`]).
     side_band: std::sync::atomic::AtomicBool,
@@ -1933,7 +1938,7 @@ mod tests {
         of_counter(leader, target, attr, Counter::Zero)
     }
 
-    fn of_counter(
+    pub(super) fn of_counter(
         leader: Option<&Arc<Event>>,
         target: Target,
         attr: Attr,

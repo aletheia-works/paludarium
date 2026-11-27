@@ -5680,10 +5680,14 @@ kernel.
   change takes it; and as memory core mm does not back, it takes no
   `MADV_DOFORK` or `MADV_DODUMP`, gives `MADV_DONTNEED` and
   `MADV_DONTNEED_LOCKED` no pages (`EINVAL`), and stays unlocked through
-  `mlock`. The user page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
-  offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
-  index 0, and the count and times enabled and running between two bumps
-  of the sequence lock. `PERF_EVENT_IOC_SET_OUTPUT`, and
+  `mlock`. The user page is `struct perf_event_mmap_page`: version 0,
+  `size` 96, the data's offset and size, `cap_bit0_is_deprecated` and no
+  `cap_user_rdpmc`, index 0, and the count and times enabled and running
+  between two bumps of the sequence lock. These are updated at the
+  `mmap`, the event's enabling and its reset, and when its thread runs
+  again after a sleep or a move to another CPU, where Linux schedules the
+  event in (`perf_swevent_add`, a clock's `add`); a system call that does
+  not sleep leaves them. `PERF_EVENT_IOC_SET_OUTPUT`, and
   `PERF_FLAG_FD_OUTPUT` at open through the group's descriptor, make an
   event write to another event's buffer, as Linux's
   `perf_event_set_output`: the other must be an event (`EBADF`), not the

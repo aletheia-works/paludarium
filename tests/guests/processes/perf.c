@@ -1037,6 +1037,20 @@ static int case_mmap(void) {
         (unsigned long long)PAGE_U64(page, 1024), (unsigned long long)PAGE_U64(page, 1032));
     say("count %d times %d", PAGE_U64(page, 16) <= count(fd),
         PAGE_U64(page, 24) >= PAGE_U64(page, 32));
+    /* The page shows the count and times as of the event's last schedule-in
+       (perf_swevent_add): calls that do not sleep leave it, and the return
+       from a sleep brings it up to date. */
+    {
+        uint64_t before = PAGE_U64(page, 16), enabled = PAGE_U64(page, 24);
+        touch(4);
+        (void)getppid();
+        int kept = PAGE_U64(page, 16) == before && PAGE_U64(page, 24) == enabled;
+        struct timespec ms = {0, 1000000};
+        nanosleep(&ms, NULL);
+        uint64_t now = PAGE_U64(page, 16);
+        say("after a sleep: kept before %d count %d grew %d enabled grew %d", kept, now == count(fd),
+            now >= before + 4, PAGE_U64(page, 24) > enabled);
+    }
     /* The data pages read as zeros. */
     int zeros = 1;
     for (size_t i = 4096; i < 9 * 4096; i += 512) zeros &= ((volatile char *)page)[i] == 0;

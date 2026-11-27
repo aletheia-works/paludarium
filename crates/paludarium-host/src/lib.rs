@@ -153,6 +153,12 @@ pub mod switches {
         }
     }
 
+    /// Whether this host thread has slept since the last [`take`].
+    #[must_use]
+    pub fn pending() -> bool {
+        TAKEN.with(|taken| taken.get() != 0)
+    }
+
     /// The sleeps since the last call, on this host thread.
     #[must_use]
     pub fn take() -> u64 {

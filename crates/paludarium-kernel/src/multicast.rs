@@ -128,12 +128,15 @@ struct Group<A> {
     /// When it was joined anew, by the host's monotonic clock
     /// (`mca_cstamp`).
     created: u64,
+    /// Whether its device has it in its filter (`MAF_LOADED`): from when
+    /// it is joined or its device's IPv6 comes up (`ipv6_mc_up`) until that
+    /// goes down (`ipv6_mc_down`).
+    loaded: bool,
     modes: Counts,
     sources: Vec<(A, Counts)>,
 }
 /// The groups a device has joined (`in_dev->mc_list`, `idev->mc_list`), the
-/// newest first. Of IPv6's, those that sockets joined
-/// ([`Network::in_group6`] has the rest).
+/// newest first: by sockets, and by the device itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Groups<A> {
     list: Vec<Group<A>>,
@@ -163,6 +166,7 @@ impl<A: Copy + PartialEq> Groups<A> {
                         group,
                         users: 1,
                         created: now,
+                        loaded: true,
                         modes: [0; 2],
                         sources: Vec::new(),
                     },
@@ -192,9 +196,25 @@ impl<A: Copy + PartialEq> Groups<A> {
         gone
     }
     /// Each group, the newest first, with its users and when it was joined
-    /// (`in_dev_dump_ifmcaddr`).
+    /// (`in_dev_dump_ifmcaddr`, `in6_dump_addrs`).
     pub(crate) fn listed(&self) -> impl Iterator<Item = (A, u32, u64)> + '_ {
         self.list.iter().map(|g| (g.group, g.users, g.created))
+    }
+    /// Each group, the newest first, with its users and whether it is
+    /// loaded (`/proc/net/igmp6`).
+    pub(crate) fn loaded(&self) -> impl Iterator<Item = (A, u32, bool)> + '_ {
+        self.list.iter().map(|g| (g.group, g.users, g.loaded))
+    }
+    /// Its device's IPv6 comes up, or goes down, for every group
+    /// (`ipv6_mc_up`, `ipv6_mc_down`).
+    fn load(&mut self, up: bool) {
+        for g in &mut self.list {
+            g.loaded = up;
+        }
+    }
+    /// Every group goes, without a word (`ipv6_mc_destroy_dev`'s last).
+    fn clear(&mut self) {
+        self.list.clear();
     }
     /// A membership of `mode` there names `sources`, as another or, as
     /// `only` those, one there already (`ip_mc_add_src`, `ip6_mc_add_src`).
@@ -263,17 +283,20 @@ impl<A: Copy + PartialEq> Groups<A> {
             .map(|g| (g.group, g.users, g.sources.as_slice()))
     }
 }
-/// A change of a device's IPv4 groups that netlink tells of
-/// (`inet_ifmcaddr_notify`): a group the device `index` has joined anew, of
-/// its one user, or left for good, of none, and when it was joined.
+/// A change of a device's groups that netlink tells of
+/// (`inet_ifmcaddr_notify`, `inet6_ifmcaddr_notify`): a group the device
+/// `index` has joined anew, of its one user, or left for good, of none, and
+/// when it was joined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Told4 {
+pub(crate) struct Told<A> {
     pub index: i32,
-    pub group: Ipv4Addr,
+    pub group: A,
     pub joined: bool,
     pub created: u64,
 }
-impl Told4 {
+pub(crate) type Told4 = Told<Ipv4Addr>;
+pub(crate) type Told6 = Told<Ipv6Addr>;
+impl<A> Told<A> {
     /// Its users, as `inet_fill_ifmcaddr` gives them.
     pub(crate) fn users(&self) -> u32 {
         u32::from(self.joined)
@@ -289,6 +312,47 @@ pub(crate) fn leave_all_hosts(groups: &mut Groups<Ipv4Addr>, index: i32) -> Opti
         joined: false,
         created,
     })
+}
+/// A change of a device's own IPv6 groups that its addresses and their
+/// device's state make, kept in their order for [`Network::sync6`]: the
+/// solicited-node group of an address joined at a time
+/// (`addrconf_join_solict`) or left (`addrconf_leave_solict`), and the
+/// device's IPv6 coming up (`ipv6_mc_up`) or going down (`ipv6_mc_down`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Change6 {
+    Join(i32, Ipv6Addr, u64),
+    Leave(i32, Ipv6Addr),
+    Up(i32),
+    Down(i32),
+}
+/// The interface-local and link-local all-nodes groups, `ff01::1` and
+/// `ff02::1`.
+const NODES6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0xff01, 0, 0, 0, 0, 0, 0, 1),
+    Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+];
+/// The link-local, interface-local and site-local all-routers groups, in
+/// the order a device that forwards joins them (`dev_forward_change`).
+const ROUTERS6: [Ipv6Addr; 3] = [
+    Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2),
+    Ipv6Addr::new(0xff01, 0, 0, 0, 0, 0, 0, 2),
+    Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 2),
+];
+/// The IPv6 groups a device comes to IPv6 with at `now` (`ipv6_add_dev`):
+/// the interface-local all-nodes group, then the link-local one.
+pub(crate) fn all_nodes(now: u64) -> Groups<Ipv6Addr> {
+    let mut groups = Groups::default();
+    for group in NODES6 {
+        groups.join(group, Mode::Exclude, now);
+    }
+    groups
+}
+/// The solicited-node group of `address` (`addrconf_addr_solict_mult`).
+pub(crate) fn solicited(address: Ipv6Addr) -> Ipv6Addr {
+    let o = address.octets();
+    Ipv6Addr::from([
+        0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, o[13], o[14], o[15],
+    ])
 }
 /// The source a device's filters look at, none for an unspecified one.
 fn source4(source: Ipv4Addr) -> Option<Ipv4Addr> {
@@ -648,50 +712,112 @@ impl Network {
 }
 impl Network {
     /// Whether the device `index` is in the IPv6 group `group` and takes what
-    /// comes to it from `source` (`ipv6_chk_mcast_addr`): as one a socket
-    /// joined, with its filters ([`Groups::takes`]), the all-nodes groups
-    /// every device with IPv6 is in (`ipv6_add_dev`), the solicited-node
-    /// group of an address of a veth end's (`addrconf_join_solict`), or the
-    /// all-routers groups of one that forwards (`dev_forward_change`).
+    /// comes to it from `source` (`ipv6_chk_mcast_addr`), with its filters
+    /// ([`Groups::takes`]).
     pub(crate) fn in_group6(
         &self,
         index: i32,
         source: Ipv6Addr,
         group: Ipv6Addr,
-        now: Option<u64>,
+        _now: Option<u64>,
     ) -> bool {
+        self.sync6();
         let source = (!source.is_unspecified()).then_some(source);
-        let (joined, veth, routes) = {
-            let devices = self.devices();
-            let Some(device) = devices.by_index(index) else {
-                return false;
-            };
-            (
-                device.groups6.takes(group, source),
-                device.veth.is_some(),
-                device.conf6.forwarding != 0,
-            )
-        };
-        let first = group.segments()[0];
-        let nodes = |id: u16| group.segments() == [first, 0, 0, 0, 0, 0, 0, id];
-        joined
-            || nodes(1) && matches!(first, 0xff01 | 0xff02)
-            || veth && routes && nodes(2) && matches!(first, 0xff01 | 0xff02 | 0xff05)
-            || veth && self.addresses_at(now).solicits6(index, group)
+        self.devices()
+            .groups6_of(index)
+            .is_some_and(|(groups, _)| groups.takes(group, source))
     }
     /// Whether the device `index` has IPv6 at all (`in6_dev_get`): not a
     /// veth end of an MTU below 1280.
     fn has_ipv6(&self, index: i32) -> bool {
-        self.devices()
-            .by_index(index)
-            .is_some_and(|d| d.veth.as_ref().is_none_or(|v| v.mtu >= 1280))
+        self.devices().groups6_of(index).is_some()
     }
     /// Does `change` with the IPv6 groups of the device `index`, or with none
     /// while it is gone.
     fn with_groups6<R>(&self, index: i32, change: impl FnOnce(&mut Groups<Ipv6Addr>) -> R) -> R {
+        self.sync6();
         match self.devices().by_index_mut(index) {
             Some(device) => change(&mut device.groups6),
             None => change(&mut Groups::default()),
+        }
+    }
+    /// Makes the changes of the devices' own IPv6 groups that their
+    /// addresses and states have queued ([`crate::multicast::Change6`]), in
+    /// their order, before any other change or look at them; kept for
+    /// netlink to tell of.
+    pub(crate) fn sync6(&self) {
+        let changes = core::mem::take(&mut self.addresses().changes6);
+        if changes.is_empty() {
+            return;
+        }
+        let mut devices = self.devices();
+        for change in changes {
+            apply6(change, &mut devices, None);
+        }
+    }
+    /// [`Self::sync6`], with `device` out of the namespace: the changes of
+    /// it are made to it, and what they tell of given back.
+    pub(crate) fn sync6_out(&self, device: &mut crate::netdev::Device) -> Vec<Told6> {
+        let changes = core::mem::take(&mut self.addresses().changes6);
+        let mut told = Vec::new();
+        let mut devices = self.devices();
+        for change in changes {
+            apply6(change, &mut devices, Some((device, &mut told)));
+        }
+        told
+    }
+    /// What the IPv6 groups' changes since the last call were, in their
+    /// order, for netlink to tell of.
+    pub(crate) fn groups_told6(&self) -> Vec<Told6> {
+        self.sync6();
+        core::mem::take(&mut self.devices().told6)
+    }
+    /// The device `index` comes to IPv6 at `now` (`ipv6_add_dev`): it joins
+    /// the all-nodes groups, and, a veth end that forwards, the link-local
+    /// all-routers group, a loopback having no multicast (`IFF_MULTICAST`).
+    pub(crate) fn register6(&self, index: i32, now: u64) {
+        self.sync6();
+        let mut devices = self.devices();
+        let Some(routes) = devices
+            .by_index(index)
+            .map(|d| d.veth.is_some() && d.conf6.forwarding != 0)
+        else {
+            return;
+        };
+        for group in NODES6 {
+            join_in6(&mut devices, index, group, Mode::Exclude, now);
+        }
+        if routes {
+            join_in6(&mut devices, index, ROUTERS6[0], Mode::Exclude, now);
+        }
+    }
+    /// The device `index` goes from IPv6 ([`destroy6`]), kept for netlink
+    /// to tell of.
+    pub(crate) fn destroy6(&self, index: i32) {
+        self.sync6();
+        let mut devices = self.devices();
+        let Some(device) = devices.by_index_mut(index) else {
+            return;
+        };
+        let told = destroy6(device);
+        devices.told6.extend(told);
+    }
+    /// The veth end `index` comes to forward IPv6 at `now`, or no longer
+    /// does (`dev_forward_change`): it joins the all-routers groups, or
+    /// leaves them.
+    pub(crate) fn forward6(&self, index: i32, on: bool, now: u64) {
+        self.sync6();
+        let mut devices = self.devices();
+        if !devices.by_index(index).is_some_and(|d| d.veth.is_some()) {
+            return;
+        }
+        let filter = Filter::new(Mode::Exclude);
+        for group in ROUTERS6 {
+            if on {
+                join_in6(&mut devices, index, group, Mode::Exclude, now);
+            } else {
+                leave_in6(&mut devices, index, group, &filter);
+            }
         }
     }
     /// The device `asked` names (`ip6_mc_find_dev`): that of its index, or of
@@ -732,9 +858,14 @@ impl Network {
                 filter: Filter::new(mode),
             },
         );
-        self.with_groups6(index, |groups| {
-            groups.join(asked.group, mode, now.unwrap_or(0))
-        });
+        self.sync6();
+        join_in6(
+            &mut self.devices(),
+            index,
+            asked.group,
+            mode,
+            now.unwrap_or(0),
+        );
         Ok(())
     }
     /// A socket of `memberships` leaves the IPv6 group `asked`
@@ -750,18 +881,22 @@ impl Network {
         }
         let at = member6(memberships, asked, true).ok_or(EADDRNOTAVAIL)?;
         let left = memberships.remove(at);
-        self.with_groups6(left.at.index, |g| {
-            g.leave(left.at.group, &left.filter);
-        });
+        self.sync6();
+        leave_in6(
+            &mut self.devices(),
+            left.at.index,
+            left.at.group,
+            &left.filter,
+        );
         Ok(())
     }
     /// A socket of `memberships` that goes leaves them all
     /// (`__ipv6_sock_mc_close`).
     pub(crate) fn drop6(&self, memberships: &[Member6]) {
+        self.sync6();
+        let mut devices = self.devices();
         for m in memberships {
-            self.with_groups6(m.at.index, |groups| {
-                groups.leave(m.at.group, &m.filter);
-            });
+            leave_in6(&mut devices, m.at.index, m.at.group, &m.filter);
         }
     }
     /// A socket of `memberships` adds `source` to the filter of the one
@@ -852,6 +987,120 @@ impl Network {
             )
             .is_ok_and(|route| route.kind == crate::interface::Kind::Multicast);
         routed && self.has_ipv6(index) && self.in_group6(index, src, group, now)
+    }
+}
+/// Makes `change` in `devices`, or in `out`, a device out of them, with
+/// what it tells of, if it is of that one.
+fn apply6(
+    change: Change6,
+    devices: &mut crate::netdev::Devices,
+    out: Option<(&mut crate::netdev::Device, &mut Vec<Told6>)>,
+) {
+    let index = match change {
+        Change6::Join(index, ..)
+        | Change6::Leave(index, _)
+        | Change6::Up(index)
+        | Change6::Down(index) => index,
+    };
+    let (groups, told) = match out {
+        Some((device, told)) if device.index == index => {
+            if device.veth.as_ref().is_some_and(|v| v.mtu < 1280) {
+                return;
+            }
+            (&mut device.groups6, told)
+        }
+        _ => match devices.groups6_of(index) {
+            Some(found) => found,
+            None => return,
+        },
+    };
+    match change {
+        Change6::Join(index, group, now) => {
+            if groups.join(group, Mode::Exclude, now) {
+                told.push(Told6 {
+                    index,
+                    group,
+                    joined: true,
+                    created: now,
+                });
+            }
+        }
+        Change6::Leave(index, group) => {
+            if let Some(created) = groups.leave(group, &Filter::new(Mode::Exclude)) {
+                told.push(Told6 {
+                    index,
+                    group,
+                    joined: false,
+                    created,
+                });
+            }
+        }
+        Change6::Up(_) => groups.load(true),
+        Change6::Down(_) => groups.load(false),
+    }
+}
+/// `device`, out of its namespace, goes from IPv6 (`ipv6_mc_destroy_dev`),
+/// after its addresses: it leaves the link-local all-nodes group, and, as
+/// it forwards, the all-routers one; the rest go without a word. What it
+/// tells of.
+pub(crate) fn destroy6(device: &mut crate::netdev::Device) -> Vec<Told6> {
+    let mut told = Vec::new();
+    let index = device.index;
+    let routes = device.conf6.forwarding != 0;
+    let filter = Filter::new(Mode::Exclude);
+    for group in [NODES6[1], ROUTERS6[0]]
+        .into_iter()
+        .take(1 + usize::from(routes))
+    {
+        if let Some(created) = device.groups6.leave(group, &filter) {
+            told.push(Told6 {
+                index,
+                group,
+                joined: false,
+                created,
+            });
+        }
+    }
+    device.groups6.clear();
+    told
+}
+/// The device `index` of `devices` joins the IPv6 `group` at `now`, kept
+/// for netlink to tell of as it does it anew.
+fn join_in6(
+    devices: &mut crate::netdev::Devices,
+    index: i32,
+    group: Ipv6Addr,
+    mode: Mode,
+    now: u64,
+) {
+    if let Some((groups, told)) = devices.groups6_of(index)
+        && groups.join(group, mode, now)
+    {
+        told.push(Told6 {
+            index,
+            group,
+            joined: true,
+            created: now,
+        });
+    }
+}
+/// It leaves `group` once, as a membership of `filter` does, kept for
+/// netlink to tell of as it leaves it for good.
+fn leave_in6(
+    devices: &mut crate::netdev::Devices,
+    index: i32,
+    group: Ipv6Addr,
+    filter: &Filter<Ipv6Addr>,
+) {
+    if let Some((groups, told)) = devices.groups6_of(index)
+        && let Some(created) = groups.leave(group, filter)
+    {
+        told.push(Told6 {
+            index,
+            group,
+            joined: false,
+            created,
+        });
     }
 }
 /// Which of `memberships` is of `group` on the device `index`.
@@ -1037,6 +1286,90 @@ mod tests {
         );
         network.drop4(&mine);
         assert!(!network.in_group4(1, LO, Ipv4Addr::new(239, 0, 0, 0)));
+    }
+
+    #[test]
+    fn a_device_keeps_its_own_ipv6_groups_in_order_with_the_sockets() {
+        use crate::netdev::{Conf4, Conf6, Device};
+        let network = Network::isolated(crate::users::first());
+        let va = Device::veth(
+            1000,
+            b"va".to_vec(),
+            [2, 0, 0, 0, 0, 0xa],
+            1500,
+            (Conf4::default(), Conf6::default()),
+        );
+        network.devices().add(va, true);
+        network.register6(1000, 1);
+        let node = |id: u16| Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, id);
+        let nodes1 = Ipv6Addr::new(0xff01, 0, 0, 0, 0, 0, 0, 1);
+        let told = |network: &Network| {
+            network
+                .groups_told6()
+                .iter()
+                .map(|t| (t.index, t.group, t.joined))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            told(&network),
+            [(1000, nodes1, true), (1000, node(1), true)]
+        );
+        // An address's solicited-node group, once for each address that has
+        // it, made as it is next looked at.
+        let address: Ipv6Addr = "2001:db8::a".parse().unwrap();
+        let solicited = super::solicited(address);
+        assert_eq!(solicited, "ff02::1:ff00:a".parse::<Ipv6Addr>().unwrap());
+        network.addresses().changes6.extend([
+            Change6::Up(1000),
+            Change6::Join(1000, solicited, 2),
+            Change6::Join(1000, solicited, 3),
+        ]);
+        let mut mine = Vec::new();
+        let ff15 = Membership6 {
+            group: "ff15::1".parse().unwrap(),
+            index: 1000,
+        };
+        network
+            .join6(&mut mine, ff15, Mode::Exclude, Some(4))
+            .unwrap();
+        let listed = |network: &Network| {
+            network.sync6();
+            network
+                .devices()
+                .by_index(1000)
+                .unwrap()
+                .groups6
+                .loaded()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(&network),
+            [
+                (ff15.group, 1, true),
+                (solicited, 2, true),
+                (node(1), 1, true),
+                (nodes1, 1, true)
+            ]
+        );
+        assert_eq!(
+            told(&network),
+            [(1000, solicited, true), (1000, ff15.group, true)]
+        );
+        // Forwarding, then down, then gone.
+        network.forward6(1000, true, 5);
+        assert_eq!(told(&network).len(), 3);
+        network.forward6(1000, false, 6);
+        network.addresses().changes6.extend([
+            Change6::Leave(1000, solicited),
+            Change6::Leave(1000, solicited),
+            Change6::Down(1000),
+        ]);
+        assert!(listed(&network).iter().all(|&(_, _, loaded)| !loaded));
+        assert_eq!(told(&network).len(), 4);
+        network.destroy6(1000);
+        assert_eq!(told(&network), [(1000, node(1), false)]);
+        assert!(listed(&network).is_empty());
+        assert!(!network.in_group6(1000, Ipv6Addr::UNSPECIFIED, ff15.group, None));
     }
 
     #[test]

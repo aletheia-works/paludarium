@@ -93,6 +93,7 @@
     {"name":"veth-ipv6-multicast","binary":"veth-ipv6-multicast"},
     {"name":"multicast-sources","binary":"multicast-sources"},
     {"name":"multicast-groups","binary":"multicast-groups"},
+    {"name":"multicast-groups6","binary":"multicast-groups6"},
     {"name":"veth-ipv6-accept","binary":"veth-ipv6-accept"},
     {"name":"veth-ipv6-oif","binary":"veth-ipv6-oif"},
     {"name":"veth-ipv6-scope","binary":"veth-ipv6-scope"},

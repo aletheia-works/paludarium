@@ -777,6 +777,7 @@ pub(crate) enum Event {
     /// A group a device has joined anew or left for good
     /// (`inet_ifmcaddr_notify`).
     Group4(crate::multicast::Told4),
+    Group6(crate::multicast::Told6),
 }
 /// A neighbour of the loopback or of a veth end, as `___neigh_create`
 /// makes one for the next hop of a packet out through it, or for a
@@ -1349,9 +1350,12 @@ pub(crate) struct Addresses {
     neighbours: Vec<Neighbour>,
     /// The proxy entries of the namespace, the oldest first.
     proxies: Vec<Proxy>,
-    /// The veth ends IPv6 has made ready (`IF_READY`), up with their
+    /// The devices IPv6 has made ready (`IF_READY`), up with their
     /// carrier, by index.
     ready6: Vec<i32>,
+    /// The changes of the devices' own IPv6 groups not yet made, in their
+    /// order ([`crate::inet::Network::sync6`]).
+    pub(crate) changes6: Vec<crate::multicast::Change6>,
     /// The seed of the hash that chooses among a multipath route's hops.
     pub multipath_seed: crate::multipath::Seed,
     /// IPv4's `fib_multipath_hash_policy` and `fib_multipath_hash_fields`.
@@ -1464,6 +1468,7 @@ impl Addresses {
             neighbours: Vec::new(),
             proxies: Vec::new(),
             ready6: Vec::new(),
+            changes6: Vec::new(),
             multipath_seed: crate::multipath::Seed::default(),
             serials6: Serials6::default(),
             multipath4: crate::multipath::Policy::default(),
@@ -2037,6 +2042,13 @@ impl Addresses {
     /// (`init_loopback`).
     pub(crate) fn up6(&mut self, now: u64) -> Vec<Event> {
         let mut events = Vec::new();
+        // `init_loopback`'s `ipv6_find_idev` (`ipv6_mc_up`), as it is
+        // ready (`IF_READY`).
+        if !self.ready6.contains(&LOOPBACK_INDEX) {
+            self.ready6.push(LOOPBACK_INDEX);
+        }
+        self.changes6
+            .push(crate::multicast::Change6::Up(LOOPBACK_INDEX));
         for address in self.v6.clone() {
             if address.index == LOOPBACK_INDEX
                 && address.flags & PERMANENT != 0
@@ -2075,10 +2087,11 @@ impl Addresses {
     /// route through `lo`, told of in the order of a dump
     /// (`rt6_disable_ip`), the neighbours, then every address of it.
     pub(crate) fn down6(&mut self) -> Vec<Event> {
+        let was_ready = self.ready6.contains(&LOOPBACK_INDEX);
         let mut events = self.routes6_gone(LOOPBACK_OIF);
         self.flush(true, &mut events);
         events.extend(self.addresses6_gone(LOOPBACK_INDEX));
-        events
+        self.mc_down6(LOOPBACK_INDEX, events, was_ready)
     }
     /// The IPv6 routes through the device of `oif` go, told of in the
     /// order of a dump (`rt6_disable_ip`).
@@ -2104,7 +2117,27 @@ impl Addresses {
         if !gone.is_empty() {
             self.serials6.all();
         }
+        for a in &gone {
+            self.solicit_gone(a);
+        }
         gone.into_iter().map(Event::DelAddr6).collect()
+    }
+    /// The device of `gone`, a loopback's but, leaves its solicited-node
+    /// group once as it goes.
+    fn solicit_gone(&mut self, gone: &V6) {
+        if gone.index != LOOPBACK_INDEX {
+            let group = crate::multicast::solicited(gone.address);
+            self.changes6
+                .push(crate::multicast::Change6::Leave(gone.index, group));
+        }
+    }
+    /// The IPv6 of the device `index` goes down, once ready
+    /// (`addrconf_ifdown`'s `ipv6_mc_down`), after its addresses.
+    fn mc_down6(&mut self, index: i32, events: Vec<Event>, was_ready: bool) -> Vec<Event> {
+        if was_ready {
+            self.changes6.push(crate::multicast::Change6::Down(index));
+        }
+        events
     }
     /// IPv6's part of the veth end `index` coming up at `now`
     /// (`addrconf_notify`'s `NETDEV_UP`): the prefix route of each of its
@@ -2150,6 +2183,7 @@ impl Addresses {
             return events;
         }
         self.ready6.push(index);
+        self.changes6.push(crate::multicast::Change6::Up(index));
         let oif = index.unsigned_abs();
         // `rt6_sync_up`: its routes are no longer dead, nor down, as it
         // has its carrier.
@@ -2213,9 +2247,10 @@ impl Addresses {
     /// IPv6's part of the veth end `index` going down (`addrconf_ifdown`):
     /// its routes ([`Self::routes6_down`]), then its addresses.
     pub(crate) fn device_down6(&mut self, index: i32) -> Vec<Event> {
+        let was_ready = self.ready6.contains(&index);
         let mut events = self.routes6_down(index.unsigned_abs());
         events.extend(self.addresses6_gone(index));
-        events
+        self.mc_down6(index, events, was_ready)
     }
     /// IPv6's part of the veth end `index` going away, once down
     /// (`addrconf_ifdown` for `NETDEV_UNREGISTER`): what is left of its
@@ -2623,6 +2658,15 @@ impl Addresses {
         }
     }
     fn insert_v6(&mut self, new: V6) {
+        // A loopback joins no solicited-node group.
+        if new.index != LOOPBACK_INDEX {
+            let group = crate::multicast::solicited(new.address);
+            self.changes6.push(crate::multicast::Change6::Join(
+                new.index,
+                group,
+                new.life.created,
+            ));
+        }
         let at = self
             .v6
             .iter()
@@ -2651,6 +2695,7 @@ impl Addresses {
     /// prefix route ([`Self::prefix_gone`]), unless it had none.
     fn remove_v6(&mut self, found: usize, now: u64) -> Vec<Event> {
         let gone = self.v6.remove(found);
+        self.solicit_gone(&gone);
         self.serials6.all();
         let mut events = vec![Event::DelAddr6(gone.clone())];
         self.kernel_del6(&gone.local_route(), &mut events);
@@ -4356,17 +4401,6 @@ impl Addresses {
     pub(crate) fn local4(&self, ip: Ipv4Addr) -> bool {
         self.tables4.contains(&TABLE_LOCAL) && self.addr_type4(ip, TABLE_LOCAL) == Kind::Local
     }
-    /// Whether `group` is the solicited-node group of an IPv6 address of the
-    /// device `index` (`addrconf_addr_solict_mult`).
-    pub(crate) fn solicits6(&self, index: i32, group: Ipv6Addr) -> bool {
-        const PREFIX: [u8; 13] = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff];
-        let group = group.octets();
-        group[..13] == PREFIX
-            && self
-                .v6
-                .iter()
-                .any(|a| a.index == index && a.address.octets()[13..] == group[13..])
-    }
     /// Whether `ip` is an IPv6 address of this namespace's, and not
     /// tentative: one that `ipv6_chk_addr` finds, banning
     /// `IFA_F_TENTATIVE`, as a bind (`__inet6_bind`) and a packet's
@@ -4608,6 +4642,7 @@ mod tests {
                 Event::NewNeighbour(n) => format!("+neigh {} {:#x}", n.ip, n.state),
                 Event::DelNeighbour(n) => format!("-neigh {}", n.ip),
                 Event::Group4(t) => format!("group {} {}", t.group, t.joined),
+                Event::Group6(t) => format!("group {} {}", t.group, t.joined),
             })
             .collect()
     }

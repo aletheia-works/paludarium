@@ -28,6 +28,7 @@ pub(crate) enum File {
     Udp6,
     Unix,
     Icmp6,
+    Igmp6,
     Route,
     Packet,
     Netlink,
@@ -46,7 +47,7 @@ pub(crate) struct Source {
 impl File {
     /// The files, in the order Linux's `proc_readdir_de` lists them: by the
     /// length of their names, then by name.
-    pub(crate) const ALL: [Self; 19] = [
+    pub(crate) const ALL: [Self; 20] = [
         Self::Arp,
         Self::Dev,
         Self::Raw,
@@ -59,6 +60,7 @@ impl File {
         Self::Udp6,
         Self::Unix,
         Self::Icmp6,
+        Self::Igmp6,
         Self::Route,
         Self::Packet,
         Self::Netlink,
@@ -81,6 +83,7 @@ impl File {
             Self::Udp6 => b"udp6",
             Self::Unix => b"unix",
             Self::Icmp6 => b"icmp6",
+            Self::Igmp6 => b"igmp6",
             Self::Route => b"route",
             Self::Packet => b"packet",
             Self::Netlink => b"netlink",
@@ -127,6 +130,7 @@ impl File {
             Self::Route => route(network, now),
             Self::IfInet6 => if_inet6(network, now),
             Self::Igmp => igmp(network),
+            Self::Igmp6 => igmp6(network),
             Self::Mcfilter => mcfilter(network),
             Self::Mcfilter6 => mcfilter6(network),
             Self::Ipv6Route => ipv6_route(network, now),
@@ -453,6 +457,38 @@ fn mcfilter(network: Option<&Network>) -> String {
     });
     out
 }
+/// `igmp6`, as `igmp6_mc_seq_show` prints it: each group of each device
+/// that has IPv6, the newest first, with its users and flags, and no timer,
+/// as no MLDv1 report is waited for. Its flags are `MAF_NOREPORT` for the
+/// link-local all-nodes group and one of a scope below a link's, and
+/// `MAF_LOADED` for the rest while their device's IPv6 is up.
+fn igmp6(network: Option<&Network>) -> String {
+    const LOADED: u32 = 4;
+    const NOREPORT: u32 = 8;
+    let mut out = String::new();
+    let Some(network) = network else { return out };
+    network.sync6();
+    let devices = network.devices();
+    let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+    for d in registered(&devices).filter(|d| d.veth.as_ref().is_none_or(|v| v.mtu >= 1280)) {
+        let name = String::from_utf8_lossy(&d.name);
+        for (group, users, loaded) in d.groups6.loaded() {
+            let scope = crate::multicast::scope6(group);
+            let flags = if group == all_nodes || scope < 2 {
+                NOREPORT
+            } else {
+                0
+            } | if scope >= 2 && loaded { LOADED } else { 0 };
+            let _ = writeln!(
+                out,
+                "{:<4} {name:<15} {:032x} {users:5} {flags:08X} 0",
+                d.index,
+                u128::from(group),
+            );
+        }
+    }
+    out
+}
 /// `mcfilter6`, the sources of IPv6's groups, of the devices that have IPv6
 /// (`__in6_dev_get`): not a veth end of an MTU below 1280.
 fn mcfilter6(network: Option<&Network>) -> String {
@@ -460,6 +496,7 @@ fn mcfilter6(network: Option<&Network>) -> String {
         "Idx Device                Multicast Address                   Source Address    INC    EXC\n",
     );
     let Some(network) = network else { return out };
+    network.sync6();
     let devices = network.devices();
     let groups = registered(&devices)
         .filter(|d| d.veth.as_ref().is_none_or(|v| v.mtu >= 1280))
@@ -731,7 +768,6 @@ mod tests {
             assert_eq!(File::named(file.name()), Some(file));
         }
         assert_eq!(File::named(b"snmp"), None);
-        assert_eq!(File::named(b"igmp6"), None);
     }
 
     #[test]
@@ -806,6 +842,15 @@ mod tests {
              1\tlo        :     1      V3\n\
              \t\t\t\t010000E0     1 0:00000000\t\t0\n"
         );
+        assert_eq!(
+            text(File::Igmp6, network()),
+            format!(
+                "1    lo              {:032x}     1 0000000C 0\n\
+                 1    lo              {:032x}     1 00000008 0\n",
+                u128::from(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+                u128::from(Ipv6Addr::new(0xff01, 0, 0, 0, 0, 0, 0, 1)),
+            )
+        );
         assert_eq!(text(File::Mcfilter, network()).lines().count(), 1);
         assert_eq!(text(File::Mcfilter6, network()).lines().count(), 1);
     }
@@ -859,6 +904,7 @@ mod tests {
         for file in [File::Route, File::IfInet6, File::Ipv6Route] {
             assert!(file.text(&source(None), None).is_empty());
         }
+        assert!(File::Igmp6.text(&source(None), None).is_empty());
         for file in [File::Igmp, File::Mcfilter, File::Mcfilter6] {
             assert_eq!(
                 file.text(&source(None), None)

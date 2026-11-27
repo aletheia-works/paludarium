@@ -117,12 +117,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
-- **`/proc/net` の一部**：あるのは `arp`、`dev`、`if_inet6`、`igmp`、`ipv6_route`、`mcfilter`、
-  `mcfilter6`、`route` と、ソケットのファイル（[機能](./features) を参照）だけです。`igmp6`、
+- **`/proc/net` の一部**：あるのは `arp`、`dev`、`if_inet6`、`igmp`、`igmp6`、`ipv6_route`、
+  `mcfilter`、`mcfilter6`、`route` と、ソケットのファイル（[機能](./features) を参照）だけです。
   `dev_mcast`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、`dev` のものは
-  0 です。`mcfilter6` は、ソケットが最後に参加した IPv6 のグループを、デバイスの最も新しい
-  グループとみなします。Linux では、その後にカーネル自身が参加したもの（新しいアドレスの
-  要請ノードのグループなど）が最も新しいことがあります。ネットワークのないセッションのファイルには、
+  0 です。ネットワークのないセッションのファイルには、
   デバイスもインターネットのソケットもありません。ソケットのカーネル内のアドレスは 0、参照の数は
   種類ごとに同じ値、まだ届いていないデータグラムとメッセージが占めるメモリは 0 で、TCP の接続の
   `pingpong` を含む `quick` も 0 です。確認応答を待つ間のタイマーは示しません。`netlink` には、ポートが 0 である
@@ -1030,10 +1028,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ホストのネットワークへのデバイスがなく、グループへの経路もないので、デバイスを指さずに
   入ろうとすると `ENODEV` です。IGMP と MLD のパケットは送りません。raw ソケットは `EPERM` で、パケット
   ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。エニーキャストの
-  グループ（`IPV6_JOIN_ANYCAST`）は `ENOPROTOOPT` です。`RTM_GETMULTICAST` が返すのは
-  IPv4 のグループだけで、IPv6 のもの（`inet6_dump_ifmcaddr`）と Linux の master の
-  リンク層のもの（`AF_PACKET`、`dev_mc_dump`）は `EOPNOTSUPP`、`RTNLGRP_IPV6_MCADDR`
-  には何も伝えません。ICMP の port unreachable の頻度を
+  グループ（`IPV6_JOIN_ANYCAST`）は `ENOPROTOOPT` です。IPv6 を転送するデバイスには
+  サブネットルーターのエニーキャストアドレスがない（`addrconf_join_anycast`）ので、その
+  要請ノードのグループにも入りません。キャリアのないまま上がっているデバイスにアドレスを
+  足しても、デバイスのグループはフィルターに戻りません（`ipv6_find_idev` の `ipv6_mc_up`）。
+  違いが見えるのは `igmp6` のフラグだけです。Linux の master のリンク層のグループ
+  （`AF_PACKET`、`dev_mc_dump`）の `RTM_GETMULTICAST` は `EOPNOTSUPP` です。ICMP の port unreachable の頻度を
   抑えないので（`icmpv4_xrlim_allow`、`icmpv6_xrlim_allow`）、相手の閉じたポートへのデータグラムのたびに、
   接続したソケットの次の送信は `ECONNREFUSED` になります。組を通る接続は、端が
   落ちても、消えても、移っても、使っていたアドレスや経路が消えても続きます。Linux では

@@ -132,13 +132,11 @@ verified.
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
 - **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `igmp`,
-  `ipv6_route`, `mcfilter`, `mcfilter6`, `route` and those of the sockets
-  (see [features](./features)) alone; `igmp6`, `dev_mcast`, `snmp`,
+  `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route` and those of the
+  sockets (see [features](./features)) alone; `dev_mcast`, `snmp`,
   `sockstat` and the rest are `ENOENT`, and no counter is kept, so those of
-  `dev` are 0. `mcfilter6` takes the IPv6 group a socket joined last as a
-  device's newest, where Linux may have joined one of its own since, such as
-  a new address's solicited-node group. A session with no network has files of no device and
-  no Internet socket. Of a socket, its address in the kernel is 0, its
+  `dev` are 0. A session with no network has files of no device and no
+  Internet socket. Of a socket, its address in the kernel is 0, its
   references are the same for each of a kind, the memory its unsent
   datagrams and messages take is 0, and so is a TCP connection's `quick` with
   `pingpong`; no timer shows while it waits for an acknowledgement. `netlink` leaves out
@@ -1228,10 +1226,13 @@ verified.
   joining one there without naming a device is `ENODEV`.
   No IGMP or MLD packet is sent: nothing in the guest would see one, as
   raw sockets are `EPERM` and there are no packet sockets (`AF_PACKET`).
-  Anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`. `RTM_GETMULTICAST`
-  lists IPv4's groups alone: IPv6's (`inet6_dump_ifmcaddr`) and Linux
-  master's link-layer ones (`AF_PACKET`, `dev_mc_dump`) are `EOPNOTSUPP`,
-  and nothing is told to `RTNLGRP_IPV6_MCADDR`. ICMP's port unreachable is not rate limited
+  Anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`, and a device
+  that forwards IPv6 has no subnet-router anycast address
+  (`addrconf_join_anycast`), so it joins no solicited-node group of one.
+  An address added to a device up without its carrier does not load the
+  device's groups again (`ipv6_find_idev`'s `ipv6_mc_up`), which only
+  `igmp6`'s flags would show. `RTM_GETMULTICAST` of Linux master's
+  link-layer groups (`AF_PACKET`, `dev_mc_dump`) is `EOPNOTSUPP`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,

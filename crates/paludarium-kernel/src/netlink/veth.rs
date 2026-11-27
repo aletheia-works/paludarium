@@ -297,6 +297,13 @@ fn tell(own: &Arc<Network>, to: &Arc<Network>, notices: &mut Vec<Notice>, list: 
 
 /// Sends `network`'s netconf notifications of `told` through `notices`
 /// ([`super::devconf`]), as [`tell`] does.
+/// `told`'s settings of IPv4, then of IPv6.
+fn by_family(
+    told: Vec<crate::netconf::Told>,
+) -> (Vec<crate::netconf::Told>, Vec<crate::netconf::Told>) {
+    told.into_iter()
+        .partition(|t| matches!(t, crate::netconf::Told::Ipv4(..)))
+}
 fn tell_netconf(
     own: &Arc<Network>,
     network: &Arc<Network>,
@@ -496,6 +503,11 @@ pub(super) fn newlink(
     let settings = crate::netconf::registered(&peer);
     peer_net.devices().add(peer, peer_asked > 0);
     tell_netconf(own, &peer_net, notices, settings);
+    // `ipv6_add_dev` joins its groups.
+    let now = own.addresses().seen();
+    peer_net.register6(peer_index, now);
+    let list = super::groups_told(&peer_net);
+    tell(own, &peer_net, notices, list);
     let list = told(&peer_net, peer_index, RTM_NEWLINK, u32::MAX, false);
     tell(own, &peer_net, notices, list);
     // Then the first end.
@@ -516,6 +528,9 @@ pub(super) fn newlink(
     let settings = crate::netconf::registered(&first);
     target.devices().add(first, index > 0);
     tell_netconf(own, &target, notices, settings);
+    target.register6(first_index, now);
+    let list = super::groups_told(&target);
+    tell(own, &target, notices, list);
     let tie = |network: &Network, index: i32, peer: Peer| {
         if let Some(v) = network
             .devices()
@@ -736,6 +751,8 @@ fn unregister(
                 tell(own, network, notices, list);
                 let list = super::device_down6(network, device.index);
                 tell(own, network, notices, list);
+                let list = super::groups_told_out(network, device, false);
+                tell(own, network, notices, list);
             }
         }
     }
@@ -747,7 +764,13 @@ fn unregister(
         tell(own, network, notices, list);
         let list = super::addresses_gone(network, device.index);
         tell(own, network, notices, list);
-        tell_netconf(own, network, notices, crate::netconf::unregistered(device));
+        // IPv4's settings go (`devinet_sysctl_unregister`); then IPv6's
+        // groups (`ipv6_mc_destroy_dev`), and its settings.
+        let (v4, v6) = by_family(crate::netconf::unregistered(device));
+        tell_netconf(own, network, notices, v4);
+        let list = super::groups_told_out(network, device, true);
+        tell(own, network, notices, list);
+        tell_netconf(own, network, notices, v6);
         let list = told_of(network, device, RTM_DELLINK, u32::MAX, true);
         tell(own, network, notices, list);
     }
@@ -918,7 +941,12 @@ pub(super) fn move_to(
     };
     let list = super::addresses_gone(network, index);
     tell(own, network, notices, list);
-    let mut list = super::devconf::notices(crate::netconf::unregistered(&device));
+    let (v4, v6) = by_family(crate::netconf::unregistered(&device));
+    tell_netconf(own, network, notices, v4);
+    network.destroy6(index);
+    let list = super::groups_told(network);
+    tell(own, network, notices, list);
+    let mut list = super::devconf::notices(v6);
     let nsid = nsid::link_netnsid(network, to, &mut list).unwrap_or(-1);
     let (message, more) = link_message(
         network,
@@ -958,6 +986,9 @@ pub(super) fn move_to(
         settings
     };
     tell_netconf(own, to, notices, settings);
+    to.register6(new_index, own.addresses().seen());
+    let list = super::groups_told(to);
+    tell(own, to, notices, list);
     if let Some(peer) = peer
         && let Some(n) = peer.network.upgrade()
     {
@@ -976,6 +1007,7 @@ pub(super) fn move_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::netlink::{RTM_DELMULTICAST, RTM_NEWMULTICAST, RTNLGRP_IPV6_MCADDR};
 
     /// An `RTM_NEWLINK` for a pair within one namespace: `name` of
     /// `index` with its peer `peer` of `peer_index`, each of the address
@@ -1054,7 +1086,12 @@ mod tests {
                 let b = &n.bytes;
                 // The index after an `ifinfomsg`'s family and type, or a
                 // `netconfmsg` and `NETCONFA_IFINDEX`'s header.
-                let at = if n.group == RTNLGRP_LINK { 20 } else { 24 };
+                // An `ifaddrmsg`'s index, of a group.
+                let at = if matches!(n.group, RTNLGRP_LINK | RTNLGRP_IPV6_MCADDR) {
+                    20
+                } else {
+                    24
+                };
                 (
                     n.group,
                     u16::from_le_bytes([b[4], b[5]]),
@@ -1082,6 +1119,9 @@ mod tests {
             [
                 (V4, NEW, 1001),
                 (V6, NEW, 1001),
+                // `ipv6_add_dev`'s all-nodes groups, the end at 1000 having no IPv6.
+                (RTNLGRP_IPV6_MCADDR, RTM_NEWMULTICAST, 1001),
+                (RTNLGRP_IPV6_MCADDR, RTM_NEWMULTICAST, 1001),
                 (link, RTM_NEWLINK, 1001),
                 (V4, NEW, 1000),
                 (link, RTM_NEWLINK, 1000),
@@ -1095,11 +1135,16 @@ mod tests {
         assert_eq!(
             told_in_order(&notices),
             [
+                // `ipv6_mc_destroy_dev` leaves the link-local all-nodes
+                // group, and the end joins both anew in B.
                 (V4, DEL, 1001),
+                (RTNLGRP_IPV6_MCADDR, RTM_DELMULTICAST, 1001),
                 (V6, DEL, 1001),
                 (link, RTM_DELLINK, 1001),
                 (V4, NEW, 1001),
                 (V6, NEW, 1001),
+                (RTNLGRP_IPV6_MCADDR, RTM_NEWMULTICAST, 1001),
+                (RTNLGRP_IPV6_MCADDR, RTM_NEWMULTICAST, 1001),
                 (link, RTM_NEWLINK, 1001),
             ]
         );
@@ -1128,6 +1173,7 @@ mod tests {
                 (V4, DEL, 1000),
                 (link, RTM_DELLINK, 1000),
                 (V4, DEL, 1001),
+                (RTNLGRP_IPV6_MCADDR, RTM_DELMULTICAST, 1001),
                 (V6, DEL, 1001),
                 (link, RTM_DELLINK, 1001),
             ]

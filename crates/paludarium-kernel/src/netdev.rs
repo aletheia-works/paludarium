@@ -134,7 +134,7 @@ impl Device {
                 ..Conf6::default()
             },
             groups4: crate::multicast::Groups::default(),
-            groups6: crate::multicast::Groups::default(),
+            groups6: crate::multicast::all_nodes(0),
             veth: None,
         }
     }
@@ -193,6 +193,8 @@ pub(crate) struct Devices {
     /// The changes of the devices' IPv4 groups netlink has yet to tell of
     /// ([`crate::multicast::Told4`]), in their order.
     pub told4: Vec<crate::multicast::Told4>,
+    /// And of their IPv6 groups ([`crate::multicast::Told6`]).
+    pub told6: Vec<crate::multicast::Told6>,
 }
 
 impl Default for Devices {
@@ -216,6 +218,7 @@ impl Devices {
                 ..Conf6::default()
             },
             told4: Vec::new(),
+            told6: Vec::new(),
         }
     }
     /// The device of `index` (`__dev_get_by_index`), if any.
@@ -260,6 +263,22 @@ impl Devices {
     )> {
         let device = self.list.iter_mut().find(|d| d.index == index)?;
         Some((&mut device.groups4, &mut self.told4))
+    }
+    /// The IPv6 groups of the device of `index`, if it has IPv6 (not a veth
+    /// end of an MTU below 1280, `in6_dev_get`), with the changes to tell
+    /// of ([`Devices::told6`]).
+    pub(crate) fn groups6_of(
+        &mut self,
+        index: i32,
+    ) -> Option<(
+        &mut crate::multicast::Groups<core::net::Ipv6Addr>,
+        &mut Vec<crate::multicast::Told6>,
+    )> {
+        let device = self.list.iter_mut().find(|d| d.index == index)?;
+        if device.veth.as_ref().is_some_and(|v| v.mtu < 1280) {
+            return None;
+        }
+        Some((&mut device.groups6, &mut self.told6))
     }
     /// The index a new device takes (`dev_index_reserve`): `asked`, if
     /// positive, which another has (`EBUSY`); else the next free from where

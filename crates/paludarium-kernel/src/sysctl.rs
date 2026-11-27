@@ -1622,7 +1622,21 @@ impl NetFile {
                 } else if let Net::Forwarding6(_) = self.file {
                     let told =
                         crate::netconf::set_forwarding6(&mut self.network.devices(), target, value);
+                    // Each device that turns joins or leaves the
+                    // all-routers groups (`dev_forward_change`).
+                    let now = self
+                        .host
+                        .clock(paludarium_host::ClockId::Monotonic)
+                        .unwrap_or(0);
+                    for t in &told {
+                        if let crate::netconf::Told::Ipv6(index, _, conf) = t
+                            && *index > 0
+                        {
+                            self.network.forward6(*index, conf.forwarding != 0, now);
+                        }
+                    }
                     crate::netlink::devconf::tell(&self.network, told);
+                    crate::netlink::tell_groups(&self.network);
                 } else {
                     let changed = crate::netconf::set_disable_ipv6(
                         &mut self.network.devices(),

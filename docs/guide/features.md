@@ -3200,9 +3200,16 @@ kernel.
     an index or that of the route to it (0): `EINVAL` for no group or a
     device without IPv6, `ENODEV` for none, `EADDRINUSE` as a member there
     (anywhere, for 0), `EADDRNOTAVAIL` to leave as none, and `EPROTO` of
-    TCP (`__ipv6_sock_mc_join`, `ipv6_sock_mc_drop`). Every device is in
-    ff01::1 and ff02::1, a veth end in the solicited-node groups of its
-    addresses, and one that forwards in ff01::2, ff02::2 and ff05::2. A
+    TCP (`__ipv6_sock_mc_join`, `ipv6_sock_mc_drop`). A device joins
+    groups of its own too, kept in one list with the sockets', the newest
+    first: ff01::1 and ff02::1 as it comes to IPv6 (`ipv6_add_dev`), the
+    solicited-node group of each address as the address comes, once for
+    each, and leaves it as the address goes (`addrconf_join_solict`), a
+    loopback's but; and, a veth end, ff02::2, ff01::2 and ff05::2 as it
+    comes to forward, which it leaves as it stops (`dev_forward_change`).
+    Down, it keeps them, unloaded (`ipv6_mc_down`), until it is ready
+    again (`ipv6_mc_up`); going, it leaves ff02::1 and, as it forwards,
+    ff02::2, and forgets the rest (`ipv6_mc_destroy_dev`). A
     datagram to a group comes back where its device is in the group,
     unless `IPV6_MULTICAST_LOOP` is off, and then with an
     `IPV6_MULTICAST_HOPS` of 0 goes no further; one to a group of the
@@ -3731,6 +3738,16 @@ kernel.
     `lo`'s address and before the routes (`ip_mc_up`), and as it goes
     down, before the routes and neighbours go, closes, or goes
     (`ip_mc_down`, `ip_mc_destroy_dev`), which forgets the rest unsaid.
+    One of `AF_INET6`, as `inet6_dump_ifmcaddr`, gives the IPv6 groups of
+    each device with IPv6 alike, of 128 bits and site scope (200) for a
+    group of that scope (ff?5::), a named namespace's with its ID first
+    (`inet6_fill_ifmcaddr`). Each IPv6 group joined anew or left for good,
+    a device's own too, is told to `RTNLGRP_IPV6_MCADDR` (38)
+    (`inet6_ifmcaddr_notify`), of the universe's scope: a new device's
+    all-nodes groups before its `RTM_NEWLINK`, and as it goes, after its
+    IPv4 settings and before its IPv6 ones; an address's solicited-node
+    group as the request that adds or removes the address is done, which
+    Linux joins by its work shortly after.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
@@ -4827,7 +4844,11 @@ kernel.
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
     first, with their users, under a line of the device with how many it
     has and the querier `V3`: no IGMP report is sent or heard, so no timer
-    runs and no device is the reporter. `mcfilter` and `mcfilter6`
+    runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
+    each IPv6 group of each device with IPv6, the newest first, with its
+    users and its flags, `MAF_NOREPORT` for ff02::1 and a group of a scope
+    below a link's and `MAF_LOADED` for the rest while their device is up,
+    and no timer, as no MLDv1 report is waited for. `mcfilter` and `mcfilter6`
     (`igmp_mcf_seq_show`, `igmp6_mcf_seq_show`), the sources the
     memberships of each group name, with how many include and how many
     exclude each, from the first device whose newest group names one, as

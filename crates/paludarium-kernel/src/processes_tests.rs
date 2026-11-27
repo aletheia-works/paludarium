@@ -5270,6 +5270,19 @@ mod shm {
         t.state.credentials = bare;
         assert_eq!(write(&mut k, &mut t, &m, msgmax, b"100"), 3);
         assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), e(Errno::EPERM));
+        // bpf_unpriv_handler asks before anything else: also for nothing
+        // written, or a write past the start, which msgmax takes whole.
+        assert_eq!(write(&mut k, &mut t, &m, msgmax, b""), 0);
+        assert_eq!(write(&mut k, &mut t, &m, bpf, b""), e(Errno::EPERM));
+        m.write(GuestAddr(BUF), b"2").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 18, [msgmax, BUF, 1, 1, 0, 0]),
+            1
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 18, [bpf, BUF, 1, 1, 0, 0]),
+            e(Errno::EPERM)
+        );
         t.state.credentials = root;
         let bpf = open(&mut k, &mut t, &m, "unprivileged_bpf_disabled");
         assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), 1);

@@ -4003,7 +4003,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `perf_cpu_time_max_percent` は 0 から 100 まで、`perf_event_max_sample_rate` は 1 以上を
   取ります（`EINVAL`）。後者は、Linux の `perf_event_max_sample_rate_handler` と同じく、
   前者が 0 か 100 のあいだは拒まれます（`EINVAL`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
-  と同じく、`CAP_SYS_ADMIN` のある書き手から（`EPERM`）0 から 2 まで（`EINVAL`）を
+  と同じく、`CAP_SYS_ADMIN` のある書き手から（ほかの何よりも先に `EPERM` で、空の書き込みや
+  先頭より後ろへの書き込みでも同じです）0 から 2 まで（`EINVAL`）を
   取り、いったん 1 になるとほかの値を取りません（`EPERM`）。`perf_event_open` と `bpf` は
   そのときの値を確かめます。`shm_rmid_forced`（0 か 1。持ち主と書ける者は上限と同じ）を
   設定すると、Linux の `shm_close` と `exit_shm` と同じく、セグメントは最後に外れたときに

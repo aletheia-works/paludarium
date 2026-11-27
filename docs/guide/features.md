@@ -4667,7 +4667,8 @@ kernel.
   100 and `perf_event_max_sample_rate` 1 or more (`EINVAL`), the latter
   refused (`EINVAL`) while the former is 0 or 100, as Linux's
   `perf_event_max_sample_rate_handler`; `unprivileged_bpf_disabled` takes 0 to 2 (`EINVAL`)
-  from a writer with `CAP_SYS_ADMIN` (`EPERM`), and once 1 it takes no
+  from a writer with `CAP_SYS_ADMIN` (`EPERM` before anything else, so also
+  for an empty write or one past the start), and once 1 it takes no
   other value (`EPERM`), as Linux's `bpf_unpriv_handler`; `perf_event_open`
   and `bpf` check what they are now. `shm_rmid_forced` (0 or 1, owned and
   written as the limits) makes a segment go at its last detach and those

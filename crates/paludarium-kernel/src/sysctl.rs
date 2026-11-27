@@ -45,7 +45,8 @@
 //! `perf_cpu_time_max_percent` is 0 or 100, as Linux's
 //! `perf_event_max_sample_rate_handler`;
 //! `unprivileged_bpf_disabled` takes 0 to 2 from a writer with
-//! `CAP_SYS_ADMIN` (`EPERM`), and once 1 it stays (`EPERM`), as Linux's
+//! `CAP_SYS_ADMIN` (`EPERM` before anything else, so also for an empty write
+//! or one past the start), and once 1 it stays (`EPERM`), as Linux's
 //! `bpf_unpriv_handler`.
 //!
 //! `/proc/sys/kernel/yama` has the machine's `ptrace_scope`, as
@@ -1921,10 +1922,14 @@ impl SettingFile {
             }
             None => (self.admin, self.ptrace, self.net_admin),
         };
-        // `yama_dointvec_minmax` asks before `proc_dointvec_minmax` looks at
-        // what is written or where.
-        if !ptrace && matches!(self.value, Value::Machine(_, Kernel::PtraceScope)) {
-            return Err(Errno::EPERM);
+        // `yama_dointvec_minmax` and `bpf_unpriv_handler` ask before
+        // `proc_dointvec_minmax` looks at what is written or where.
+        match self.value {
+            Value::Machine(_, Kernel::PtraceScope) if !ptrace => return Err(Errno::EPERM),
+            Value::Machine(_, Kernel::UnprivilegedBpfDisabled) if !admin => {
+                return Err(Errno::EPERM);
+            }
+            _ => {}
         }
         let written = self.take(buf, admin, net_admin);
         if written.is_ok() {

@@ -2198,8 +2198,8 @@ impl Kernel {
     /// the capability module's `cap_ptrace_traceme`, Landlock's
     /// `hook_ptrace_traceme` and Yama's `yama_ptrace_traceme` decide
     /// (`EPERM`): Yama's `ptrace_scope` 2 asks the tracer for
-    /// `CAP_SYS_PTRACE` in the caller's user namespace, and 3 refuses. A parent that is exiting
-    /// traces nothing, without an error.
+    /// `CAP_SYS_PTRACE` in the caller's user namespace, and 3 refuses. A
+    /// parent that is exiting traces nothing, without an error.
     fn ptrace_traceme(&mut self, thread: &Thread) -> Result<u64, Errno> {
         if self.processes.traces.tracer_of(thread.tid).is_some() {
             return Err(Errno::EPERM);

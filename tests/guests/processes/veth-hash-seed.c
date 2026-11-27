@@ -464,7 +464,9 @@ int main(int argc, char **argv) {
         set(written[i], label);
     }
     int fd = open(SEED, O_RDWR);
-    printf("at 1: seek=%ld write=%ld\n", (long)lseek(fd, 1, SEEK_SET), result(write(fd, "3", 1)));
+    /* Seeks first: a call's arguments may be evaluated in any order. */
+    long seek = (long)lseek(fd, 1, SEEK_SET);
+    printf("at 1: seek=%ld write=%ld\n", seek, result(write(fd, "3", 1)));
     get("at 1");
     lseek(fd, 0, SEEK_SET);
     printf("twice: write=%ld", result(write(fd, "21", 2)));

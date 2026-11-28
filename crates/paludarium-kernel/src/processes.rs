@@ -202,8 +202,6 @@ struct PriorityThread {
     nice_limit: u64,
     rtprio_limit: u64,
 }
-/// fs.nr_open: the highest RLIMIT_NOFILE Linux accepts by default.
-const NR_OPEN: u64 = 1 << 20;
 /// `pid_max`, at its highest (`PID_MAX_LIMIT`), as on a 64-bit Linux that
 /// systemd starts: `set_tid` takes numbers below it.
 pub(crate) const PID_MAX: u32 = 4_194_304;
@@ -246,8 +244,9 @@ pub struct Processes {
     taken: Mutex<std::collections::BTreeSet<u32>>,
     entries: Mutex<BTreeMap<u32, Entry>>,
     tasks: Arc<TaskCount>,
-    /// The highest RLIMIT_NOFILE hard limit a process may set, as fs.nr_open.
-    nr_open: AtomicU64,
+    /// The embedder's ceiling on RLIMIT_NOFILE, which no hard limit passes
+    /// whatever `fs.nr_open` is ([`Self::set_open_file_limit`]).
+    open_file_ceiling: AtomicU64,
     /// Notified whenever a process exits, stops or continues, lets its vfork
     /// parent go, or is sent a signal by a process (`kill`, a queued signal),
     /// so that a wait for a child wakes at once for these; another signal (a
@@ -305,8 +304,8 @@ impl Processes {
         });
         Self {
             next: AtomicU32::new(2),
+            open_file_ceiling: AtomicU64::new(u64::MAX),
             taken: Mutex::default(),
-            nr_open: AtomicU64::new(NR_OPEN),
             changed: WaitToken::default(),
             file_owners: Mutex::default(),
             locks: crate::record_locks::Locks::default(),
@@ -383,11 +382,12 @@ impl Processes {
         Ok(TaskCharge(Arc::clone(&self.tasks)))
     }
     /// Caps RLIMIT_NOFILE at `max`, as a container started with that limit
-    /// and fs.nr_open: raising the hard limit beyond it fails with EPERM. Set
-    /// before the guest starts, when the first process is the only one; the
-    /// processes it creates inherit its limits.
+    /// and fs.nr_open: raising the hard limit beyond it fails with EPERM,
+    /// whatever root then writes to `/proc/sys/fs/nr_open`. Set before the
+    /// guest starts, when the first process is the only one; the processes
+    /// it creates inherit its limits.
     pub(crate) fn set_open_file_limit(&self, max: u64) {
-        self.nr_open.store(max, Ordering::SeqCst);
+        self.open_file_ceiling.store(max, Ordering::SeqCst);
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         debug_assert_eq!(entries.len(), 1, "set before the guest starts");
         for entry in entries.values_mut() {
@@ -1164,7 +1164,10 @@ impl Processes {
             if soft > hard {
                 return Err(Errno::EINVAL);
             }
-            if resource == 7 && hard > self.nr_open.load(Ordering::SeqCst) {
+            if resource == 7
+                && (hard > u64::from(self.sysctls.nr_open())
+                    || hard > self.open_file_ceiling.load(Ordering::SeqCst))
+            {
                 return Err(Errno::EPERM);
             }
             if hard > old.1 && !sender.capable(crate::credentials::CAP_SYS_RESOURCE) {
@@ -3378,6 +3381,15 @@ impl Kernel {
         if flags & VM != 0 && self.processes.shares_memory(self.process.pid, mem) {
             return Err(Errno::EINVAL);
         }
+        // unshare_fs and unshare_fd come first: the copy of a shared table
+        // fails when `fs.nr_open` no longer lets one hold its numbers.
+        let files = if flags & FILES != 0 {
+            Some(self.files.unshared(flags & FS == 0, None)?)
+        } else if flags & FS != 0 {
+            Some(self.files.for_clone(true, false)?)
+        } else {
+            None
+        };
         // unshare_userns, then unshare_nsproxy_namespaces with the
         // credentials it gave.
         let own = self.group.namespaces(thread.tid);
@@ -3411,10 +3423,8 @@ impl Kernel {
             self.group.set_task_ids(thread.tid, credentials.task_ids());
             thread.state.credentials = credentials;
         }
-        if flags & FILES != 0 {
-            self.files = self.files.unshared(flags & FS == 0);
-        } else if flags & FS != 0 {
-            self.files = self.files.for_clone(true, false);
+        if let Some(files) = files {
+            self.files = files;
         }
         // CLONE_NEWNS took a working directory and root of the thread's own,
         // which are now on the new namespace's copies.
@@ -3768,6 +3778,11 @@ impl Kernel {
         let msgqueue = self.processes.soft_limit(self.process.pid, 12);
         let credentials =
             crate::namespaces::user_for(&own, &parent.state.credentials, namespaces, msgqueue)?;
+        // copy_files, before copy_mm: a copy of the table fails when
+        // `fs.nr_open` no longer lets one hold its numbers (`EMFILE`).
+        let files = self
+            .files
+            .for_clone(flags & 0x400 != 0, flags & 0x200 != 0)?;
         // copy_mm, before copy_namespaces: `dup_mm` fails with `ENOMEM` when a
         // pinned page's copy finds no room.
         let child_mem = if flags & 0x100 == 0 {
@@ -3918,7 +3933,7 @@ impl Kernel {
             host: self.host.clone(),
             process: crate::Process { pid },
             table: crate::SyscallTable::u1(),
-            files: self.files.for_clone(flags & 0x400 != 0, flags & 0x200 != 0),
+            files,
             cancellation: inbox.wake_token(),
             inbox,
             group,
@@ -5476,7 +5491,13 @@ impl Kernel {
         self.processes.exec_renumber(self.process.pid, thread.tid);
         thread.tid = self.process.pid;
         let closed = self.files.take_close_on_exec();
-        self.files = self.files.for_exec();
+        // `unshare_files`, past the point of no return: a shared table that
+        // `fs.nr_open` no longer lets a copy of hold ends the program.
+        let unshared = self.files.for_exec();
+        let copy_failed = unshared.is_err();
+        if let Ok(files) = unshared {
+            self.files = files;
+        }
         self.group.exec_actions();
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
         self.group.set_program(&image);
@@ -5552,7 +5573,7 @@ impl Kernel {
         self.group.keep_peak(mem.resident_pages().0);
         self.exec_memory = Some(Arc::new(memory));
         self.release_vfork();
-        Ok((closed, image.fails))
+        Ok((closed, image.fails || copy_failed))
     }
 }
 /// What an exec that loaded its program gives: the descriptors it closed,

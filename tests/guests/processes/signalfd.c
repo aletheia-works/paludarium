@@ -241,6 +241,64 @@ static void *edge_thread(void *unused) {
     return NULL;
 }
 
+/* The kernel's struct sigevent, for a timer that signals one thread. */
+struct thread_sigevent {
+    union sigval value;
+    int signo, notify, tid, pad[11];
+};
+
+static int init_done[2], init_hold[2];
+/* The init's other thread: a write to a pipe no one reads sends it SIGPIPE,
+   and its timer SIGUSR2, neither of which it handles or blocks. */
+static void *init_thread(void *unused) {
+    (void)unused;
+    int broken[2];
+    pipe(broken);
+    close(broken[0]);
+    say("init thread write %ld", TRY(write(broken[1], "x", 1)));
+    close(broken[1]);
+    struct thread_sigevent event = {.signo = SIGUSR2, .notify = 4 /* SIGEV_THREAD_ID */,
+                                    .tid = gettid()};
+    int timer = -1;
+    say("init thread timer %ld", TRY(syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &timer)));
+    struct itimerspec once = {.it_value = {0, 1000000}};
+    syscall(SYS_timer_settime, timer, 0, &once, NULL);
+    usleep(20000);
+    write(init_done[1], "x", 1);
+    char byte;
+    read(init_hold[0], &byte, 1);
+    return NULL;
+}
+
+/* The init of a nested PID namespace drops a signal it has no handler for
+   as it is sent (SIGNAL_UNKILLABLE), unless it blocks it: a signal file's
+   waiter gets no edge for it. */
+static int init_edges(void) {
+    sigset_t usr1 = set_of(1, SIGUSR1);
+    sigprocmask(SIG_SETMASK, &usr1, NULL);
+    signal(SIGPIPE, SIG_DFL);
+    signal(SIGUSR2, SIG_DFL);
+    int fd = signalfd(-1, &usr1, SFD_NONBLOCK);
+    int edge = epoll_create1(0);
+    struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.u32 = 1};
+    epoll_ctl(edge, EPOLL_CTL_ADD, fd, &event);
+    struct epoll_event out[2];
+    kill(getpid(), SIGUSR1);
+    say("init signal %d", epoll_wait(edge, out, 2, 0));
+    say("init quiet %d", epoll_wait(edge, out, 2, 0));
+    pipe(init_done);
+    pipe(init_hold);
+    pthread_t other;
+    pthread_create(&other, NULL, init_thread, NULL);
+    char byte;
+    read(init_done[0], &byte, 1);
+    usleep(50000);
+    say("init dropped %d", epoll_wait(edge, out, 2, 200));
+    write(init_hold[1], "x", 1);
+    pthread_join(other, NULL);
+    return 7;
+}
+
 /* Edge-triggered epoll gets an edge for each signal queued to the process,
    as Linux's signalfd_notify wakes the file: one of the file's again, a
    real-time signal while one of its number waits, or another signal, even
@@ -305,6 +363,17 @@ static int case_edges(void) {
     struct signalfd_siginfo info[8];
     say("read %ld", TRY(read(fd, info, sizeof info)) / (long)sizeof *info);
     say("taken %d", epoll_wait(edge, out, 2, 0));
+    pid_t outer = fork();
+    if (outer == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWPID)) _exit(90);
+        pid_t init = fork();
+        if (init == 0) _exit(init_edges());
+        int status = 0;
+        waitpid(init, &status, 0);
+        say("init exited %d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        _exit(0);
+    }
+    waitpid(outer, NULL, 0);
     return 0;
 }
 

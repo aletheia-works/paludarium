@@ -19,7 +19,7 @@ mod fd {
             syscall(&mut k, &mut t, &m, 0, [fd, DATA + 64, 8, 0, 0, 0]),
             0
         );
-        assert!(k.files.for_exec().descriptor(fd).is_err());
+        assert!(k.files.for_exec().unwrap().descriptor(fd).is_err());
         assert_eq!(
             syscall(&mut k, &mut t, &m, 293, [1, 0, 0, 0, 0, 0]),
             Errno::EFAULT.to_syscall_return()
@@ -45,7 +45,7 @@ mod fd {
             syscall(&mut k, &mut t, &m, 72, [fd as u64, 1, 0, 0, 0, 0]),
             1
         );
-        assert!(k.files.for_exec().descriptor(fd as u64).is_err());
+        assert!(k.files.for_exec().unwrap().descriptor(fd as u64).is_err());
         m.write(GuestAddr(DATA + 64), &1i32.to_le_bytes()).unwrap();
         assert_eq!(
             syscall(
@@ -2927,7 +2927,7 @@ mod namespaces {
         );
         assert_eq!(syscall(&mut k, &mut t, &m, 80, [DATA, 0, 0, 0, 0, 0]), 0);
         // A working directory another thread shares: EINVAL.
-        let shared = k.files.for_clone(true, true);
+        let shared = k.files.for_clone(true, true).unwrap();
         assert_eq!(
             syscall(&mut k, &mut t, &m, 308, [fd, 0, 0, 0, 0, 0]),
             einval()
@@ -3170,7 +3170,7 @@ mod namespaces {
     #[test]
     fn unshare_files_and_fs_give_the_thread_its_own() {
         let (mut k, mut t, m) = setup();
-        let shared = k.files.for_clone(true, true);
+        let shared = k.files.for_clone(true, true).unwrap();
         assert_eq!(syscall(&mut k, &mut t, &m, 272, [0x400, 0, 0, 0, 0, 0]), 0);
         // The identity is the working directory, the umask and the table.
         let (own, other) = (k.files.identity(), shared.identity());
@@ -5636,6 +5636,134 @@ mod shm {
     }
 
     #[test]
+    fn nr_open_and_pipe_max_size_bound_tables_limits_and_pipes() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/fs/nr_open"),
+            "1048576\n"
+        );
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/vm/max_map_count"),
+            "65530\n"
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "../vm/max_map_count", b"1"),
+            e(Errno::EACCES)
+        );
+        // A hard RLIMIT_NOFILE past `nr_open` is `EPERM` (`do_prlimit`).
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "../fs/nr_open", b"64\n"),
+            3
+        );
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/fs/nr_open"),
+            "64\n"
+        );
+        let limit = |k: &mut Kernel, t: &mut Thread, soft: u64, hard: u64| {
+            m.write_u64(GuestAddr(DATA), soft).unwrap();
+            m.write_u64(GuestAddr(DATA + 8), hard).unwrap();
+            syscall(k, t, &m, 302, [0, 7, DATA, 0, 0, 0])
+        };
+        assert_eq!(limit(&mut k, &mut t, 64, 65), e(Errno::EPERM));
+        assert_eq!(limit(&mut k, &mut t, 64, 64), 0);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "../fs/nr_open", b"128"), 3);
+        assert_eq!(limit(&mut k, &mut t, 100, 128), 0);
+        // The table has room for 64 numbers; past them it grows only below
+        // `nr_open`, and `dup2` reports what cannot as `EBADF`.
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "../fs/nr_open", b"64"), 2);
+        assert_eq!(syscall(&mut k, &mut t, &m, 33, [0, 63, 0, 0, 0, 0]), 63);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 33, [0, 70, 0, 0, 0, 0]),
+            e(Errno::EBADF)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [0, 0, 70, 0, 0, 0]),
+            e(Errno::EMFILE)
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "../fs/nr_open", b"1048576"),
+            7
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 33, [0, 70, 0, 0, 0, 0]), 70);
+        // Grown, the table keeps its room.
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "../fs/nr_open", b"64"), 2);
+        assert_eq!(syscall(&mut k, &mut t, &m, 33, [0, 99, 0, 0, 0, 0]), 99);
+        // A pipe of a user without CAP_SYS_RESOURCE starts at and may grow
+        // to `pipe-max-size` at most; root's need not.
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "../fs/pipe-max-size", b"5000"),
+            4
+        );
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/fs/pipe-max-size"),
+            "8192\n"
+        );
+        let pipe = |k: &mut Kernel, t: &mut Thread| {
+            assert_eq!(syscall(k, t, &m, 22, [DATA + 0x100, 0, 0, 0, 0, 0]), 0);
+            m.read_u64(GuestAddr(DATA + 0x100)).unwrap() & 0xffff_ffff
+        };
+        let root = pipe(&mut k, &mut t);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [root, 1032, 0, 0, 0, 0]),
+            65536
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [root, 1031, 1 << 20, 0, 0, 0]),
+            1 << 20
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        let user = pipe(&mut k, &mut t);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [user, 1032, 0, 0, 0, 0]),
+            8192
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [user, 1031, 8193, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [user, 1031, 100, 0, 0, 0]),
+            4096
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [user, 1031, 8192, 0, 0, 0]),
+            8192
+        );
+        // Shrinking root's past the limit is no growth.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [root, 1031, 1 << 19, 0, 0, 0]),
+            1 << 19
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [root, 1031, 1 << 20, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+    }
+
+    #[test]
+    fn an_embedder_s_open_file_ceiling_stays_whatever_nr_open_is() {
+        let (k, mut t, m) = setup();
+        let mut k = k.with_open_file_limit(100);
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/fs/nr_open"),
+            "1048576\n"
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "../fs/nr_open", b"2097152"),
+            7
+        );
+        m.write_u64(GuestAddr(DATA), 100).unwrap();
+        m.write_u64(GuestAddr(DATA + 8), 101).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 302, [0, 7, DATA, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+    }
+
+    #[test]
     fn attachments_share_memory_and_count_as_their_mappings() {
         let (mut k, mut t, m) = setup();
         let id = shmget(&mut k, &mut t, &m, 0, 3 * PAGE_SIZE - 10, 0o600);
@@ -8083,7 +8211,13 @@ mod proc_names {
         }
         assert_eq!(
             names(&mut k, &mut t, &m, "/proc/sys/vm"),
-            [".", "..", "drop_caches", "unprivileged_userfaultfd"]
+            [
+                ".",
+                "..",
+                "drop_caches",
+                "max_map_count",
+                "unprivileged_userfaultfd"
+            ]
         );
     }
 }

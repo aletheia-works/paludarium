@@ -1133,10 +1133,12 @@ struct Published {
 impl Kernel {
     /// Creates a kernel that performs host I/O through `host`.
     pub fn new(host: Arc<dyn Host>) -> Self {
-        let files = files::Files::with_host(Arc::clone(&host));
+        let mut files = files::Files::with_host(Arc::clone(&host));
         let group = Arc::new(ThreadGroup::default());
         group.watch(&files.readiness.deadlines);
         let processes = Arc::new(Processes::new(group.clone()));
+        // Every descriptor table grows as the machine's `fs.nr_open` lets it.
+        files.nr_open = Arc::clone(&processes.sysctls.nr_open);
         Kernel {
             host,
             process: Process { pid: 1 },

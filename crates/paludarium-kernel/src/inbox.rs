@@ -239,7 +239,7 @@ impl SignalInbox {
     /// the overrun its signal now has.
     pub(crate) fn send_timer(&self, signal: signals::PendingSignal) -> Option<(i32, i32)> {
         let timer = signal.timer?;
-        let ignored = self.ignores(signal.number);
+        let ignored = self.ignores(signal.number, signal.synchronous);
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(queued) = queue
             .iter_mut()
@@ -279,7 +279,7 @@ impl SignalInbox {
             return Err(Errno::EINVAL);
         }
         let ignored = (signal.target == signals::PendingTarget::Thread)
-            .then(|| self.ignores(number))
+            .then(|| self.ignores(number, signal.synchronous))
             .flatten();
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if number < 32
@@ -408,7 +408,9 @@ impl SignalInbox {
     /// or `SIG_DFL` for one ignored by default), as `sig_task_ignored` reads
     /// it; `None` for an inbox of no group. Read before the queue's lock is
     /// taken, which no action's lock is held around.
-    fn ignores(&self, number: i32) -> Option<bool> {
+    /// The init of a nested PID namespace also drops one it has no handler
+    /// for ([`Tif::drops_unhandled`]).
+    fn ignores(&self, number: i32, synchronous: bool) -> Option<bool> {
         let slot = self
             .actions
             .lock()
@@ -423,7 +425,9 @@ impl SignalInbox {
             .unwrap_or_default();
         Some(
             action.handler == signals::SIG_IGN
-                || action.handler == 0 && matches!(number, 17 | 18 | 23 | 28),
+                || action.handler == 0
+                    && (matches!(number, 17 | 18 | 23 | 28)
+                        || self.tif.drops_unhandled(number, synchronous)),
         )
     }
     /// Counts signal `number`, sent for this inbox's thread, as an arrival
@@ -712,6 +716,55 @@ mod signals_time_tests {
         signals::queue(&mut state, signals::PendingSignal::thread(18, 0));
         two.send_thread(20, 0).unwrap();
         assert_eq!(one.others_arrivals(), 5);
+    }
+
+    /// The init of a nested PID namespace drops a signal it has no handler
+    /// for as it is sent (SIGNAL_UNKILLABLE), so neither the send nor the
+    /// drain counts it, unless it is blocked, SIGKILL, or a fault's.
+    #[test]
+    fn a_nested_inits_unhandled_signal_does_not_count() {
+        let count = Arc::<AtomicU64>::default();
+        let actions = crate::threads::ActionSlot::default();
+        let targets = Arc::<Targets>::default();
+        let [one, two] = [SignalInbox::default(), SignalInbox::default()];
+        for (tid, inbox) in [(1, &one), (2, &two)] {
+            inbox.attach(Arc::default(), Arc::clone(&count));
+            inbox.follow_actions(Arc::clone(&actions));
+            targets.add(tid, inbox.tif());
+        }
+        targets.set_unkillable();
+        let mut state = ThreadState::default();
+        state.seat.take(two.tif(), 0);
+        two.drain(&mut state);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 0);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 0);
+        // What it handles, or blocks, it takes.
+        let handled = crate::SignalAction {
+            handler: 0x1000,
+            ..Default::default()
+        };
+        actions.lock().unwrap().lock().unwrap().insert(12, handled);
+        state.signal_actions.insert(12, handled);
+        two.send_thread(12, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 1);
+        two.tif().set_blocked(1 << 13);
+        two.send_thread(14, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 2);
+        // A fault's signal is forced on it, and SIGKILL comes through.
+        two.tif().set_blocked(0);
+        two.send_pending(signals::segment_fault(13, 0)).unwrap();
+        two.send_thread(9, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 4);
+        // So too for one the kernel queues for the thread itself.
+        signals::queue(&mut state, signals::PendingSignal::user(13, 0));
+        two.publish(&state);
+        assert_eq!(one.others_arrivals(), 4);
+        // Another process is no init.
+        let other = Arc::new(Tif::default());
+        Targets::default().add(3, &other);
+        assert!(!other.drops_unhandled(10, false));
     }
 
     #[test]

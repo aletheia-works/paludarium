@@ -2642,13 +2642,16 @@ impl Kernel {
             self.processes.locks().release_table(table);
             let notify = &self.files.caches.notify;
             // Each close of a directory's file is a `dnotify_flush` of that
-            // directory, whichever table asked for its watches.
-            let fs = self.files.fs();
-            let directories: Vec<_> = descriptors
-                .iter()
-                .filter_map(|d| crate::dnotify::directory_in(&*fs, d))
-                .collect();
-            notify.dn.release_table(table, &directories, &notify.fan);
+            // directory, whichever table asked for its watches; with no
+            // watch or mark there, none needs its file looked at.
+            if notify.dn.active() || notify.dn.marking() {
+                let fs = self.files.fs();
+                let directories: Vec<_> = descriptors
+                    .iter()
+                    .filter_map(|d| crate::dnotify::directory_in(&*fs, d))
+                    .collect();
+                notify.dn.release_table(table, &directories, &notify.fan);
+            }
         }
         let closed: Vec<_> = descriptors.into_iter().map(|d| d.file).collect();
         crate::mqueue::exited(&closed, self.process.pid);

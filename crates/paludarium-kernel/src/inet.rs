@@ -1203,6 +1203,52 @@ impl Network {
             self.count(index, frames);
         }
     }
+    /// Where each side of a TCP connection from `from`, of this namespace,
+    /// to a listener in `there` sends its packets ([`crate::loopback::Way`]):
+    /// both through the loopback, or, out through the veth end `veth` here,
+    /// the client through it and the server through its peer `dif` there.
+    fn ways(
+        &self,
+        there: &Network,
+        veth: Option<i32>,
+        dif: u32,
+        from: SocketAddr,
+    ) -> [Option<crate::loopback::Way>; 2] {
+        let ip = if plain(from.ip()).is_ipv4() { 20 } else { 40 };
+        let tallies = |network: &Network, index: i32| {
+            network
+                .devices()
+                .by_index(index)
+                .map(|d| (Arc::clone(&d.tx), Arc::clone(&d.rx)))
+        };
+        let Some(index) = veth else {
+            let lo = tallies(self, crate::netdev::LOOPBACK_INDEX).map(|(tx, _)| tx);
+            let way = |tx: Arc<crate::netdev::Tally>| crate::loopback::Way {
+                tx,
+                rx: None,
+                before: ip,
+            };
+            return [lo.clone().map(way), lo.map(way)];
+        };
+        let (Some(client), Some(server)) =
+            (tallies(self, index), tallies(there, dif.cast_signed()))
+        else {
+            return [None, None];
+        };
+        let before = frames::ETHERNET + ip;
+        [
+            Some(crate::loopback::Way {
+                tx: client.0,
+                rx: Some(server.1),
+                before,
+            }),
+            Some(crate::loopback::Way {
+                tx: server.0,
+                rx: Some(client.1),
+                before,
+            }),
+        ]
+    }
     /// The index the peer of this namespace's veth end `index` has in its
     /// own namespace, where a packet out through the end comes in; 0 for
     /// none.
@@ -3065,6 +3111,13 @@ impl InetSocket {
                                     _ => self.network.source_through(to, 0, keys, self.now()),
                                 };
                                 self.network.output(from, self.now());
+                                // The SYN, and the reset that answers it,
+                                // through the loopback.
+                                let ip = if plain(to.ip()).is_ipv4() { 20 } else { 40 };
+                                self.network.count(
+                                    crate::netdev::LOOPBACK_INDEX,
+                                    &[ip + frames::SYN, ip + frames::RESET],
+                                );
                                 return self.refused(&mut s, address);
                             } else {
                                 return Err(ENETUNREACH);
@@ -4436,7 +4489,15 @@ impl InetSocket {
                 notify,
                 client.map(|client| &client.network.tcp_metrics),
             ),
-            (from, to, dif, names),
+            (
+                from,
+                to,
+                dif,
+                names,
+                client.map_or_else(Default::default, |client| {
+                    client.network.ways(there, veth, dif, from)
+                }),
+            ),
         );
         if open {
             listen.ready.push_back(child);
@@ -4478,7 +4539,13 @@ impl InetSocket {
             &crate::loopback::Notify,
             Option<&Arc<crate::tcp_metrics::Metrics>>,
         ),
-        (from, to, dif, names): (SocketAddr, SocketAddr, u32, Option<crate::loopback::Names>),
+        (from, to, dif, names, ways): (
+            SocketAddr,
+            SocketAddr,
+            u32,
+            Option<crate::loopback::Names>,
+            [Option<crate::loopback::Way>; 2],
+        ),
     ) -> (Arc<InetSocket>, bool) {
         // `tcp_v4_syn_recv_sock`: the hops the handshake's last segment had.
         if plain(from.ip()).is_ipv4() {
@@ -4513,7 +4580,7 @@ impl InetSocket {
             (from, to),
             (&self.host, &self.hub.deadlines),
             [Arc::clone(notify), child.urgent_notify()],
-            (mtu, names),
+            (mtu, names, ways),
         );
         let _ = link.set(Arc::clone(&joined));
         if let Some(metrics) = client_metrics {
@@ -4862,7 +4929,19 @@ impl InetSocket {
                 // `inet_csk_route_req`, `ip_send_unicast_reply`: its ports.
                 let keys = crate::multipath::Flow::socket(FLOW_TCP, to.port(), from.port());
                 there.reply(&answer, from.ip(), to.ip(), keys, self.now());
-                return Ok(self.join(&there, s, (bound, from), to, options, Some(index)));
+                let joined = self.join(&there, s, (bound, from), to, options, Some(index));
+                if joined.is_none() {
+                    // The SYN, and the reset that answers it
+                    // (`tcp_v4_send_reset`, of no options).
+                    let ip = if plain(to.ip()).is_ipv4() { 20 } else { 40 };
+                    let link = frames::ETHERNET + ip;
+                    self.network.count(index, &[link + frames::SYN]);
+                    there.count(
+                        self.network.peer_index(index).cast_signed(),
+                        &[link + frames::RESET],
+                    );
+                }
+                return Ok(joined);
             }
             Reach::OneWay(_) | Reach::Dropped => (SYN_TIMEOUT, ETIMEDOUT),
             Reach::Unanswered if self.network.is_up() => (ARP_TIMEOUT, EHOSTUNREACH),
@@ -4972,7 +5051,13 @@ impl InetSocket {
                 (theirs, locked, filtering),
                 &stream,
                 (&link, &notify, Some(&self.network.tcp_metrics)),
-                (from, to, dif, names),
+                (
+                    from,
+                    to,
+                    dif,
+                    names,
+                    self.network.ways(there, veth, dif, from),
+                ),
             );
             if open {
                 listen.ready.push_back(child);

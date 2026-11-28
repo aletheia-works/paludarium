@@ -386,6 +386,7 @@ mod linux {
                     | "bpf-prog-tcp"
                     | "bpf-prog-segments"
                     | "bpf-prog-testrun"
+                    | "bpf-prog-cfg"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -471,6 +472,7 @@ mod linux {
                     | "veth-ipv6-anycast"
                     | "veth-dev-mcast"
                     | "net-dev-counters"
+                    | "net-dev-tcp"
                     | "veth-igmp-neighbours"
                     | "veth-ipv6-solicited-routers"
                     | "veth-ipv6-accept"
@@ -752,6 +754,7 @@ mod linux {
         veth_ipv6_anycast => ("veth-ipv6-anycast","veth-ipv6-anycast"),
         veth_dev_mcast => ("veth-dev-mcast","veth-dev-mcast"),
         net_dev_counters => ("net-dev-counters","net-dev-counters"),
+        net_dev_tcp => ("net-dev-tcp","net-dev-tcp"),
         veth_igmp_neighbours => ("veth-igmp-neighbours","veth-igmp-neighbours"),
         veth_ipv6_solicited_routers => ("veth-ipv6-solicited-routers","veth-ipv6-solicited-routers"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
@@ -882,6 +885,7 @@ mod linux {
         bpf_prog_tcp => ("bpf-prog-tcp","bpf-prog"),
         bpf_prog_segments => ("bpf-prog-segments","bpf-prog"),
         bpf_prog_testrun => ("bpf-prog-testrun","bpf-prog"),
+        bpf_prog_cfg => ("bpf-prog-cfg","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         dnotify_calls => ("dnotify-calls","inotify"),
         dnotify_switch => ("dnotify-switch","inotify"),
@@ -1146,6 +1150,7 @@ mod linux {
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
         processes_sysctl_constants => ("sysctl-constants","process"),
+        processes_sysctl_limits => ("sysctl-limits","process"),
         processes_poll_default => ("poll-default","process"),
         processes_uts_sysctl => ("uts-sysctl","process"),
         processes_uts_sysctl_poll => ("uts-sysctl-poll","process"),

@@ -144,9 +144,32 @@ struct Packet {
     echo: u64,
     /// Its SACK blocks, a D-SACK first.
     sacks: Option<Box<[(u64, u64)]>>,
+    /// A reset of a socket gone, which carries no option
+    /// (`tcp_v4_send_reset`).
+    optionless: bool,
 }
 
+/// A SYN's TCP header (`tcp_syn_options`: MSS, SACK permitted, timestamps
+/// and window scale), and a SACK option's of no blocks with its padding
+/// (`tcp_options_write`).
+const SYN_HEADER: u32 = 40;
+const SACK: u32 = 4;
+
 impl Packet {
+    /// Its length from its TCP header (`__tcp_transmit_skb`): a SYN-ACK's
+    /// options; a reset of a socket gone has none (`tcp_v4_send_reset`);
+    /// the rest the timestamps', and their SACK blocks.
+    fn tcp_len(&self) -> u32 {
+        let header = if self.syn {
+            SYN_HEADER
+        } else if self.optionless {
+            TCP_HEADER
+        } else {
+            let blocks = self.sacks.as_ref().map_or(0, |s| s.len() as u32);
+            HEADER + if blocks > 0 { SACK + 8 * blocks } else { 0 }
+        };
+        header + self.len
+    }
     fn start(&self) -> u64 {
         self.end - u64::from(self.len) - u64::from(self.fin)
     }
@@ -552,6 +575,10 @@ pub(crate) struct Flows {
     /// it ended.
     metrics: [Option<Kept>; 2],
     settled: [bool; 2],
+    /// The lengths from their TCP headers of the packets each side has sent
+    /// since they were last taken ([`Self::take_sent`]), for the devices'
+    /// counters.
+    sent: [Vec<u32>; 2],
 }
 
 impl Flows {
@@ -595,7 +622,15 @@ impl Flows {
             end_at: [None; 2],
             metrics: [None, None],
             settled: [false; 2],
+            // The handshake: the client's SYN and last acknowledgement, the
+            // server's SYN-ACK.
+            sent: [vec![SYN_HEADER, HEADER], vec![SYN_HEADER]],
         }
+    }
+    /// What each side has sent since the last call, as [`Self::sent`] keeps
+    /// it.
+    pub(crate) fn take_sent(&mut self) -> [Vec<u32>; 2] {
+        core::mem::take(&mut self.sent)
     }
     /// `side` keeps what it ends with in `metrics`, under its `local` and
     /// `remote` addresses, and starts from what is kept there
@@ -780,6 +815,7 @@ impl Flows {
         };
         let mut packet = self.bare(1);
         packet.syn = true;
+        self.sent[1].push(packet.tcp_len());
         self.wire.push_back(packet);
     }
     /// A segment of `side`'s with nothing in it but its acknowledgement.
@@ -798,6 +834,7 @@ impl Flows {
             at: self.now,
             echo: s.recent,
             sacks: None,
+            optionless: false,
         }
     }
     /// Whether something one side sent is lost and will be sent again.
@@ -904,6 +941,7 @@ impl Flows {
         self.sides[side].counts.segs_out += 1;
         let mut packet = self.bare(side);
         packet.reset = true;
+        self.sent[side].push(packet.tcp_len());
         let heard = self.passes(&mut packet);
         self.stop(side);
         if heard {
@@ -1344,7 +1382,7 @@ impl Flows {
                 s.pingpong = s.pingpong.saturating_add(1).min(255);
             }
         }
-        self.wire.push_back(Packet {
+        let packet = Packet {
             to: 1 - side,
             len,
             segments,
@@ -1357,7 +1395,10 @@ impl Flows {
             at: now,
             echo: s.recent,
             sacks,
-        });
+            optionless: false,
+        };
+        self.sent[side].push(packet.tcp_len());
+        self.wire.push_back(packet);
     }
     /// `tcp_send_ack`.
     fn send_ack(&mut self, side: usize) {
@@ -1511,7 +1552,7 @@ impl Flows {
     }
     /// A reset from `side`, whose socket has gone.
     fn refuse(&mut self, side: usize, end: u64) {
-        self.wire.push_back(Packet {
+        let packet = Packet {
             to: 1 - side,
             len: 0,
             segments: 1,
@@ -1524,7 +1565,10 @@ impl Flows {
             at: 0,
             echo: 0,
             sacks: None,
-        });
+            optionless: true,
+        };
+        self.sent[side].push(packet.tcp_len());
+        self.wire.push_back(packet);
     }
     /// `tcp_rcv_established`. With `defer`, an acknowledgement due now is
     /// left to the caller: returns whether one is.

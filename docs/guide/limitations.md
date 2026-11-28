@@ -138,8 +138,15 @@ verified.
   the two that paludarium refuses ([decisions](../design/decisions)).
 - **Device counters, in part**: `/proc/net/dev` and a link's
   `IFLA_STATS64` and `IFLA_STATS` count UDP datagrams, ICMP's port
-  unreachable and ARP alone (see [features](./features)). TCP's segments
-  are not counted yet, nor the packets of IPv6 that the kernel sends of
+  unreachable, ARP and TCP's segments alone (see [features](./features)).
+  ICMP's port unreachable is sent, and counted, for each datagram to a
+  closed port, where Linux limits how many go (`icmp_ratelimit`,
+  `icmp_msgs_per_sec`, and per peer through a veth pair).
+  A SYN that a listener's full queue drops, or that nothing answers, is
+  not counted, nor are its retries; a connection's own retransmissions,
+  the SYN-ACK's sent again among them, are, as is its handshake once
+  the listener has answered, whether or not the request is dropped
+  later. Nor are the packets of IPv6 that the kernel sends of
   itself (neighbour discovery, MLD reports, router solicitations and
   duplicate address detection), nor ARP's probes of a neighbour whose
   entry ages, nor what goes to the host (a TCP connection to a port no
@@ -168,7 +175,7 @@ verified.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/interrupts`, `/proc/partitions`, `/proc/kallsyms`, the files of `/proc/sys` but for the ones of `fs`,
-  `kernel` and `net` it has and `vm/drop_caches` and
+  `kernel` and `net` it has and `vm/drop_caches`, `vm/max_map_count` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, `attr`, ...) are `ENOENT`, as in
   another process's directory, whatever the filesystem holds there (with
@@ -180,6 +187,11 @@ verified.
   of `hostname` and `domainname` polls them by descriptor number until one is
   ready, where Linux does in the order they changed, so that of several that
   changed another may be the one it has seen.
+  `vm/max_map_count` is of mode 0444 and bounds nothing, where Linux's is
+  root's to write (0644) and makes a mapping past it `ENOMEM`. There are no
+  `fs/pipe-user-pages-soft` and `fs/pipe-user-pages-hard`, and nothing counts
+  a user's pipe pages, so a pipe of a user past Linux's soft limit is not
+  made smaller nor refused growth (`EPERM`).
   `io` does not count what Linux's
   `kernel_read` and `kernel_write` count for the process (`execve` reading its
   program and interpreter, a core dump's writes), and a read or write that
@@ -1162,9 +1174,7 @@ verified.
 - **Edge-triggered `epoll` on a signalfd, in part**: a signal queued for
   another thread of the process is the waiting thread's edge as it is sent,
   but a thread already waiting sees it within 10 ms, where Linux's
-  `signalfd_notify` wakes the file at once. A signal sent to the init of a
-  nested PID namespace, which it drops as it has no handler
-  (`SIGNAL_UNKILLABLE`), still counts as sent.
+  `signalfd_notify` wakes the file at once.
 - **A POSIX timer's signal, in part**: a timer on a clock of real time
   sends to the process's leader first, where Linux's `posixtimer_get_target`
   sends to a thread of the process that its interrupt finds running. One

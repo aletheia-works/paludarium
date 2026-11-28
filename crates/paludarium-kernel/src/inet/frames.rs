@@ -14,6 +14,10 @@ const IP6: usize = 40;
 const FRAGMENT6: usize = 8;
 const UDP: usize = 8;
 const ICMP: usize = 8;
+/// A TCP SYN's header with its options (`tcp_syn_options`), and a reset's
+/// with none (`tcp_v4_send_reset`, `tcp_v6_send_reset`).
+pub(crate) const SYN: usize = 40;
+pub(crate) const RESET: usize = 20;
 /// What ICMP quotes of a packet at most: what fits in 576 bytes
 /// (`icmp_send`), and in IPv6's least MTU (`icmp6_send`).
 const QUOTED4: usize = 576 - IP4 - ICMP;

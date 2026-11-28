@@ -2552,6 +2552,9 @@ fn dev_tty_is_there_without_a_controlling_terminal() {
     assert_eq!((mode_uid, rdev), (0o020_666, 5 << 8));
     assert_eq!(f.ret(21, &[name, 2]), 0);
     assert_eq!(f.ret(2, &[name, 2]), errno(Errno(6)));
+    // O_CREAT | O_EXCL finds the node, and O_DIRECTORY no directory.
+    assert_eq!(f.ret(2, &[name, 0o302, 0o600]), errno(Errno::EEXIST));
+    assert_eq!(f.ret(2, &[name, 0o200000]), errno(Errno::ENOTDIR));
 }
 #[test]
 fn file_size_limit_is_enforced_as_linux_does() {

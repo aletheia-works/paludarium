@@ -19235,6 +19235,14 @@ static int dev_tty_node_case(void) {
     for (struct dirent *e; (e = readdir(d));) listed |= !strcmp(e->d_name, "tty") && e->d_type == DT_CHR;
     closedir(d);
     printf("listed=%d\n", listed);
+    /* Opens that the node decides before any terminal: it is there, and no
+       directory. */
+    int excl = open("/dev/tty", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    int excl_error = excl < 0 ? -errno : 0;
+    int dir = open("/dev/tty", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    printf("excl=%d directory=%d\n", excl_error, dir < 0 ? -errno : 0);
+    if (excl >= 0) close(excl);
+    if (dir >= 0) close(dir);
     return 0;
 }
 /* `execve` through a magic link on the way (`/proc/self/fd/<n>/name`,

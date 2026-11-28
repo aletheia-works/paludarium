@@ -8283,7 +8283,11 @@ fn open_path(
         return Ok((Arc::new(link), p.to_vec()));
     }
     // `/dev/tty`: the controlling terminal, when it is one of the
-    // emulator's pseudo-terminals.
+    // emulator's pseudo-terminals. It is no directory (`ENOTDIR`), which
+    // the open finds of the node before it looks for a terminal.
+    if p == b"/dev/tty" && flags & 0o200000 != 0 {
+        return Err(Errno::ENOTDIR);
+    }
     if p == b"/dev/tty"
         && let Some(file) = crate::pty::open_controlling(c, flags)
     {

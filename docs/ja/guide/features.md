@@ -5486,6 +5486,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変えられます。回の間にシグナルが来ると終わります（`EINTR`）。`retval` は結果、`duration` は
   1 回にかかった時間、`data_out` は Ethernet ヘッダーをゼロにしたパケットで、`data_size_out`
   に入る分だけ、リニア部から書きます（入らなければ大きさを書いたあとで `ENOSPC`）。
+  書き出しが呼び出し側の書けないページに当たると、そのページの手前まで書いて `EFAULT` になり、
+  その後は何も書きません。
   コンテキスト（`struct __sk_buff`、入出力）は `mark`、`priority`、`ingress_ifindex`、
   `ifindex`、`cb[]`、`wire_len`、`gso_segs`、`gso_size` を渡し、ほかの場所は 0 でなければ
   ならず（`EINVAL`）、192 バイトより後ろも 0 でなければなりません（`E2BIG`）。返ってくるのは

@@ -6440,7 +6440,9 @@ kernel.
   a signal between runs ends them (`EINTR`). `retval` is its result,
   `duration` the time a run took, and `data_out` the packet with its
   Ethernet header zeroed, as much as `data_size_out` takes (`ENOSPC`
-  after the sizes are written), its linear part first. A context
+  after the sizes are written), its linear part first. A copy out that
+  runs into a page the caller may not write writes up to it and is
+  `EFAULT`, with nothing written after it. A context
   (`struct __sk_buff`, in and out) gives `mark`, `priority`,
   `ingress_ifindex`, `ifindex`, `cb[]`, `wire_len`, `gso_segs` and
   `gso_size` and must have zeros elsewhere (`EINVAL`), and past its 192

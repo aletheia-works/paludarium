@@ -1561,3 +1561,33 @@ fn a_test_run_s_packet_may_be_in_pages() {
     assert_eq!(out[14..40], (0..26).collect::<Vec<u8>>()[..]);
     assert_eq!(out[40], 0xee);
 }
+
+/// A packet copied out to a `data_out` that runs off the caller's memory
+/// is written up to the page that faults, as Linux's copy leaves it, and
+/// the run is EFAULT with its size, result and time not written.
+#[test]
+fn a_test_run_s_copy_out_stops_at_the_page_that_faults() {
+    let mut e = Env::new();
+    let len = e.program(&field(0));
+    e.packet([0; 6], 0x0800, 64);
+    let end = DATA + SIZE;
+    e.put(end - 10, &[0xee; 10]);
+    let ran = e.test_run(&TestRun {
+        data_out: end - 10,
+        ..TestRun::of(len, 64)
+    });
+    // A size of 64 and a result of 50 were not written.
+    assert_eq!((ran.result, ran.retval, ran.size_out), (-14, 0, 0));
+    // The Ethernet header comes back as zeros, over the 0xee bytes.
+    assert_eq!(e.get(end - 10, 10), [0; 10]);
+    // A context copied out the same way.
+    e.put(CTX_IN, &[0; 192]);
+    let ran = e.test_run(&TestRun {
+        ctx_out: end - 100,
+        ..TestRun::of(len, 64).with_context()
+    });
+    // Its first 100 bytes, with the loopback's ifindex at 40; its size
+    // is the one given.
+    assert_eq!((ran.result, ran.ctx_size_out), (-14, 192));
+    assert_eq!(e.get(end - 100 + 40, 4), 1u32.to_le_bytes());
+}

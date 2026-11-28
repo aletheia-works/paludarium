@@ -4227,11 +4227,10 @@ kernel.
   caller, with no other register changed. A tracer that changes the call's
   number there, or moves the thread, ends it with `SIGSYS`, whose action is
   then left at its default and `SA_IMMUTABLE` (`force_exit_sig`). Any other
-  address there, a stack
-  that cannot be read and a pointer the call cannot write are `SIGSEGV` from
-  the kernel (`SI_KERNEL`); a pointer past user space is `SEGV_MAPERR` at
-  it. Reads from outside give `EFAULT` (`process_vm_readv`) and `EIO`
-  (`/proc/<pid>/mem`, `PTRACE_PEEKDATA`).
+  address there, a stack that cannot be read and a pointer the call cannot
+  write are `SIGSEGV` from the kernel (`SI_KERNEL`); a pointer past user
+  space is `SEGV_MAPERR` at it. Reads from outside give `EFAULT`
+  (`process_vm_readv`) and `EIO` (`/proc/<pid>/mem`, `PTRACE_PEEKDATA`).
 
 - Files are checked as Linux checks them (`generic_permission`): the
   owner's permission bits apply to the owner, the group's to a member of the

@@ -2018,13 +2018,22 @@ exit=15",
 }
 
 /// `vsyscall-immutable` (`sa-immutable.c`): a tracer that changes the
-/// number of a `vsyscall` entry's call at its seccomp stop ends the tracee
-/// with SIGSYS, its action at its default and SA_IMMUTABLE: no handler
-/// runs and the tracer sees no signal-delivery stop. The guest's
-/// CLONE_SIGHAND sharer, which then finds SIGSYS's action immutable, is
-/// left out; the actions are read here instead.
+/// number of a `vsyscall` entry's call at its seccomp stop, or moves the
+/// thread from the entry, ends the tracee with SIGSYS, its action at its
+/// default and SA_IMMUTABLE: no handler runs and the tracer sees no
+/// signal-delivery stop. The guest's CLONE_SIGHAND sharer, which then
+/// finds SIGSYS's action immutable, is left out; the actions are read here
+/// instead.
 #[test]
 fn vsyscall_number_changed() {
+    vsyscall_changed(ORIG_RAX, GETPID);
+}
+#[test]
+fn vsyscall_moved() {
+    vsyscall_changed(RIP, crate::vsyscall::START);
+}
+/// The tracer writes `value` to the register at `field` at the stop.
+fn vsyscall_changed(field: u64, value: u64) {
     let mut g = Tracer::new();
     let (child, thread) = g.fork(|c| {
         // time traced, the rest allowed.
@@ -2098,7 +2107,7 @@ fn vsyscall_number_changed() {
         "nr={nr} at-entry={}",
         i32::from(rip == crate::vsyscall::START + 0x400)
     ));
-    g.m.write_u64(GuestAddr(regs + ORIG_RAX), GETPID).unwrap();
+    g.m.write_u64(GuestAddr(regs + field), value).unwrap();
     let r = g.pt(SETREGS, child, 0, regs);
     g.say("changed", r);
     g.pt(CONT, child, 0, 0);

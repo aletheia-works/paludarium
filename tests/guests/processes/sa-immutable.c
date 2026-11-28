@@ -11,10 +11,12 @@
  * compared here.)
  *
  * The vsyscall-immutable case: a tracer that changes the number of a
- * vsyscall entry's call at its seccomp stop makes `emulate_vsyscall` end
- * the caller with SIGSYS (`force_exit_sig`), which leaves the action at its
- * default and SA_IMMUTABLE as well: the tracer sees no signal-delivery stop,
- * and the process that shares the actions finds SIGSYS's immutable. */
+ * vsyscall entry's call at its seccomp stop, or moves the thread from the
+ * entry, makes `emulate_vsyscall` end the caller with SIGSYS
+ * (`force_exit_sig`), which leaves the action at its default and
+ * SA_IMMUTABLE as well: the tracer sees no signal-delivery stop, and the
+ * process that shares the actions finds SIGSYS's immutable. Each change is
+ * made in a forked process of its own, whose actions are not yet so. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <sched.h>
@@ -122,8 +124,8 @@ static void show_sigsys(const char *who) {
     fflush(stdout);
 }
 
-/* The vsyscall-immutable case. */
-static int vsyscall_immutable(void) {
+/* One change of the vsyscall-immutable case: the number, or `rip`. */
+static int vsyscall_immutable(int move) {
     struct kact sys = {(unsigned long)handler, SA_RESTORER_FLAG, 0, 0};
     printf("handler: %ld\n", act(SIGSYS, &sys, NULL));
     static char stack[64 * 1024] __attribute__((aligned(16)));
@@ -145,8 +147,11 @@ static int vsyscall_immutable(void) {
     ptrace(PTRACE_GETREGS, pid, 0, &regs);
     printf("seccomp: event %d nr %lld at entry %d\n", status >> 16, (long long)regs.orig_rax,
            regs.rip == VSYSCALL_TIME);
-    regs.orig_rax = SYS_getpid;
-    printf("changed: %ld\n", ptrace(PTRACE_SETREGS, pid, 0, &regs));
+    if (move)
+        regs.rip = VSYSCALL_TIME - 0x400;
+    else
+        regs.orig_rax = SYS_getpid;
+    printf("changed %s: %ld\n", move ? "rip" : "nr", ptrace(PTRACE_SETREGS, pid, 0, &regs));
     fflush(stdout);
     ptrace(PTRACE_CONT, pid, 0, 0);
     waitpid(pid, &status, __WALL);
@@ -170,7 +175,16 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     struct rlimit none = {0, 0};
     setrlimit(RLIMIT_CORE, &none);
-    if (argc > 1 && strcmp(argv[1], "vsyscall-immutable") == 0) return vsyscall_immutable();
+    if (argc > 1 && strcmp(argv[1], "vsyscall-immutable") == 0) {
+        for (int move = 0; move < 2; move++) {
+            int pid = fork();
+            if (pid == 0) _exit(vsyscall_immutable(move));
+            int status;
+            waitpid(pid, &status, 0);
+            status_line("case", status);
+        }
+        return 0;
+    }
 
     /* Only the known flags stay, and show. */
     struct kact usr1 = {(unsigned long)handler,

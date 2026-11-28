@@ -461,6 +461,7 @@
     {"name":"sysvipc-proc","binary":"process"},
     {"name":"kernel-sysctl","binary":"process"},
     {"name":"sysctl-constants","binary":"process"},
+    {"name":"sysctl-limits","binary":"process"},
     {"name":"poll-default","binary":"process"},
     {"name":"uts-sysctl","binary":"process"},
     {"name":"uts-sysctl-poll","binary":"process"},

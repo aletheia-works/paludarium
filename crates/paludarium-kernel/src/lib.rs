@@ -1801,9 +1801,10 @@ impl Kernel {
         // sampling perf events, whose clocks overflow as it runs.
         let sampling = perf::sampling(&self.processes.perf_events);
         // So does a thread that slept, whose events' user pages and
-        // switch records show it: its sleeps are taken now, so that an
-        // event opened or enabled after them takes none of them.
-        let slept = paludarium_host::switches::pending();
+        // switch records show it: its sleeps are taken now, and so are
+        // those the call took itself as it read a clock, so that an event
+        // opened or enabled after them takes none of them.
+        let slept = paludarium_host::switches::pending() || thread.state.cpu.slept != 0;
         if self.group.cpu_timers_armed() || sampling || slept {
             account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
             self.scheduled_in(thread);

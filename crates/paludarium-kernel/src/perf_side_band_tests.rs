@@ -1033,3 +1033,21 @@ fn a_call_s_sleeps_are_taken_as_it_returns() {
     assert_eq!(env.call(NANOSLEEP, [ARG, 0, 0, 0, 0, 0]), 0);
     assert!(!paludarium_host::switches::pending());
 }
+
+/// A call that took its sleeps itself, as it read a clock after them (as
+/// `clock_nanosleep` does, through `sleep_clock_now`), drops them as it
+/// returns, so that an event another thread opens before the thread's next
+/// call takes none of them: they were before it.
+#[test]
+fn a_call_drops_the_sleeps_it_took_as_it_returns() {
+    let mut env = Env::new();
+    env.call(GETPID, [0; 6]);
+    let _ = paludarium_host::switches::take();
+    paludarium_host::switches::sleep(&mut false);
+    let host = Arc::clone(&env.k.host);
+    crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
+    assert!(!paludarium_host::switches::pending());
+    assert_eq!(env.t.state.cpu.slept, 1);
+    let _ = env.k.checkpoint(&mut env.t, &env.m);
+    assert_eq!(env.t.state.cpu.slept, 0);
+}

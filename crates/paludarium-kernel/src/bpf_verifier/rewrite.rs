@@ -122,8 +122,10 @@ fn removed_nop(f: &Facts<'_>, seen_before: &[usize], i: usize) -> bool {
     if !ja && !wired {
         return false;
     }
+    // A jump of 0 once the dead code is gone lands on the next live
+    // instruction; a jump back never becomes one.
     let to = target(f, i);
-    to == i + 1 || seen_before[to] - seen_before[i] - 1 == 0
+    to > i && seen_before[to] == seen_before[i] + 1
 }
 
 /// `convert_ctx_accesses` of the instruction at `i`, if it goes through
@@ -353,6 +355,14 @@ mod tests {
         // Both sides taken: the jump stays.
         let seen = [true; 4];
         assert_eq!(len(&facts(&insns, &seen, &n, &empty)), Ok(4));
+        // A jump back stays, also a conditional one whose fall-through is
+        // dead.
+        let insns = [mov, ja(1), exit, ja(-2)];
+        let seen = [true; 4];
+        assert_eq!(len(&facts(&insns, &seen, &n, &empty)), Ok(4));
+        let insns = [ja(1), exit, jeq(-2), mov];
+        let seen = [true, true, true, false];
+        assert_eq!(len(&facts(&insns, &seen, &n, &empty)), Ok(3));
     }
 
     #[test]

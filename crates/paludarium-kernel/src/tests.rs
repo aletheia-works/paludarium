@@ -15750,6 +15750,18 @@ fn the_name_calls_find_a_last_magic_link_itself() {
     let new = put(&mut f, 0x340, b"/dev/fd/x9");
     assert_eq!(f.ret(82, &[missing, new]), errno(Errno::ENOENT), "rename");
     assert_eq!(f.ret(86, &[missing, new]), errno(Errno::ENOENT), "link");
+    // Under a root of its own, `/dev/fd` is a directory that root holds:
+    // a name made there is the root's.
+    let root = put(&mut f, 0x380, b"/tmp/r");
+    let dev = put(&mut f, 0x3a0, b"/tmp/r/dev");
+    let fd_dir = put(&mut f, 0x3c0, b"/tmp/r/dev/fd");
+    for at in [root, dev, fd_dir] {
+        assert_eq!(f.ret(83, &[at, 0o755]), 0);
+    }
+    assert_eq!(f.ret(161, &[root]), 0);
+    let made = put(&mut f, 0x3e0, b"/dev/fd/x9");
+    assert_eq!(f.ret(83, &[made, 0o755]), 0, "mkdir under the root");
+    assert_eq!(f.ret(84, &[made]), 0, "rmdir under the root");
     assert_eq!(f.ret(3, &[fd]), 0);
 }
 

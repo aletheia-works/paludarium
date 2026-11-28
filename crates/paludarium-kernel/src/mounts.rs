@@ -31,6 +31,7 @@ use paludarium_host::{ClockId, HostFs};
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{MemFs, NewTmpfs, Propagation, Settings, Target, mount_flags as mnt};
 
+use crate::kstrto;
 use crate::namespaces::Namespace;
 use crate::syscalls::{Context, Outcome};
 
@@ -1145,38 +1146,6 @@ fn memparse(s: &[u8]) -> (u64, &[u8]) {
     }
     (value, &s[end..])
 }
-/// `kstrtouint(s, base)`: the whole string, a `+` and a newline allowed.
-fn kstrtouint(s: &[u8], base: u64) -> Option<u32> {
-    let s = s.strip_prefix(b"+").unwrap_or(s);
-    let (base, s) = match (base, s) {
-        (0, [b'0', x, d, ..]) if x.eq_ignore_ascii_case(&b'x') && d.is_ascii_hexdigit() => {
-            (16, &s[2..])
-        }
-        (0, [b'0', ..]) => (8, s),
-        (0, _) => (10, s),
-        (16, [b'0', x, ..]) if x.eq_ignore_ascii_case(&b'x') => (16, &s[2..]),
-        _ => (base, s),
-    };
-    let mut value: u64 = 0;
-    let mut digits = 0;
-    for &b in s {
-        let digit = match b {
-            b'0'..=b'9' => u64::from(b - b'0'),
-            b'a'..=b'f' | b'A'..=b'F' => u64::from(b.to_ascii_lowercase() - b'a') + 10,
-            _ => break,
-        };
-        if digit >= base {
-            break;
-        }
-        value = value.checked_mul(base)?.checked_add(digit)?;
-        digits += 1;
-    }
-    let rest = &s[digits..];
-    if digits == 0 || !(rest.is_empty() || rest == b"\n") {
-        return None;
-    }
-    u32::try_from(value).ok()
-}
 /// `mpol_parse_str` for the one node there is: a mode, and for `prefer`,
 /// `bind`, `interleave`, `weighted_interleave` and `prefer_many` a node
 /// list (`0`), with `=static`, `=relative` or `=local` after it.
@@ -1288,7 +1257,7 @@ impl Tmpfs {
                 self.inodes = Some(inodes);
             }
             b"mode" => {
-                let mode = kstrtouint(&string()?, 8).ok_or_else(bad)?;
+                let mode = kstrto::uint(&string()?, 8).map_err(|_| bad())?;
                 self.mode = mode & 0o7777;
             }
             b"uid" | b"gid" => {
@@ -1298,7 +1267,7 @@ impl Tmpfs {
                     crate::users::Ids::Group
                 };
                 let text = string()?;
-                let id = kstrtouint(&text, 0).ok_or_else(bad)?;
+                let id = kstrto::uint(&text, 0).map_err(|_| bad())?;
                 // `fs_param_is_uid`'s make_kuid in the caller's namespace,
                 // whose mapping `shmem_parse_one` then needs.
                 let kernel = creds.user.kernel_of(ids, id).ok_or_else(|| {
@@ -1756,16 +1725,6 @@ mod tests {
         assert_eq!(memparse(b"k"), (0, &b"k"[..]));
         assert_eq!(memparse(b"16E"), (u64::MAX, &b""[..]));
         assert_eq!(memparse(b"0x"), (0, &b"x"[..]));
-    }
-
-    #[test]
-    fn kstrtouint_takes_the_whole_string() {
-        assert_eq!(kstrtouint(b"0750", 8), Some(0o750));
-        assert_eq!(kstrtouint(b"+17\n", 8), Some(0o17));
-        assert_eq!(kstrtouint(b"8", 8), None);
-        assert_eq!(kstrtouint(b"", 8), None);
-        assert_eq!(kstrtouint(b"0x10", 0), Some(16));
-        assert_eq!(kstrtouint(b"4294967296", 0), None);
     }
 
     #[test]

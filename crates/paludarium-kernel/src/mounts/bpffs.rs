@@ -8,7 +8,8 @@ use paludarium_host::{ClockId, HostFs};
 use paludarium_types::Errno;
 use paludarium_vfs::{MemFs, NewTmpfs, Settings};
 
-use super::{Refused, Value, common_flag, common_options, kstrtouint};
+use super::{Refused, Value, common_flag, common_options};
+use crate::kstrto;
 use crate::syscalls::Context;
 
 /// Its type's name, as `mount` takes it and mountinfo shows it.
@@ -101,7 +102,7 @@ impl Bpffs {
                 } else {
                     crate::users::Ids::Group
                 };
-                let id = kstrtouint(string()?, 0).ok_or_else(bad)?;
+                let id = kstrto::uint(string()?, 0).map_err(|_| bad())?;
                 // make_kuid in the caller's namespace, which must map it.
                 let kernel = creds.user.kernel_of(ids, id).ok_or_else(bad)?;
                 if key == b"uid" {
@@ -110,7 +111,7 @@ impl Bpffs {
                     self.gid = kernel;
                 }
             }
-            b"mode" => self.mode = kstrtouint(string()?, 8).ok_or_else(bad)? & S_IALLUGO,
+            b"mode" => self.mode = kstrto::uint(string()?, 8).map_err(|_| bad())? & S_IALLUGO,
             b"delegate_cmds" | b"delegate_maps" | b"delegate_progs" | b"delegate_attachs" => {
                 let which = DELEGATES
                     .iter()
@@ -126,7 +127,7 @@ impl Bpffs {
                         mask |= 1u64.wrapping_shl(value);
                     } else {
                         // `kstrtou64(p, 0, &msk)`, which replaces the mask.
-                        mask = kstrtou64(part)?;
+                        mask = kstrto::ull(part, 0)?;
                     }
                 }
                 if mask != 0 && !creds.capable(CAP_SYS_ADMIN) {
@@ -269,42 +270,6 @@ fn named(names: &[(&str, u32)], prefix: &str, part: &[u8]) -> Option<u32> {
         let short = strip_prefix_ignoring_case(name, prefix)?;
         short.as_bytes().eq_ignore_ascii_case(part).then_some(value)
     })
-}
-
-/// `kstrtou64(s, 0)`: the whole string (a `+` and a newline allowed) in
-/// the base its prefix gives; `ERANGE` past 64 bits, else `EINVAL`.
-fn kstrtou64(s: &[u8]) -> Result<u64, Errno> {
-    let s = s.strip_prefix(b"+").unwrap_or(s);
-    let (base, digits) = match s {
-        [b'0', x, d, ..] if x.eq_ignore_ascii_case(&b'x') && d.is_ascii_hexdigit() => (16, &s[2..]),
-        [b'0', ..] => (8, s),
-        _ => (10, s),
-    };
-    let digits = digits.strip_suffix(b"\n").unwrap_or(digits);
-    if digits.is_empty() {
-        return Err(Errno::EINVAL);
-    }
-    let mut value: u64 = 0;
-    let mut overflow = false;
-    for &b in digits {
-        let digit = match b {
-            b'0'..=b'9' => u64::from(b - b'0'),
-            b'a'..=b'f' | b'A'..=b'F' => u64::from(b.to_ascii_lowercase() - b'a') + 10,
-            _ => return Err(Errno::EINVAL),
-        };
-        if digit >= base {
-            return Err(Errno::EINVAL);
-        }
-        match value.checked_mul(base).and_then(|v| v.checked_add(digit)) {
-            Some(v) => value = v,
-            None => overflow = true,
-        }
-    }
-    if overflow {
-        Err(Errno::ERANGE)
-    } else {
-        Ok(value)
-    }
 }
 
 /// `__MAX_BPF_CMD` and the other ends of the enums, which bound `any`.
@@ -519,17 +484,6 @@ mod tests {
             sb_clear: 0,
             sb_flags: 0,
         }
-    }
-
-    #[test]
-    fn kstrtou64_takes_a_whole_number_in_its_base() {
-        assert_eq!(kstrtou64(b"0x1f"), Ok(31));
-        assert_eq!(kstrtou64(b"017\n"), Ok(15));
-        assert_eq!(kstrtou64(b"+9"), Ok(9));
-        assert_eq!(kstrtou64(b"08"), Err(Errno::EINVAL));
-        assert_eq!(kstrtou64(b""), Err(Errno::EINVAL));
-        assert_eq!(kstrtou64(b"12x"), Err(Errno::EINVAL));
-        assert_eq!(kstrtou64(b"0x10000000000000000"), Err(Errno::ERANGE));
     }
 
     #[test]

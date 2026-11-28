@@ -234,6 +234,26 @@ pub(crate) struct CpuAccount {
     /// Whether the thread has slept or moved to another CPU since perf last
     /// looked ([`Kernel::scheduled_in`]).
     resumed: bool,
+    /// The times it has slept since then, each a switch out and back in
+    /// for the events with `context_switch` ([`perf::switched`]), as runs
+    /// of the CPU each was on and their number: another thread's
+    /// `sched_setaffinity` may move it between two sleeps of one call.
+    slept: Vec<(u32, u64)>,
+    /// Whether perf has seen it run: a new thread's first run is a switch
+    /// in alone, for the events there were when it was made
+    /// ([`CpuAccount::made`]).
+    ran: bool,
+    /// The first ID of an event opened after a `clone` made the thread, or
+    /// `None` for one no `clone` made.
+    made_before: Option<u64>,
+}
+
+impl CpuAccount {
+    /// A `clone` made the thread, its inherited events too: those opened
+    /// from now are none of its first run's, which was before them.
+    pub(crate) fn made(&mut self) {
+        self.made_before = Some(perf::next_id());
+    }
 }
 impl Clone for CpuAccount {
     fn clone(&self) -> Self {
@@ -946,6 +966,11 @@ pub(crate) fn account_cpu(
     let switches = paludarium_host::switches::take();
     if switches != 0 {
         account.resumed = true;
+        let cpu = account.on.map_or(0, |(cpu, _)| cpu);
+        match account.slept.last_mut() {
+            Some((on, n)) if *on == cpu => *n = n.saturating_add(switches),
+            _ => account.slept.push((cpu, switches)),
+        }
         usage.switches.fetch_add(switches, Ordering::SeqCst);
         // Its sleeps since its last account were on the CPU it was on
         // then, though another thread's `sched_setaffinity` moved its
@@ -1792,9 +1817,11 @@ impl Kernel {
         // its last system call too, as Linux's tick does, and so do the
         // sampling perf events, whose clocks overflow as it runs.
         let sampling = perf::sampling(&self.processes.perf_events);
-        // So does a thread that slept, whose events' user pages show it.
-        let slept = perf::buffers_mapped(&self.processes.perf_events)
-            && paludarium_host::switches::pending();
+        // So does a thread that slept, whose events' user pages and
+        // switch records show it: its sleeps are taken now, and so are
+        // those the call took itself as it read a clock, so that an event
+        // opened or enabled after them takes none of them.
+        let slept = paludarium_host::switches::pending() || !thread.state.cpu.slept.is_empty();
         if self.group.cpu_timers_armed() || sampling || slept {
             account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
             self.scheduled_in(thread);
@@ -2514,10 +2541,29 @@ impl Kernel {
 
     /// After [`account_cpu`]: a thread that slept or moved to another CPU
     /// since its last account was scheduled in again, which updates its
-    /// events' user pages ([`perf::scheduled_in`]).
+    /// events' user pages ([`perf::scheduled_in`]), and its first run and
+    /// its sleeps are written as switch records ([`perf::switched`]).
     fn scheduled_in(&self, thread: &mut Thread) {
         if std::mem::take(&mut thread.state.cpu.resumed) {
             perf::scheduled_in(&self.processes.perf_events, &self.group, thread.tid);
+        }
+        let sleeps = std::mem::take(&mut thread.state.cpu.slept);
+        let started = !std::mem::replace(&mut thread.state.cpu.ran, true);
+        let started = started.then_some(thread.state.cpu.made_before).flatten();
+        if (started.is_some() || !sleeps.is_empty()) && perf::switches(&self.processes.perf_events)
+        {
+            let who = perf::Who {
+                pid: thread.state.pid,
+                tid: thread.tid,
+                cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+            };
+            perf::switched(
+                &self.processes.perf_events,
+                &self.group,
+                &who,
+                started,
+                &sleeps,
+            );
         }
     }
 

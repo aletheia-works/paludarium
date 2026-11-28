@@ -2,7 +2,7 @@
 //! `statx.c`, `sync.c`, `truncate.c` and `advise.c` have them:
 //! `IORING_OP_OPENAT`, `_OPENAT2`, `_CLOSE`, `_STATX`, `_FALLOCATE`,
 //! `_FADVISE`, `_MADVISE`, `_RENAMEAT`, `_UNLINKAT`, `_MKDIRAT`,
-//! `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`.
+//! `_SYMLINKAT`, `_LINKAT`, `_FTRUNCATE` and `_PIPE`.
 //!
 //! Each runs as the call it stands for does. Linux runs most of them in a
 //! worker, so there its completion may come after a later request's; here
@@ -11,6 +11,7 @@
 use paludarium_types::Errno;
 
 use super::{IOSQE_FIXED_FILE, Ring, Work, file_of, int_at, u16_at, u32_at, u64_at};
+use crate::files::Descriptor;
 use crate::syscalls::Context;
 
 pub(super) const OP_FALLOCATE: u8 = 17;
@@ -26,8 +27,9 @@ pub(super) const OP_MKDIRAT: u8 = 37;
 pub(super) const OP_SYMLINKAT: u8 = 38;
 pub(super) const OP_LINKAT: u8 = 39;
 pub(super) const OP_FTRUNCATE: u8 = 55;
+pub(super) const OP_PIPE: u8 = 62;
 
-pub(super) const OPS: [u8; 13] = [
+pub(super) const OPS: [u8; 14] = [
     OP_FALLOCATE,
     OP_OPENAT,
     OP_CLOSE,
@@ -41,6 +43,7 @@ pub(super) const OPS: [u8; 13] = [
     OP_SYMLINKAT,
     OP_LINKAT,
     OP_FTRUNCATE,
+    OP_PIPE,
 ];
 
 const AT_REMOVEDIR: u32 = 0x200;
@@ -54,6 +57,9 @@ const O_TMPFILE: u64 = 0o20000000;
 /// `VALID_OPEN_FLAGS`, and `O_PATH_FLAGS`.
 const VALID_OPEN_FLAGS: u64 = 0o37777703;
 const O_PATH_FLAGS: u64 = 0o200000 | 0o400000 | O_PATH | O_CLOEXEC;
+/// What `IORING_OP_PIPE` takes, as `pipe2`: `O_CLOEXEC`, `O_NONBLOCK`,
+/// `O_DIRECT` and `O_NOTIFICATION_PIPE`.
+const PIPE_FLAGS: u32 = 0o2000000 | 0o4000 | 0o40000 | 0o200;
 
 /// A file request, with the names its preparation read and where it read
 /// them.
@@ -96,6 +102,13 @@ enum Op {
         addr: u64,
         len: u64,
         advice: u32,
+    },
+    /// A pipe, whose ends' numbers go to `at`, in descriptors or from
+    /// registered slot `slot` (one past its index).
+    Pipe {
+        at: u64,
+        flags: u32,
+        slot: u32,
     },
 }
 
@@ -232,6 +245,17 @@ pub(super) fn prepare(opcode: u8, flags: u8, sqe: &[u8]) -> Result<Work, Errno> 
                 a: [off, length, u64::from(rw_flags)],
             }
         }
+        // `io_pipe_prep`: its `buf_index` and `len` are not looked at.
+        OP_PIPE => {
+            if fd != 0 || off != 0 || addr3 != 0 || rw_flags & !PIPE_FLAGS != 0 {
+                return Err(Errno::EINVAL);
+            }
+            Op::Pipe {
+                at: addr,
+                flags: rw_flags,
+                slot: file_index,
+            }
+        }
         _ => {
             unused(rw_flags != 0 || addr != 0 || len != 0 || file_index != 0 || addr3 != 0)?;
             Op::File {
@@ -286,7 +310,7 @@ pub(super) fn prepare_memory(c: &Context<'_>, fs: &mut Fs) -> Result<(), Errno> 
                 fs.names.push((*at, read));
             }
         }
-        Op::Close { .. } | Op::File { .. } | Op::Madvise { .. } => {}
+        Op::Close { .. } | Op::File { .. } | Op::Madvise { .. } | Op::Pipe { .. } => {}
     }
     Ok(())
 }
@@ -300,7 +324,7 @@ fn name(c: &Context<'_>, at: u64, empty: bool) -> Result<Vec<u8>, Errno> {
 }
 
 /// Runs a file request, and says whether it fails its link: only an open, a
-/// close, an `IORING_OP_FADVISE` and a file that is not found do
+/// close, an `IORING_OP_FADVISE`, a pipe and a file that is not found do
 /// (`req_set_fail`).
 pub(super) fn run(c: &mut Context<'_>, ring: &Ring, fs: &Fs) -> (i32, bool) {
     let res = |r: Result<u64, Errno>| r.map_or_else(|e| -e.0, |v| v as i32);
@@ -330,6 +354,10 @@ pub(super) fn run(c: &mut Context<'_>, ring: &Ring, fs: &Fs) -> (i32, bool) {
         Op::Call { number, a, .. } => {
             let done = crate::files::with_names(&fs.names, || crate::files::run(c, *number, *a));
             (res(done), false)
+        }
+        &Op::Pipe { at, flags, slot } => {
+            let done = res(pipe(c, ring, at, flags, slot));
+            (done, done < 0)
         }
         Op::Madvise { addr, len, advice } => {
             let a = [*addr, *len, u64::from(*advice), 0, 0, 0];
@@ -432,5 +460,61 @@ fn remove_fixed(ring: &Ring, slot: u32) -> Result<u64, Errno> {
     let gone = files.clear(slot).ok_or(Errno::EBADF)?;
     drop(registered);
     ring.put_nodes([gone]);
+    Ok(0)
+}
+
+/// `io_pipe`: a pipe as `pipe2` makes one ([`crate::files::new_pipe`]), whose
+/// ends go in the two lowest free descriptors (`EMFILE`), or in registered
+/// slots as [`super::net::install_fixed`] puts a file there: two free ones
+/// with `IORING_FILE_INDEX_ALLOC`, otherwise `slot` and the one after it,
+/// and `O_CLOEXEC` is `EINVAL` for them. The ends' numbers are written to
+/// `at` last (`EFAULT`), which takes back the descriptors or empties the
+/// slots, as a second slot that fails empties the first.
+fn pipe(c: &mut Context<'_>, ring: &Ring, at: u64, flags: u32, slot: u32) -> Result<u64, Errno> {
+    let [reader, writer] = crate::files::new_pipe(c, flags)?;
+    let cloexec = flags & O_CLOEXEC as u32 != 0;
+    let numbers = |first: u32, second: u32| {
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&first.to_le_bytes());
+        bytes[4..].copy_from_slice(&second.to_le_bytes());
+        crate::files::output(c, at, &bytes)
+    };
+    if slot == 0 {
+        let limit = c.group.nofile();
+        let first = c.files.reserve(limit)?;
+        let second = c
+            .files
+            .reserve(limit)
+            .inspect_err(|_| c.files.unreserve(first))?;
+        if let Err(e) = numbers(first, second) {
+            c.files.unreserve(first);
+            c.files.unreserve(second);
+            return Err(e);
+        }
+        c.files.fill(first, Descriptor::unnamed(reader, cloexec));
+        c.files.fill(second, Descriptor::unnamed(writer, cloexec));
+        return Ok(0);
+    }
+    if cloexec {
+        return Err(Errno::EINVAL);
+    }
+    let alloc = slot == super::FILE_INDEX_ALLOC;
+    let installed = |file, slot: u32| {
+        let index = super::net::install_fixed(ring, Descriptor::unnamed(file, false), slot);
+        match index {
+            ..0 => Err(Errno(-index)),
+            _ if alloc => Ok(index as u32),
+            _ => Ok(slot - 1),
+        }
+    };
+    let first = installed(reader, slot)?;
+    let second =
+        installed(writer, if alloc { slot } else { slot.wrapping_add(1) }).inspect_err(|_| {
+            let _ = remove_fixed(ring, first);
+        })?;
+    numbers(first, second).inspect_err(|_| {
+        let _ = remove_fixed(ring, first);
+        let _ = remove_fixed(ring, second);
+    })?;
     Ok(0)
 }

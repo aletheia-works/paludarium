@@ -1954,16 +1954,17 @@ kernel.
   kernel the differential tests run on, and so are the operations,
   registrations and setup and `io_uring_enter` flags it knows of. Its
   operations are `IORING_OP_NOP`,
-  `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
-  the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
-  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
+  `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with) and
+  `_EPOLL_WAIT`, the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`,
+  `_WRITEV`, `_FSYNC`, `_READ_FIXED`, `_WRITE_FIXED`, `_READV_FIXED` and
+  `_WRITEV_FIXED`, `IORING_OP_FILES_UPDATE`,
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
   `IORING_OP_ASYNC_CANCEL`, the timeouts `IORING_OP_TIMEOUT`,
   `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, the polls `IORING_OP_POLL_ADD` and
   `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
-  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
-  `IORING_OP_SPLICE` and `_TEE`, and the socket requests
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT`, `_FTRUNCATE` and
+  `_PIPE`, `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations, up to Linux
   7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`, as on a Linux
@@ -2297,6 +2298,36 @@ kernel.
   posts no tag. `IORING_OP_READ_FIXED` and
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
+  `IORING_OP_READV_FIXED` and `_WRITEV_FIXED` read their `iovec`s as the
+  entry is prepared (`ENOMEM` for more than `kmalloc` makes room for at
+  once, 4 MiB of them, then `EINVAL` for more than 1024, `EFAULT`, and
+  `EINVAL` for a negative length), then, after the file and the buffer
+  (`EFAULT`), room is made for the pieces of pages they may take, two more
+  than the 4 KiB pages of each: more than `INT_MAX` pieces are `EOVERFLOW`,
+  and more than `kmalloc` gives at once (4 MiB of 16-byte pieces) `ENOMEM`.
+  Then each buffer must lie in the registered one and have some bytes
+  (`EFAULT`), and they may have at most `MAX_RW_COUNT` in all (`EINVAL`). They move the bytes as
+  `readv` and `writev` do.
+
+- `IORING_OP_EPOLL_WAIT` takes the events of the epoll its `fd` names, at
+  most `len` of them, to `addr`, as `epoll_wait` does with no timeout: its
+  `off`, `rw_flags`, `buf_index` and `splice_fd_in` must be 0 (`EINVAL`);
+  then the file (`EBADF`), the count, from 1 to `INT_MAX / 12` (`EINVAL`),
+  the events' room in the user half (`EFAULT`) and an epoll (`EINVAL`) are
+  checked, as Linux's `ep_check_params` does. With none ready it waits until
+  the epoll is readable, then takes them; room it cannot write is `EFAULT`
+  once some are ready. It gives how many it took.
+
+- `IORING_OP_PIPE` makes a pipe as `pipe2` does with its `pipe_flags`
+  (`O_CLOEXEC`, `O_NONBLOCK` and `O_DIRECT`; others, or an `fd`, `off` or
+  `addr3`, are `EINVAL`) and writes its ends' numbers to `addr`. Without a
+  `file_index` they are the two lowest free descriptors (`EMFILE`). With
+  one, they are registered slots, which may not be `O_CLOEXEC` (`EINVAL`):
+  `IORING_FILE_INDEX_ALLOC` takes two free ones, looking on from the last
+  one taken (`ENFILE`), and a slot takes it and the one after it, each as
+  `IORING_OP_OPENAT` would fill it (`ENXIO`, `EINVAL`). A second slot that
+  fails, or numbers it cannot write (`EFAULT`), give the descriptors back
+  or empty the slots.
 
 - A ring made with `IORING_SETUP_R_DISABLED` refuses `io_uring_enter`
   (`EBADFD`) until `IORING_REGISTER_ENABLE_RINGS` enables it, whose thread
@@ -4290,11 +4321,13 @@ kernel.
   (`getcpu`) do what `emulate_vsyscall` does: seccomp sees the call with the
   entry's address, and a tracer its `PTRACE_EVENT_SECCOMP`, but no system
   call's stop is made; then the result is in `rax` and the thread at its
-  caller, with no other register changed. Any other address there, a stack
-  that cannot be read and a pointer the call cannot write are `SIGSEGV` from
-  the kernel (`SI_KERNEL`); a pointer past user space is `SEGV_MAPERR` at
-  it. Reads from outside give `EFAULT` (`process_vm_readv`) and `EIO`
-  (`/proc/<pid>/mem`, `PTRACE_PEEKDATA`).
+  caller, with no other register changed. A tracer that changes the call's
+  number there, or moves the thread, ends it with `SIGSYS`, whose action is
+  then left at its default and `SA_IMMUTABLE` (`force_exit_sig`). Any other
+  address there, a stack that cannot be read and a pointer the call cannot
+  write are `SIGSEGV` from the kernel (`SI_KERNEL`); a pointer past user
+  space is `SEGV_MAPERR` at it. Reads from outside give `EFAULT`
+  (`process_vm_readv`) and `EIO` (`/proc/<pid>/mem`, `PTRACE_PEEKDATA`).
 
 - Files are checked as Linux checks them (`generic_permission`): the
   owner's permission bits apply to the owner, the group's to a member of the
@@ -4597,6 +4630,14 @@ kernel.
   points in the root's directory: `rmdir` and `rename` of them are
   `EBUSY`, `unlink` `EISDIR` and the calls that make them `EEXIST`.
 
+- A path that goes on past a file of `/proc` or `/dev` that is not a
+  directory, with a trailing slash or a name after it (`/proc/self/status/`,
+  `/proc/mounts/x`, `/dev/null/`, `/dev/stdin/x`), is `ENOTDIR` for every
+  call that looks it up, as Linux's walk finds. The links on the way are
+  followed, so a link to a directory is gone on in. The calls that make or
+  remove the last name only check the names before it, and their own
+  errors above come after that.
+
 - `/proc` lists the files above, and nothing the filesystem has there (with
   `--mount /:/`, none of the host's own entries), and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
@@ -4676,7 +4717,12 @@ kernel.
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
   a futex, a timer or anything else it sleeps on), as Linux shows a task
-  that is not running, and `R` otherwise, also while it runs in a system
+  that is not running, `D (disk sleep)` instead in a wait Linux's task
+  sleeps `TASK_KILLABLE` in (a `vfork` parent waiting for its child, an
+  open waiting for a fanotify listener's answer, a task waiting for its
+  userfaultfd event to be read, and a seccomp notification's wait once
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` makes it killable), and `R`
+  otherwise, also while it runs in a system
   call that does not wait. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
   `maps` and `smaps` are empty, and open for any reader their mode lets,
@@ -6077,14 +6123,19 @@ kernel.
   (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack
   and mappings; and
   `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
-  that is made or ends; and with `namespaces` (which takes `CAP_PERFMON`),
+  that is made or ends; with `namespaces` (which takes `CAP_PERFMON`),
   `PERF_RECORD_NAMESPACES` of a thread's namespaces, the device and inode
   of each of its `/proc/<pid>/ns` files of net, uts, ipc, pid, user, mnt
   and cgroup: of a new thread or child, written by its creator, and of a
   thread after each `unshare` that succeeds, new namespaces or not, and
-  each `setns`. A `cpu-clock` or `task-clock` event whose
-  interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
-  throttled until the next tick, its count stopped meanwhile, with
+  each `setns`; and with `context_switch`, `PERF_RECORD_SWITCH`
+  (`SWITCH_CPU_WIDE` for an event of a CPU, with the thread that ran
+  instead) of each sleep of a thread, one with `PERF_RECORD_MISC_SWITCH_OUT`
+  and one without it as it runs again, and one without it alone for a new
+  thread's or child's first run, which inherited events take. A
+  `cpu-clock` or `task-clock` event whose interrupts in a tick reach
+  `perf_event_max_sample_rate` over `HZ` is throttled until the next tick,
+  its count stopped meanwhile, with
   `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,
   ID and `stream_id`). It stops its group's other clocks too
   (`perf_event_throttle_group`): they leave that time out of their counts,
@@ -6485,7 +6536,9 @@ kernel.
   a signal between runs ends them (`EINTR`). `retval` is its result,
   `duration` the time a run took, and `data_out` the packet with its
   Ethernet header zeroed, as much as `data_size_out` takes (`ENOSPC`
-  after the sizes are written), its linear part first. A context
+  after the sizes are written), its linear part first. A copy out that
+  runs into a page the caller may not write writes up to it and is
+  `EFAULT`, with nothing written after it. A context
   (`struct __sk_buff`, in and out) gives `mark`, `priority`,
   `ingress_ifindex`, `ifindex`, `cb[]`, `wire_len`, `gso_segs` and
   `gso_size` and must have zeros elsewhere (`EINVAL`), and past its 192

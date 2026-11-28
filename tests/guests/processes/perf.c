@@ -2509,6 +2509,116 @@ static int case_side_band_comm(void) {
     return 0;
 }
 
+#define ATTR_CONTEXT_SWITCH (1ULL << 26)
+#define RECORD_SWITCH 14
+#define MISC_SWITCH_OUT (1 << 13)
+#define MISC_SWITCH_OUT_PREEMPT (1 << 14)
+
+/* The SWITCH records of one thread: its switches out as it went to sleep
+   and back in, each out followed by an in, and an in alone first for a
+   new thread's first run. A preemption (SWITCH_OUT_PREEMPT), which a busy
+   machine may make of any thread, and the in after it are left out. */
+struct switched {
+    uint32_t tid;
+    int out, in, started, in_order, sizes, preempted;
+    int seen, after_out;
+};
+
+struct switch_records {
+    pid_t pid;
+    struct switched threads[2];
+    int others;
+};
+
+static void see_switch(const uint64_t *record, void *with) {
+    struct switch_records *r = with;
+    uint32_t type = (uint32_t)record[0];
+    unsigned misc = (unsigned)(record[0] >> 32) & 0xffff;
+    uint64_t size = record[0] >> 48;
+    const uint32_t *writer = (const uint32_t *)((const char *)record + size - 8);
+    struct switched *t = NULL;
+    for (int i = 0; i < 2; i++)
+        if (r->threads[i].tid && writer[1] == r->threads[i].tid && writer[0] == (uint32_t)r->pid) t = &r->threads[i];
+    if (type != RECORD_SWITCH || !t) {
+        r->others++;
+        return;
+    }
+    if (size != 16) t->sizes = 0;
+    int first = !t->seen;
+    t->seen = 1;
+    if (misc & MISC_SWITCH_OUT) {
+        if (t->after_out) t->in_order = 0;
+        t->after_out = misc & MISC_SWITCH_OUT_PREEMPT ? 2 : 1;
+        if (t->after_out == 1) t->out++;
+        else t->preempted = 1;
+        return;
+    }
+    if (t->after_out == 1) t->in++;
+    else if (first && !t->after_out) t->started++;
+    else if (!t->after_out) t->in_order = 0;
+    t->after_out = 0;
+}
+
+static void say_switched(const char *what, const struct switched *t) {
+    say("%s: out %d in %d started %d in order %d sizes %d", what, t->out, t->in, t->started, t->in_order, t->sizes);
+}
+
+static volatile int sleeper_done;
+
+static void *sleeper(void *with) {
+    *(uint32_t *)with = (uint32_t)syscall(SYS_gettid);
+    struct timespec ms = {0, 1000000};
+    nanosleep(&ms, NULL);
+    nanosleep(&ms, NULL);
+    sleeper_done = 1;
+    return NULL;
+}
+
+/* PERF_RECORD_SWITCH of a thread's sleeps (context_switch): an event of
+   the thread takes its own and none of another thread's, and an
+   inherited one takes a new thread's too, its first run first. Pinned to
+   CPU 0, as the inherited event is of that CPU only: Linux maps no
+   buffer of an inherited event of every CPU. */
+static int case_side_band_switch(void) {
+    cpu_set_t first;
+    CPU_ZERO(&first);
+    CPU_SET(0, &first);
+    sched_setaffinity(0, sizeof first, &first);
+    struct switch_records own = {.pid = getpid()};
+    own.threads[0] = (struct switched){.tid = (uint32_t)syscall(SYS_gettid), .in_order = 1, .sizes = 1};
+    void *page, *inherited_page;
+    int fd = open_side_band(0, -1, ATTR_CONTEXT_SWITCH, &page);
+    int inherited = open_side_band(0, 0, ATTR_CONTEXT_SWITCH | INHERIT, &inherited_page);
+    say("open %d %d", fd >= 0, inherited >= 0);
+    if (fd < 0 || inherited < 0) return 1;
+    struct timespec ms = {0, 1000000};
+    ioctl(fd, IOC_ENABLE, 0);
+    for (int i = 0; i < 3; i++) nanosleep(&ms, NULL);
+    ioctl(fd, IOC_DISABLE, 0);
+    /* A sleep with the event disabled writes nothing. */
+    nanosleep(&ms, NULL);
+    uint64_t tail = 0;
+    each_record(page, &tail, see_switch, &own);
+    say_switched("own", &own.threads[0]);
+    say("own: others %d", own.others);
+    struct switch_records of_both = {.pid = getpid()};
+    of_both.threads[0] = (struct switched){.tid = own.threads[0].tid, .in_order = 1, .sizes = 1};
+    uint32_t new_tid = 0;
+    pthread_t thread;
+    ioctl(inherited, IOC_ENABLE, 0);
+    pthread_create(&thread, NULL, sleeper, &new_tid);
+    while (!sleeper_done) spin();
+    ioctl(inherited, IOC_DISABLE, 0);
+    pthread_join(thread, NULL);
+    of_both.threads[1] = (struct switched){.tid = new_tid, .in_order = 1, .sizes = 1};
+    tail = 0;
+    each_record(inherited_page, &tail, see_switch, &of_both);
+    say_switched("inherited, new thread", &of_both.threads[1]);
+    say_switched("inherited, leader", &of_both.threads[0]);
+    say("inherited: others %d", of_both.others);
+    return 0;
+}
+
 #define ATTR_NAMESPACES (1ULL << 28)
 #define RECORD_NAMESPACES 16
 
@@ -2708,6 +2818,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-clock-samples")) return case_clock_samples();
     if (!strcmp(mode, "perf-fault-signals")) return case_fault_signals();
     if (!strcmp(mode, "perf-side-band-namespaces")) return case_side_band_namespaces();
+    if (!strcmp(mode, "perf-side-band-switch")) return case_side_band_switch();
     if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {

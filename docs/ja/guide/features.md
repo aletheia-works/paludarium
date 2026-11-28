@@ -1717,12 +1717,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。知っている操作、登録、setup と
   `io_uring_enter` のフラグも Linux 7.0 のものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
-  `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
-  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
+  `epoll_ctl` をまとめるのに使います）と `_EPOLL_WAIT`、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
+  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`_READV_FIXED`、`_WRITEV_FIXED`、
+  `IORING_OP_FILES_UPDATE`、
   `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、ファイルの要求
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
-  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE` と
+  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`_PIPE`、`IORING_OP_SPLICE` と
   `_TEE`、それにソケットの要求
   `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` はこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
@@ -1986,7 +1987,31 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_NOP_FIXED_BUFFER` の NOP は、完了を投稿するまでバッファーを持ちます。失敗した登録は
   タグを投稿しません。`IORING_OP_READ_FIXED` と `_WRITE_FIXED` は、ファイルを
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
-  範囲がはみ出せば `EFAULT` です。
+  範囲がはみ出せば `EFAULT` です。`IORING_OP_READV_FIXED` と `_WRITEV_FIXED` は、エントリーを
+  準備するときに `iovec` を読みます（`kmalloc` が一度に場所を作れる 4 MiB 分より多ければ `ENOMEM`、
+  次に 1024 より多ければ `EINVAL`、`EFAULT`、負の長さは `EINVAL`）。ファイルと
+  バッファー（`EFAULT`）のあと、それらが取りうるページの断片の場所を作ります。断片はそれぞれの
+  4 KiB ページの数より 2 つ多く、`INT_MAX` を超えれば `EOVERFLOW`、`kmalloc` が一度に作れる
+  場所（16 バイトの断片で 4 MiB 分）を超えれば `ENOMEM` です。そのあと、どのバッファーも登録した
+  ものの中にあって 1 バイト以上なければならず（`EFAULT`）、合計は `MAX_RW_COUNT` までです
+  （`EINVAL`）。バイトは `readv` と `writev` と同じく転送します。
+
+- `IORING_OP_EPOLL_WAIT` は、`fd` が指す epoll のイベントを `len` 個まで `addr` に、
+  タイムアウトなしの `epoll_wait` と同じく取ります。`off`、`rw_flags`、`buf_index`、
+  `splice_fd_in` は 0 でなければならず（`EINVAL`）、次に、Linux の `ep_check_params` と同じく、
+  ファイル（`EBADF`）、1 から `INT_MAX / 12` までの個数（`EINVAL`）、イベントの場所が
+  ユーザー空間にあること（`EFAULT`）、epoll であること（`EINVAL`）を調べます。用意のできた
+  イベントがなければ、epoll が読めるようになるまで待ってから取ります。書けない場所は、
+  イベントの用意ができてから `EFAULT` です。取った個数を返します。
+
+- `IORING_OP_PIPE` は、`pipe_flags`（`O_CLOEXEC`、`O_NONBLOCK`、`O_DIRECT`。ほかのフラグや、
+  `fd`、`off`、`addr3` は `EINVAL`）で `pipe2` と同じくパイプを作り、両端の番号を `addr` に
+  書きます。`file_index` がなければ、空いている最も小さい 2 つの記述子です（`EMFILE`）。
+  あれば登録したスロットで、`O_CLOEXEC` は取れません（`EINVAL`）。
+  `IORING_FILE_INDEX_ALLOC` は、最後に取ったところから探して空いた 2 つを取り（`ENFILE`）、
+  スロットを指せばそれとその次を、それぞれ `IORING_OP_OPENAT` と同じく埋めます（`ENXIO`、
+  `EINVAL`）。2 つ目のスロットが失敗するか、番号を書けなければ（`EFAULT`）、記述子を返すか
+  スロットを空にします。
 
 - `IORING_SETUP_R_DISABLED` で作ったリングは、`IORING_REGISTER_ENABLE_RINGS` で有効にするまで
   `io_uring_enter` を断ります（`EBADFD`）。`IORING_SETUP_SINGLE_ISSUER` なら、有効にした
@@ -3667,7 +3692,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`getcpu`）は `emulate_vsyscall` と同じ動きをします。seccomp には入口のアドレスで
   その呼び出しが見え、トレーサーには `PTRACE_EVENT_SECCOMP` が届きますが、システム
   コールでの停止はありません。そのあと結果が `rax` に入り、スレッドは呼び出し元へ戻り、
-  ほかのレジスターは変わりません。ページのほかのアドレス、読めないスタック、呼び出しが
+  ほかのレジスターは変わりません。トレーサーがそこで呼び出しの番号を変えるか、スレッドを
+  動かすと、スレッドは `SIGSYS` で終わり、その動作は既定のまま `SA_IMMUTABLE` になります
+  （`force_exit_sig`）。ページのほかのアドレス、読めないスタック、呼び出しが
   書けないポインターはカーネルからの `SIGSEGV`（`SI_KERNEL`）で、ユーザー空間の外の
   ポインターはそのアドレスの `SEGV_MAPERR` です。外から読むと `EFAULT`
   （`process_vm_readv`）か `EIO`（`/proc/<pid>/mem`、`PTRACE_PEEKDATA`）です。
@@ -3934,6 +3961,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ポイントで、その `rmdir` と `rename` は `EBUSY`、`unlink` は `EISDIR`、それを作る呼び出しは
   `EEXIST` です。
 
+- `/proc` や `/dev` のディレクトリでないファイルの先へ、末尾のスラッシュやその後の名前で進む
+  パス（`/proc/self/status/`、`/proc/mounts/x`、`/dev/null/`、`/dev/stdin/x`）は、Linux の
+  パスの探索と同じく、それを探すどの呼び出しでも `ENOTDIR` です。途中のリンクはたどるので、
+  ディレクトリへのリンクの先へは進めます。最後の名前を作る、消す呼び出しはその前の名前だけを
+  調べ、上のその呼び出し自身のエラーはそのあとです。
+
 - `/proc` は、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。ファイルシステムがそこに持つもの
   （`--mount /:/` ではホストの項目）は並べません。`ps`、`pgrep`、`pidof` が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
@@ -4000,7 +4033,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、Linux が動いていない
   タスクをそう見せるのと同じく、スレッドが待ちで眠っている間（パイプ、futex、タイマーなど
-  何を待っていても）は `S (sleeping)`、それ以外は `R` です。待たないシステムコールの中に
+  何を待っていても）は `S (sleeping)` です。ただし、Linux のタスクが `TASK_KILLABLE` で眠る
+  待ち（子を待つ `vfork` の親、fanotify のリスナーの答えを待つ open、userfaultfd の
+  イベントが読まれるのを待つタスク、`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` で kill だけで
+  終わるようになった seccomp の通知の待ち）では `D (disk sleep)` です。それ以外は `R` です。待たないシステムコールの中に
   いる間も `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
   持ちません。Linux と同じく、`cmdline`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。
@@ -5196,6 +5232,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>/ns` のファイルそれぞれのデバイスと inode を含みます。新しいスレッドや子のものは
   作ったスレッドが書きます。スレッドのものは、成功した `unshare` のたびに（新しい名前空間が
   なくても）、また `setns` のたびに書きます。
+  `context_switch` では、スレッドが眠るたびに `PERF_RECORD_SWITCH`（CPU のイベントには、
+  代わりに動いたスレッドを含む `SWITCH_CPU_WIDE`）を書きます。
+  `PERF_RECORD_MISC_SWITCH_OUT` の付いたものと、ふたたび動くときの付かないものの二つです。
+  新しいスレッドや子が初めて動くときには、付かないものを一つだけ書き、
+  継承したイベントがそれを受け取ります。
   `cpu-clock` と `task-clock` のイベントは、ティックの割り込みが
   `perf_event_max_sample_rate` を `HZ` で割った数に届くと次のティックまで抑えられ、
   そのあいだは数えません。グループのリーダーの `PERF_RECORD_THROTTLE` と `UNTHROTTLE`
@@ -5526,6 +5567,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変えられます。回の間にシグナルが来ると終わります（`EINTR`）。`retval` は結果、`duration` は
   1 回にかかった時間、`data_out` は Ethernet ヘッダーをゼロにしたパケットで、`data_size_out`
   に入る分だけ、リニア部から書きます（入らなければ大きさを書いたあとで `ENOSPC`）。
+  書き出しが呼び出し側の書けないページに当たると、そのページの手前まで書いて `EFAULT` になり、
+  その後は何も書きません。
   コンテキスト（`struct __sk_buff`、入出力）は `mark`、`priority`、`ingress_ifindex`、
   `ifindex`、`cb[]`、`wire_len`、`gso_segs`、`gso_size` を渡し、ほかの場所は 0 でなければ
   ならず（`EINVAL`）、192 バイトより後ろも 0 でなければなりません（`E2BIG`）。返ってくるのは

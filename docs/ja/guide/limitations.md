@@ -175,8 +175,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `status` は、それを `voluntary_ctxt_switches` として示し、`nonvoluntary_ctxt_switches` は
   0 です。`getrusage` と wait の rusage も同じく `ru_nvcsw` に示し、`ru_nivcsw` は 0 です。
   ピン留めしたページ（`pinned_vm`）とページテーブルのバイト数は何も数えないので、`status` には
-  `VmPin` と `VmPTE` がありません。ほかのプロセスのスレッドは、どの待ちでも
-  `S (sleeping)` です。Linux は割り込めない待ちの一部を `D (disk sleep)` と見せます。スレッドが
+  `VmPin` と `VmPTE` がありません。ほかのプロセスのスレッドが
+  `D (disk sleep)` になるのは、paludarium にある、Linux が `TASK_KILLABLE` にする待ち（機能を
+  参照）の中だけで、ほかの待ちではすべて `S (sleeping)` です。Linux は割り込めないロック
+  （パイプのミューテックス。ここのスレッドはこれを取る間、眠っていると見せません）や
+  I/O の待ちも `D` と見せます。スレッドが
   ほかのプロセスに見せるのは最後のシステムコールかシグナルの確認で公開したものなので、
   呼び出しの間だけ変えたマスク（`rt_sigsuspend`、`ppoll`）は、スレッドがその中で停止している
   間しか見えません。メモリーの残っていないタスク（ゾンビや、ほかのスレッドより先に
@@ -377,7 +380,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ものとしてビルド ID を読みます。Linux は読んでいないか追い出したページからは与えません。
   ホストが始められなかったスレッドには `FORK` と `EXIT` の記録を書き、
   `EXIT` は CPU 0 のものとします。Linux の失敗した `clone` はどちらも書きません。
-  `CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、`SWITCH`、
+  スレッドが CPU を離れるのは眠るときだけで、横取りされることはありません
+  （`PERF_RECORD_MISC_SWITCH_OUT_PREEMPT`）。眠りの `SWITCH` の記録は二つとも
+  スレッドがふたたび動くときに書き、一つ目の時刻は目覚めたときのものです。Linux は
+  スレッドが眠るときに書きます。眠りは、スレッドが最後にシステムコールを呼んだときか時計を
+  読んだときの CPU のものとします。そのあと眠るまでのあいだにほかのスレッドの
+  `sched_setaffinity` が移しても、CPU を離れる記録は前の CPU に書きます。
+  CPU のイベントが受け取るのはゲストのスレッドの切り替えだけで、
+  代わりに動いたスレッドはどれもアイドルのタスク（0）とします。
+  `CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、
   `AUX` の記録は書きません。
   `REFRESH` の最後のオーバーフローがイベントを無効にするとき、数えるのはそこで止まりますが、
   その時間（時計のものを除きます）と、グループのほかのイベントは、そのときまで
@@ -540,12 +551,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   直すのは呼んだスレッドだけで、Linux はアドレス空間のすべてのスレッドで読み込み直します。
   null のセレクタは `%fs` と `%gs` のベースを消しますが、Zen 2 より前の AMD の CPU は
   ベースを残します。
-- **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
+- **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、`_EPOLL_WAIT`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
-  `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
+  `_READV_FIXED`、`_WRITEV_FIXED`、`IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
-  `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
+  `_LINKAT`、`_FTRUNCATE`、`_PIPE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
   だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、
   受信のバンドル（`IORING_RECVSEND_BUNDLE`）と、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません
   （`EINVAL`）。送信が選ぶバッファーは Linux master に合わせます。差分テストのランナーのカーネルは、
@@ -963,6 +974,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Rust のランタイムが `SIGPIPE` を無視するため、無視した状態で渡されたかどうかがわかりません。
   Linux では、`SIGPIPE` を無視して起動したプログラムは無視したままです。WebAssembly では、
   無視した状態で始めるシグナルはありません。
+- **通知パイプ**：ウォッチキューはないので、`O_NOTIFICATION_PIPE` を付けた `pipe2` と
+  io_uring の `IORING_OP_PIPE` は `EINVAL` です。`CONFIG_WATCH_QUEUE` 付きでビルドした Linux は、
+  鍵とデバイスの通知が投稿されるパイプを作ります。
 - **シグナル駆動の入出力**：ホストの標準入力は 10 ms ごとに見るので、何もなかったところに
   入力が来るたびに `SIGIO` を 1 回送ります。Linux のパイプや端末は、入力のひとまとまりごとに
   送ります。標準出力と標準エラーも同じように見て、いっぱいだったところに空きができる

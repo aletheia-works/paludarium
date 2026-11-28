@@ -1624,6 +1624,7 @@ fn lookup(
             .map_or(p, |(file, _)| file),
         false => p,
     };
+    generated_directories_on_the_way(c, &p, true)?;
     let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
     Ok((p, found))
 }
@@ -2054,6 +2055,7 @@ fn read_link(c: &mut Context<'_>, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
     // `/proc/self` is a link to this process's directory, and each
     // entry of its `fd` to a descriptor's file.
     let p = crate::devices::through_link(&p).unwrap_or(p);
+    generated_directories_on_the_way(c, &p, true)?;
     Ok(if p == b"/proc/self" {
         c.process.pid.to_string().into_bytes()
     } else if let Some(path) = task_path(c, &p) {
@@ -3035,7 +3037,7 @@ fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (p, _) = lookup_linked(c, a[0], raw, follow)?;
     chown_path(c, &p, follow, a[2], a[3])
 }
-fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
+pub(crate) fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
 }
 /// Linux's largest single read or write (`MAX_RW_COUNT`).
@@ -3733,6 +3735,56 @@ pub(crate) fn iovecs(
         .map_err(|_| Errno::EFAULT)
     })
 }
+/// The two ends of a new pipe, as `create_pipe_files` makes them for
+/// `pipe2` and io_uring's `IORING_OP_PIPE`: `O_NONBLOCK` on both, packets
+/// with `O_DIRECT`, no larger to start than `fs.pipe-max-size` allows, owned
+/// by the caller's file system IDs. There are no
+/// watch queues, so a notification pipe (`O_NOTIFICATION_PIPE`) is `EINVAL`,
+/// a limitation the guide lists.
+pub(crate) fn new_pipe(c: &Context<'_>, flags: u32) -> Result<[Arc<dyn FileHandle>; 2], Errno> {
+    if flags & O_NOTIFICATION_PIPE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let ends = crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
+    let creds = &c.process.credentials;
+    ends[0].start_within(
+        c.processes.sysctls.pipe_max_size(),
+        creds.capable(crate::credentials::CAP_SYS_RESOURCE),
+    );
+    ends[0].set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
+    Ok(ends.map(|end| end as Arc<dyn FileHandle>))
+}
+/// The `count` entries of the `struct iovec` array at `at`, as
+/// `iovec_from_user` reads them: none for no entries, more than
+/// `UIO_MAXIOV` (1024) `EINVAL`, an array outside the user half or not
+/// mapped `EFAULT`, and a negative length `EINVAL`, in order. The buffers
+/// are not looked at.
+pub(crate) fn iovec_entries(
+    mem: &AddressSpace,
+    at: u64,
+    count: u64,
+) -> Result<Vec<(u64, u64)>, Errno> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    crate::sockets::access_ok(at, (count * 16) as usize)?;
+    (0..count)
+        .map(|index| {
+            let addr = at + index * 16;
+            let base = mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
+            let length = mem
+                .read_u64(GuestAddr(addr + 8))
+                .map_err(|_| Errno::EFAULT)?;
+            if (length as i64) < 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok((base, length))
+        })
+        .collect()
+}
 /// The `struct iovec` array at `at`, in Linux's `import_iovec` order: none
 /// for no entries; more than 1024 are EINVAL; the array must lie in the user
 /// half (EFAULT); then every entry is read (EFAULT) and a negative length is
@@ -3747,25 +3799,7 @@ pub(crate) fn iovecs_checked(
     count: u64,
     check: impl Fn(u64, usize) -> Result<(), Errno>,
 ) -> Result<Vec<(u64, usize)>, Errno> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    if count > 1024 {
-        return Err(Errno::EINVAL);
-    }
-    crate::sockets::access_ok(at, (count * 16) as usize)?;
-    let mut entries = Vec::with_capacity(count as usize);
-    for index in 0..count {
-        let addr = at + index * 16;
-        let base = mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
-        let length = mem
-            .read_u64(GuestAddr(addr + 8))
-            .map_err(|_| Errno::EFAULT)?;
-        if (length as i64) < 0 {
-            return Err(Errno::EINVAL);
-        }
-        entries.push((base, length));
-    }
+    let entries = iovec_entries(mem, at, count)?;
     // The lengths stay 64-bit until they are cut, as `usize` is 32 bits in
     // WebAssembly.
     let mut segments = Vec::with_capacity(entries.len());
@@ -3784,23 +3818,25 @@ pub(crate) fn iovecs_checked(
 }
 /// The memory an aio or io_uring transfer moves bytes to or from: the
 /// program's, at the addresses of `segments` as they are mapped at the
-/// time, or `len` bytes from `at` of a registered buffer's pinned pages
-/// ([`paludarium_mmu::Pinned`]), whatever maps them now.
+/// time, or pieces of a registered buffer's pinned pages
+/// ([`paludarium_mmu::Pinned`]), whatever maps them now: each piece is an
+/// offset into the pages and a length, in order.
 #[derive(Clone, Copy)]
 pub(crate) enum Memory<'a> {
     Guest(&'a [(u64, usize)]),
     Pinned {
         pages: &'a paludarium_mmu::Pinned,
-        at: usize,
-        len: usize,
+        pieces: &'a [(u64, usize)],
     },
 }
 
 impl Memory<'_> {
     fn total(&self) -> usize {
         match self {
-            Memory::Guest(segments) => segments.iter().map(|&(_, length)| length).sum(),
-            Memory::Pinned { len, .. } => *len,
+            Memory::Guest(segments)
+            | Memory::Pinned {
+                pieces: segments, ..
+            } => segments.iter().map(|&(_, length)| length).sum(),
         }
     }
     /// Checks that the first `len` bytes may be written (`EFAULT`), which
@@ -3813,48 +3849,51 @@ impl Memory<'_> {
     }
     /// Stores `bytes` from its byte `at` on; whether all of them were.
     pub(crate) fn store(&self, mem: &AddressSpace, at: usize, bytes: &[u8]) -> bool {
-        match self {
+        let mut done = 0;
+        let all = match self {
             Memory::Guest(segments) => {
-                let mut done = 0;
                 crate::sockets::spans(segments, at, bytes.len()).all(|(to, n)| {
                     let piece = &bytes[done..done + n];
                     done += n;
                     mem.write(to, piece).is_ok()
-                }) && done == bytes.len()
+                })
             }
-            Memory::Pinned {
-                pages, at: from, ..
-            } => {
-                pages.write(from + at, bytes);
+            Memory::Pinned { pages, pieces } => {
+                for (to, n) in crate::sockets::spans(pieces, at, bytes.len()) {
+                    pages.write(to.0 as usize, &bytes[done..done + n]);
+                    done += n;
+                }
                 true
             }
-        }
+        };
+        all && done == bytes.len()
     }
     /// Loads `bytes` from its byte `at` on; whether all of them were.
     pub(crate) fn load(&self, mem: &AddressSpace, at: usize, bytes: &mut [u8]) -> bool {
-        match self {
-            Memory::Guest(segments) => {
-                let (mut done, len) = (0, bytes.len());
-                crate::sockets::spans(segments, at, len).all(|(from, n)| {
-                    let piece = &mut bytes[done..done + n];
+        let (mut done, len) = (0, bytes.len());
+        let all = match self {
+            Memory::Guest(segments) => crate::sockets::spans(segments, at, len).all(|(from, n)| {
+                let piece = &mut bytes[done..done + n];
+                done += n;
+                mem.read(from, piece).is_ok()
+            }),
+            Memory::Pinned { pages, pieces } => {
+                for (from, n) in crate::sockets::spans(pieces, at, len) {
+                    pages.read(from.0 as usize, &mut bytes[done..done + n]);
                     done += n;
-                    mem.read(from, piece).is_ok()
-                }) && done == len
-            }
-            Memory::Pinned {
-                pages, at: from, ..
-            } => {
-                pages.read(from + at, bytes);
+                }
                 true
             }
-        }
+        };
+        all && done == len
     }
     /// Stores `bytes` from the start.
     fn scatter(&self, c: &Context<'_>, bytes: &[u8]) -> Result<(), Errno> {
         match self {
             Memory::Guest(segments) => scatter(c, segments, bytes),
-            Memory::Pinned { pages, at, len } => {
-                pages.write(*at, &bytes[..bytes.len().min(*len)]);
+            Memory::Pinned { .. } => {
+                let bytes = &bytes[..bytes.len().min(self.total())];
+                self.store(c.mem, 0, bytes);
                 Ok(())
             }
         }
@@ -3872,10 +3911,10 @@ impl Memory<'_> {
                         .map_err(|_| Errno::EFAULT)?;
                 }
             }
-            Memory::Pinned { pages, at, len } => {
+            Memory::Pinned { .. } => {
                 let start = bytes.len();
-                bytes.resize(start + len, 0);
-                pages.read(*at, &mut bytes[start..]);
+                bytes.resize(start + self.total(), 0);
+                self.load(c.mem, 0, &mut bytes[start..]);
             }
         }
         Ok(())
@@ -5797,15 +5836,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.mem
                 .check_write(GuestAddr(a[0]), 8)
                 .map_err(|_| Errno::EFAULT)?;
-            let ends = crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
-            let creds = &c.process.credentials;
-            ends[0].start_within(
-                c.processes.sysctls.pipe_max_size(),
-                creds.capable(crate::credentials::CAP_SYS_RESOURCE),
-            );
-            ends[0].set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
             let [first, second] = c.files.install_pair(
-                ends.map(|end| end as Arc<dyn FileHandle>),
+                new_pipe(c, flags)?,
                 flags & crate::events::CLOEXEC != 0,
                 c.group.nofile(),
             )?;
@@ -7200,6 +7232,8 @@ pub(crate) struct StandardFile {
 }
 /// `O_DIRECT`.
 pub(crate) const O_DIRECT: u32 = 0o40000;
+/// `O_NOTIFICATION_PIPE`, which is `O_EXCL`.
+const O_NOTIFICATION_PIPE: u32 = 0o200;
 /// `O_NOATIME`.
 pub(crate) const O_NOATIME: u32 = 0o1000000;
 /// Whether an open file description has Linux's `FMODE_CAN_ODIRECT`,
@@ -8273,10 +8307,12 @@ fn open_path(
     flags: u32,
     mode: u32,
 ) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
+    const O_CREAT: u32 = 0o100;
     const O_NOFOLLOW: u32 = 0o400000;
     if let Some(target) = crate::devices::through_link(p) {
         return open_path(c, &target, flags, mode);
     }
+    generated_directories_on_the_way(c, p, flags & O_CREAT == 0)?;
     if flags & (O_PATH | O_NOFOLLOW) == O_PATH | O_NOFOLLOW
         && let Some(link) = LinkPath::of(c, p)?
     {
@@ -8602,8 +8638,6 @@ fn open_path(
         }
     } else if let Some(entry) = crate::sysctl::entry(c, p) {
         crate::sysctl::open(c, entry, flags)?
-    } else if crate::proc::below_system_entry(p) {
-        return Err(Errno::ENOTDIR);
     } else if crate::proc::is_sysvipc(p) {
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
@@ -9297,6 +9331,7 @@ pub(crate) fn exec_jumped(
     let through = through_magic_links(c, raw.to_vec())?;
     let mut jumped = through != raw;
     let mut p = c.files.path(dir, through)?;
+    generated_directories_on_the_way(c, &p, true)?;
     for _ in 0..40 {
         if !generated(&p) && p != b"/proc" {
             let Err(error) = c.files.fs().metadata(&p, follow) else {
@@ -9810,6 +9845,50 @@ fn generated_stat(
     path: &[u8],
     follow: bool,
 ) -> Result<Option<(FileStat, u64, u32)>, Errno> {
+    generated_directories_on_the_way(c, path, true)?;
+    generated_stat_of_last(c, path, follow)
+}
+/// `ENOTDIR` when a name before `path`'s last one is a file paludarium
+/// makes that is not a directory, its link followed as the walk to the
+/// last name follows each one: Linux's walk asks every name it goes on
+/// from to be a directory it can look in. With `slash`, the last name
+/// before a trailing slash counts too, as a call that goes on to the file
+/// asks it to be a directory (a trailing slash follows a link even without
+/// `follow`); an open that may make the last name leaves that to its own
+/// lookup (`EISDIR`). A name on the way that is not there, or an error
+/// finding it (a task that has ended), is left to the last name's lookup,
+/// which reports it as the walk would.
+fn generated_directories_on_the_way(
+    c: &Context<'_>,
+    path: &[u8],
+    slash: bool,
+) -> Result<(), Errno> {
+    const DIRECTORY: u32 = 0o040000;
+    let end = if slash {
+        path.len()
+    } else {
+        path.iter().rposition(|&b| b != b'/').map_or(0, |at| at + 1)
+    };
+    for at in (1..end).filter(|&at| path[at] == b'/' && path[at - 1] != b'/') {
+        let before = &path[..at];
+        if !generated(before) {
+            continue;
+        }
+        if let Ok(Some((stat, ..))) = generated_stat_of_last(c, before, true)
+            && stat.mode & 0o170000 != DIRECTORY
+        {
+            return Err(Errno::ENOTDIR);
+        }
+    }
+    Ok(())
+}
+/// [`generated_stat`] of `path`'s last name, the names before it taken to
+/// be directories.
+fn generated_stat_of_last(
+    c: &Context<'_>,
+    path: &[u8],
+    follow: bool,
+) -> Result<Option<(FileStat, u64, u32)>, Errno> {
     // Under another process's directory or `task`: ENOENT for what is not
     // there, rather than whatever a mounted directory holds at the path.
     if let Some(task_path) = task_path(c, path) {
@@ -9871,7 +9950,6 @@ fn known_stat(
             device(c, path),
             BLOCK_SIZE,
         ))),
-        None if crate::proc::below_system_entry(path) => Err(Errno::ENOTDIR),
         None => Ok(other_generated_stat(c, path, follow)),
     }
 }

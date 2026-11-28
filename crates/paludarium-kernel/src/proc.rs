@@ -499,13 +499,6 @@ pub(crate) fn system_entry(path: &[u8]) -> Option<SystemEntry> {
         },
     }
 }
-/// Whether `path` goes on past a system-wide file, as `/proc/loadavg/` or
-/// `/proc/sysvipc/msg/x` do, which Linux's walk finds `ENOTDIR`.
-pub(crate) fn below_system_entry(path: &[u8]) -> bool {
-    path.iter()
-        .enumerate()
-        .any(|(at, &byte)| byte == b'/' && system_entry(&path[..at]).is_some())
-}
 /// Whether `path` is `/proc/sysvipc`, the directory of the System V IPC
 /// files, which Linux's `ipc_init` makes.
 pub(crate) fn is_sysvipc(path: &[u8]) -> bool {
@@ -3529,7 +3522,6 @@ mod generated_tests {
         assert_eq!(system_entry(b"/proc/swaps"), Some(SystemEntry::Swaps));
         assert_eq!(system_entry(b"/proc/version"), Some(SystemEntry::Version));
         assert_eq!(system_entry(b"/proc/self/version"), None);
-        assert!(below_system_entry(b"/proc/version/x"));
     }
     #[test]
     fn stat_has_linux_s_52_fields_after_the_name() {

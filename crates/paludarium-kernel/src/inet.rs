@@ -782,7 +782,7 @@ impl Network {
             bound: 0,
             port: None,
             packet: error,
-            l4_hash: if error { flow.l4_hash } else { 0 },
+            socket_hash: if error { flow.socket_hash } else { 0 },
         };
         let back = self.back4(&there, from, to, &answer, now);
         Self::answered(there, flow, answer.oif, back)
@@ -1488,7 +1488,7 @@ impl Network {
             bound: 0,
             port: None,
             packet: keys.packet,
-            l4_hash: keys.l4_hash,
+            socket_hash: keys.socket_hash,
         };
         let _ = self.reach(answer.index, to, from, &flow, now);
     }
@@ -2264,14 +2264,14 @@ struct Flow {
     /// it tells of (`icmp_route_lookup`), and the flow hash its packets
     /// carry: the socket's (`sk_txhash`), 0 for none.
     packet: bool,
-    l4_hash: u32,
+    socket_hash: u32,
 }
 impl Flow {
     /// The keys of its hash besides its addresses.
     fn keys(&self) -> crate::multipath::Flow {
         crate::multipath::Flow {
             packet: self.packet,
-            l4_hash: self.l4_hash,
+            socket_hash: self.socket_hash,
             ..crate::multipath::Flow::socket(self.proto, self.sport, self.dport)
         }
     }
@@ -3608,7 +3608,7 @@ impl InetSocket {
             bound: options.device,
             port: None,
             packet: false,
-            l4_hash: s.txhash,
+            socket_hash: s.txhash,
         };
         // A connected socket's send takes the route it keeps, if that holds,
         // or keeps the one it looks up (`ip6_sk_dst_lookup_flow`): but one to
@@ -3797,7 +3797,7 @@ impl InetSocket {
                 } else {
                     crate::multipath::Flow {
                         packet: true,
-                        l4_hash: flow.l4_hash,
+                        socket_hash: flow.socket_hash,
                         ..crate::multipath::Flow::socket(FLOW_UDP, from.port(), to.port())
                     }
                 };
@@ -4926,7 +4926,7 @@ impl InetSocket {
             bound: options.device,
             port: Some(to.port()),
             packet: false,
-            l4_hash: 0,
+            socket_hash: 0,
         };
         let failing = match self
             .network

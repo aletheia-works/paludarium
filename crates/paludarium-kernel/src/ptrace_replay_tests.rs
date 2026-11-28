@@ -1,5 +1,6 @@
 //! Cases of `tests/guests/processes/ptrace.c`, `ptrace-syscalls.c`,
-//! `ptrace-requests.c` and `single-step.c`, replayed through the kernel's
+//! `ptrace-requests.c` and `single-step.c`, and `sa-immutable.c`'s
+//! `vsyscall-immutable`, replayed through the kernel's
 //! system calls: the tracer on the test's thread, the tracee on a thread of
 //! its own, as a guest's tasks run, each system call followed by the
 //! checkpoint the runtime takes before guest code runs again. The expected
@@ -8,7 +9,8 @@
 //! `ptrace-tracer-exit` as printed on Linux 7.0 (x86-64, Ubuntu 26.04
 //! runner); for those three, the `ptrace-syscalls.c`, `ptrace-requests.c` and `single-step.c` cases as the
 //! guest prints them under the emulator, which `diff_processes` finds equal
-//! to Linux's. It still compares the whole guests with Linux on every CI
+//! to Linux's; the `vsyscall-immutable` replay prints lines of its own for
+//! what the guest checks. It still compares the whole guests with Linux on every CI
 //! run. What only the CPU does (a signal handler's body, the check a tracee
 //! makes after it resumes, the trap after each instruction a stepped
 //! tracee runs) is done here in Rust from the state the kernel left, or its
@@ -2012,6 +2014,115 @@ message=0x7 nr=102 rax=-38 info-size=84 op=3 info-nr=102 ret-data=0x7
 seccomp: stopped=1 signal=5 event=7
 message=0x42 nr=110 rax=-38 info-size=84 op=3 info-nr=110 ret-data=0x42
 exit=15",
+    );
+}
+
+/// `vsyscall-immutable` (`sa-immutable.c`): a tracer that changes the
+/// number of a `vsyscall` entry's call at its seccomp stop, or moves the
+/// thread from the entry, ends the tracee with SIGSYS, its action at its
+/// default and SA_IMMUTABLE: no handler runs and the tracer sees no
+/// signal-delivery stop. The guest's CLONE_SIGHAND sharer, which then
+/// finds SIGSYS's action immutable, is left out; the actions are read here
+/// instead.
+#[test]
+fn vsyscall_number_changed() {
+    vsyscall_changed(ORIG_RAX, GETPID);
+}
+#[test]
+fn vsyscall_moved() {
+    vsyscall_changed(RIP, crate::vsyscall::START);
+}
+/// The tracer writes `value` to the register at `field` at the stop.
+fn vsyscall_changed(field: u64, value: u64) {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        // time traced, the rest allowed.
+        let (fprog, code) = (HEAP + 0xe00, HEAP + 0xe40);
+        let filter: [(u16, u8, u8, u32); 4] = [
+            (0x20, 0, 0, 0),
+            (0x15, 0, 1, 201),
+            (0x06, 0, 0, 0x7ff0_0000),
+            (0x06, 0, 0, 0x7fff_0000),
+        ];
+        for (i, (op, jt, jf, k)) in filter.into_iter().enumerate() {
+            let at = code + i as u64 * 8;
+            let mut insn = [0u8; 8];
+            insn[..2].copy_from_slice(&op.to_le_bytes());
+            insn[2] = jt;
+            insn[3] = jf;
+            insn[4..].copy_from_slice(&k.to_le_bytes());
+            c.m.write(GuestAddr(at), &insn).unwrap();
+        }
+        c.m.write_u64(GuestAddr(fprog), filter.len() as u64)
+            .unwrap();
+        c.m.write_u64(GuestAddr(fprog + 8), code).unwrap();
+        c.catch(31, 0);
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        c.raise(SIGSTOP, &mut |_, _, _| None).unwrap();
+        assert_eq!(c.sys(PRCTL, [38, 1, 0, 0, 0, 0]), Ok(0));
+        assert_eq!(c.sys(SECCOMP, [1, 0, fprog, 0, 0, 0]), Ok(0));
+        // A call to the time entry from CODE, with a null pointer.
+        let stack = HEAP + 0xd00;
+        c.m.write_u64(GuestAddr(stack), CODE).unwrap();
+        c.t.cpu.gpr[reg::RSP] = stack;
+        c.t.cpu.gpr[reg::RDI] = 0;
+        let rip = GuestAddr(crate::vsyscall::START + 0x400);
+        c.t.cpu.rip = rip;
+        let reason = ExitReason::PageFault {
+            rip,
+            addr: rip,
+            write: false,
+            fetch: true,
+            mapped: false,
+            present: false,
+        };
+        let status = match c.k.handle(&mut c.t, &c.m, reason) {
+            Next::Exit(status) => status,
+            _ => match c.settle() {
+                Err(status) => status,
+                Ok(()) => panic!("the call went on at {:#x}", c.t.cpu.rip.0),
+            },
+        };
+        let actions = c.k.group.shared_actions();
+        let sigsys = actions.lock().unwrap()[&31];
+        assert_eq!(
+            (
+                sigsys.handler,
+                sigsys.flags & crate::signals::SA_IMMUTABLE != 0
+            ),
+            (0, true)
+        );
+        status
+    });
+    let status = g.wait(child, 0);
+    g.show("stop", status);
+    let r = g.pt(SETOPTIONS, child, 0, O_TRACESECCOMP);
+    g.say("options", r);
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, 0);
+    g.show("seccomp", status);
+    let (_, regs) = g.regs(child);
+    let (nr, rip) = (g.reg(regs, ORIG_RAX), g.reg(regs, RIP));
+    g.lines.push(format!(
+        "nr={nr} at-entry={}",
+        i32::from(rip == crate::vsyscall::START + 0x400)
+    ));
+    g.m.write_u64(GuestAddr(regs + field), value).unwrap();
+    let r = g.pt(SETREGS, child, 0, regs);
+    g.say("changed", r);
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, 0);
+    thread.join().unwrap();
+    g.show("then", status);
+    g.say("signal", status & 0x7f);
+    g.check(
+        "stop: stopped=1 signal=19 event=0
+options=0
+seccomp: stopped=1 signal=5 event=7
+nr=201 at-entry=1
+changed=0
+then: stopped=0 signal=-1 event=0
+signal=31",
     );
 }
 

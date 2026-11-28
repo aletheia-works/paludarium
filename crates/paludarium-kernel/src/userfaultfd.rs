@@ -1440,6 +1440,7 @@ fn wait_read(
     }
     context.hub.changed();
     let _sleeps = c.inbox.tif().sleep_killable();
+    let _shown = c.inbox.tif().sleep_uninterruptible();
     loop {
         let ticket = c.files.readiness.token.value();
         if event.done.load(Ordering::SeqCst)

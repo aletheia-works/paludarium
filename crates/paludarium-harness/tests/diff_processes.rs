@@ -653,6 +653,8 @@ mod linux {
         // Its events of the kernel and of CPUs need CAP_PERFMON.
         perf_side_band_namespaces => ("perf-side-band-namespaces", "perf", root),
         // Its events of the kernel and of CPUs need CAP_PERFMON.
+        perf_side_band_switch => ("perf-side-band-switch", "perf", root),
+        // Its events of the kernel and of CPUs need CAP_PERFMON.
         perf_software => ("perf-software", "perf", root),
         // Its events need CAP_PERFMON, and it writes a sysctl.
         perf_throttle => ("perf-throttle", "perf", root),
@@ -768,6 +770,7 @@ mod linux {
         processes_futex_wake_op => ("futex-wake-op", "process"),
         processes_generated_binds => ("generated-binds", "process"),
         processes_generated_changes => ("generated-changes", "process"),
+        processes_generated_enotdir => ("generated-enotdir", "process"),
         processes_generated_link_names => ("generated-link-names", "process"),
         // Makes, removes and renames names in /proc as root, then becomes nobody.
         processes_generated_name_errors => ("generated-name-errors", "process", root),
@@ -1128,6 +1131,7 @@ mod linux {
         processes_vma_merges => ("vma-merges", "process"),
         processes_vma_names => ("vma-names", "process"),
         processes_vsyscall_entries => ("vsyscall-entries", "process"),
+        processes_vsyscall_immutable => ("vsyscall-immutable", "sa-immutable"),
         processes_waitid => ("waitid", "process"),
         processes_wnohang => ("wnohang", "process"),
         processes_x87 => ("x87", "process"),
@@ -1305,6 +1309,7 @@ mod linux {
         veth_use_neigh => ("veth-use-neigh", "veth-use-neigh", root),
         vfork_exec => ("vfork-exec", "process"),
         vfork_exit => ("vfork-exit", "process"),
+        vfork_state => ("vfork-state", "process"),
         wait_any => ("wait-any", "process"),
         wait_fault => ("wait-fault", "process"),
         wait_interrupt => ("wait-interrupt", "process"),

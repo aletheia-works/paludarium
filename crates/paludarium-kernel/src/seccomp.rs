@@ -1051,6 +1051,8 @@ pub(crate) fn notify(c: &mut Context<'_>, notify: &Notify) -> Reply {
             if fatal_pending(c) {
                 break true;
             }
+            // `wait_for_completion_killable`.
+            let _shown = c.inbox.tif().sleep_uninterruptible();
             wait_through_signals(c, ticket);
         } else if crate::events::wait(c, ticket, None).is_err() {
             // A wait that has become killable meanwhile goes on.

@@ -786,6 +786,195 @@ mod tests {
         assert!(taken >= 8_000, "{taken}");
     }
 
+    /// FNV-1a over `bytes`, folded into `hash`.
+    fn fnv(hash: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *hash ^= u64::from(b);
+            *hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    /// `count` programs of up to `max_len` instructions from `seed`, most of
+    /// them ones the checks take: every code, each with a `k` that is valid
+    /// for it, jumps that stay in the program, scratch words that are often
+    /// read and, in seven programs of eight, written first, and, `far` times
+    /// in eight, a load that converts to 16 instructions, so that jumps go
+    /// far. One program in eight has one instruction that may be refused.
+    fn programs(seed: u64, count: usize, max_len: usize, far: u64) -> Vec<Vec<SockFilter>> {
+        let mut seed = seed;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let codes: Vec<u16> = (0..=u16::from(u8::MAX)).filter(|&c| allowed(c)).collect();
+        const EDGES: [u32; 16] = [
+            0,
+            1,
+            2,
+            3,
+            4,
+            15,
+            16,
+            31,
+            32,
+            39,
+            40,
+            0x7fff,
+            0x8000,
+            0xffef_ffff,
+            0x8000_0000,
+            u32::MAX,
+        ];
+        (0..count)
+            .map(|_| {
+                let len = 1 + next() as usize % max_len;
+                let shape = next();
+                let wild_at = shape.is_multiple_of(8).then(|| (shape >> 8) as usize % len);
+                let stores = shape >> 4 & 7 != 0;
+                (0..len)
+                    .map(|i| {
+                        let r = next();
+                        let left = (len - i - 1) as u64;
+                        let wild = wild_at == Some(i);
+                        if stores && i < 4 && i + 1 < len {
+                            return f(ST, 0, 0, i as u32);
+                        }
+                        let mut code = codes[r as usize % codes.len()];
+                        if wild && r & 0x100 != 0 {
+                            code = (r >> 16) as u16 & 0xff;
+                        } else if r >> 56 & 7 < 2 {
+                            code = [ST, STX, LD | MEM, LDX | MEM][(r >> 4) as usize % 4];
+                        } else if (r >> 20) % 8 < far {
+                            return f(LD | W | ABS, 0, 0, 40_000);
+                        }
+                        if i == len - 1 && !wild {
+                            code = if r & 1 == 0 { RET | K } else { RET | RET_A };
+                        }
+                        let any = (r >> 24) as u32;
+                        let k = if wild {
+                            EDGES[(r >> 24) as usize % EDGES.len()]
+                        } else {
+                            match code {
+                                c if c == ST || c == STX || c == LD | MEM || c == LDX | MEM => {
+                                    any % 4
+                                }
+                                c if c == ALU | DIV | K || c == ALU | MOD | K => any | 1,
+                                c if c == ALU | LSH | K || c == ALU | RSH | K => any % 32,
+                                c if c == JMP | JA => (any as u64 % (left.min(300) + 1)) as u32,
+                                c if c & 0x07 == LD && (c & 0xe0 == ABS || c & 0xe0 == IND) => {
+                                    match any % 4 {
+                                        0 => AD_OFF + any / 4 % 16 * 4,
+                                        1 => EDGES[(any / 4) as usize % (EDGES.len() - 1)],
+                                        _ => any % 64,
+                                    }
+                                }
+                                _ if any.is_multiple_of(3) => {
+                                    EDGES[(any / 3) as usize % EDGES.len()]
+                                }
+                                _ => any,
+                            }
+                        };
+                        let reach = left.clamp(1, 256);
+                        let (jt, jf) = ((r >> 40) % reach, (r >> 48) % reach);
+                        let (jt, jf) = if wild { (jt + 1, jf) } else { (jt, jf) };
+                        f(code, jt as u8, jf as u8, k)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Digests of what [`check`] decides on `programs`, and of what
+    /// [`convert`] makes of those it takes, with how many it takes and
+    /// converts.
+    fn conversion_digests(programs: &[Vec<SockFilter>]) -> ([u64; 2], [usize; 2]) {
+        let mut digests = [0xcbf2_9ce4_8422_2325u64; 2];
+        let mut counts = [0; 2];
+        for filter in programs {
+            let checked = check(filter);
+            let len = (filter.len() as u16).to_le_bytes();
+            fnv(&mut digests[0], &len);
+            fnv(
+                &mut digests[0],
+                &[checked.map_or_else(|e| 100 + e.0 as u8, |()| 0)],
+            );
+            if checked.is_err() {
+                continue;
+            }
+            counts[0] += 1;
+            match convert(filter) {
+                Ok(insns) => {
+                    counts[1] += 1;
+                    for i in insns {
+                        fnv(&mut digests[1], &[i.code, i.dst, i.src]);
+                        fnv(&mut digests[1], &i.off.to_le_bytes());
+                        fnv(&mut digests[1], &i.imm.to_le_bytes());
+                    }
+                    fnv(&mut digests[1], &[0xee]);
+                }
+                Err(e) => fnv(&mut digests[1], &[0xff, e.0 as u8]),
+            }
+        }
+        (digests, counts)
+    }
+
+    #[test]
+    fn checks_and_conversions_give_what_they_did() {
+        // Digests of the checks' decisions and the converted programs, made
+        // before the conversion was written anew: it must change neither.
+        // A seed, how many programs, their longest, `far`, and the digests
+        // and counts.
+        type Case = (u64, usize, usize, u64, [u64; 2], [usize; 2]);
+        let cases: [Case; 5] = [
+            (
+                0x2545_f491_4f6c_dd1d,
+                40_000,
+                12,
+                0,
+                [0x93ae_fd66_3e5b_0f9a, 0x6da3_d6e0_217e_966d],
+                [35_225, 35_225],
+            ),
+            (
+                0x9e37_79b9_7f4a_7c15,
+                20_000,
+                60,
+                0,
+                [0xbf80_2ed8_ef94_b283, 0xcac4_1dc0_6efa_30a3],
+                [16_386, 16_386],
+            ),
+            (
+                0xd1b5_4a32_d192_ed03,
+                1_000,
+                600,
+                0,
+                [0xcdd7_f1ae_52a9_ac49, 0xe8bd_9316_b5a6_957b],
+                [738, 738],
+            ),
+            (
+                0x6a09_e667_f3bc_c909,
+                300,
+                MAX_INSNS,
+                4,
+                [0x0aec_efeb_423c_668f, 0xe4a9_0c3d_9b49_ac9d],
+                [128, 128],
+            ),
+            (
+                0x510e_527f_ade6_82d1,
+                300,
+                MAX_INSNS,
+                6,
+                [0xd5d0_1baf_752d_8944, 0x72cd_0b98_c45b_7b64],
+                [101, 88],
+            ),
+        ];
+        for (seed, count, max_len, far, digests, counts) in cases {
+            let got = conversion_digests(&programs(seed, count, max_len, far));
+            assert_eq!(got, (digests, counts), "{seed:#x}");
+        }
+    }
+
     fn f(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
         SockFilter { code, jt, jf, k }
     }
@@ -844,6 +1033,21 @@ mod tests {
         assert_eq!(check(&one_path), Err(Errno::EINVAL));
         let both = [store, f(JMP | JEQ | K, 1, 0, 0), store, load, ret];
         assert_eq!(check(&both), Ok(()));
+        // What is known after a return carries into the next instruction,
+        // which only a jump reaches: there, nothing is written.
+        assert_eq!(check(&[ret, load, ret]), Err(Errno::EINVAL));
+        // The path through the return writes nothing; the path that jumps
+        // to the load writes the word.
+        let jumped = [
+            f(JMP | JEQ | K, 0, 1, 0),
+            f(JMP | JA, 0, 0, 2),
+            store,
+            f(JMP | JA, 0, 0, 1),
+            ret,
+            load,
+            ret,
+        ];
+        assert_eq!(check(&jumped), Err(Errno::EINVAL));
     }
 
     #[test]

@@ -6643,6 +6643,11 @@ kernel.
     the newest first.
   - Any close of a descriptor of that open file through that table ends
     its watch, as do asking with no events and the table's end.
+  - The directory's mark stays after a one-shot watch's signal took its
+    last watch off. Any close of a descriptor of the directory, through any
+    table and at a table's end too, then takes the mark off
+    (`dnotify_flush`), which moves the directory's place in `IN_UNMOUNT`'s
+    order.
   - A file that is not a directory gives `ENOTDIR`, an `O_PATH` descriptor
     `EBADF`. Unknown bits are ignored.
   - `/proc/sys/fs/dir-notify-enable`, the machine's (1 at first), is root's

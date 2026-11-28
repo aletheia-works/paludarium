@@ -2637,12 +2637,20 @@ impl Kernel {
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).
-        let (table, closed) = self.files.release_descriptors();
+        let (table, descriptors) = self.files.release_descriptors();
         if let Some(table) = table {
             self.processes.locks().release_table(table);
             let notify = &self.files.caches.notify;
-            notify.dn.release_table(table, &closed, &notify.fan);
+            // Each close of a directory's file is a `dnotify_flush` of that
+            // directory, whichever table asked for its watches.
+            let fs = self.files.fs();
+            let directories: Vec<_> = descriptors
+                .iter()
+                .filter_map(|d| crate::dnotify::directory_in(&*fs, d))
+                .collect();
+            notify.dn.release_table(table, &directories, &notify.fan);
         }
+        let closed: Vec<_> = descriptors.into_iter().map(|d| d.file).collect();
         crate::mqueue::exited(&closed, self.process.pid);
         closed.iter().for_each(crate::sockets::closing);
         drop(closed);

@@ -1167,11 +1167,7 @@ verified.
   aside until it is no longer ignored.
 - **inotify, in part**: when a superblock goes, its files' watches hear
   `IN_UNMOUNT` in the order the files got their first mark of any group, as
-  on Linux; but the dnotify mark a one-shot watch leaves on its directory
-  after its signal goes at the end of a descriptor table only through the
-  files that asked for a watch, where Linux's goes through any descriptor
-  of the directory, so a directory may keep its place in that order
-  longer. `/proc/self/fdinfo` lists an epoll's files by
+  on Linux. `/proc/self/fdinfo` lists an epoll's files by
   descriptor where Linux's order follows the files' addresses, and numbers
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
@@ -1227,9 +1223,7 @@ verified.
   share a bucket of a group's merge hash follows a hash of the emulator's
   own where Linux's mixes in kernel addresses (of the process, and of a
   path in the non-FID modes), so only events of one task's names in one
-  directory collide as on Linux. Whether a directory watches its children
-  is judged by the
-  fanotify marks alone, where Linux's counts inotify's too. A file a
+  directory collide as on Linux. A file a
   descriptor does not hold (a program exec runs) is opened again by the path
   it had, which fails once it is gone.
 - **Namespaces**: a user namespace has no

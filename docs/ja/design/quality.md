@@ -115,9 +115,9 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   `EINVAL` にしています。これを書いた時点の `ubuntu-24.04` の 7.0.0-1017-azure では、
   まだ成功していました。
 
-- `tests/guests/processes/cases.json` に載っているプロセスのケースと、`diff_processes`
-  が動かすケースがちょうど同じかをテストで確かめます。載せたのに動かないケースは
-  作れません。
+- プロセスのケースの一覧は `diff_processes` の `cases!` だけで、テストはこの一覧から
+  作られます。そのため、載せたケースは必ず動きます。一覧がテスト名の順に並び、
+  同じケースが二度ないことをテストで確かめます。
 
 - すべてのプルリクエストで動く `scripts/ci-changes.py --self-test` が、
   `crates/paludarium-harness/tests` の差分テストがどれもどこかで動くかを確かめます。

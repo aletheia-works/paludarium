@@ -2300,7 +2300,11 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
     {
         return Ok(pseudo_fs(PID_FS_MAGIC));
     }
-    Ok(match d.file.stat()?.mode & 0o170000 {
+    let stat = d.file.stat()?;
+    if let Some(place) = fifo_place(c, d, &stat) {
+        return c.files.fs().statfs(&place);
+    }
+    Ok(match stat.mode & 0o170000 {
         0o010000 => pseudo_fs(0x5049_5045), // PIPEFS_MAGIC
         0o140000 => pseudo_fs(0x534F_434B), // SOCKFS_MAGIC
         0 if !is_namespace(d) => pseudo_fs(ANON_INODE_FS_MAGIC),
@@ -2310,6 +2314,29 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
             .statfs(&d.path)
             .or_else(|_| c.files.fs().statfs(b"/"))?,
     })
+}
+/// Where the file system of a fifo `d` opened by its name is (`stat` its
+/// file's): its path while that still names it, else the mount of its
+/// device, as a removed or renamed fifo is still a file of that file
+/// system; only `pipe`'s fifos are pipefs's. `None` for any other file.
+fn fifo_place(c: &Context<'_>, d: &Descriptor, stat: &FileStat) -> Option<Vec<u8>> {
+    if stat.mode & 0o170000 != 0o010000 || d.path.first() != Some(&b'/') {
+        return None;
+    }
+    let fs = c.files.fs();
+    if fs
+        .metadata(&d.path, false)
+        .is_ok_and(|now| now.inode == stat.inode)
+    {
+        return Some(d.path.clone());
+    }
+    let device = descriptor_device(c, d);
+    Some(
+        fs.mounts()
+            .into_iter()
+            .find(|m| m.device == device)
+            .map_or_else(|| b"/".to_vec(), |m| m.path),
+    )
 }
 /// `statfs`'s `f_flags` for `path`, whose file system `stats` describes:
 /// the mount's ([`paludarium_vfs::FileSystem::statfs_flags`]) for one a
@@ -2361,10 +2388,10 @@ fn descriptor_statfs_flags(
         .as_any()
         .is_some_and(|v| v.is::<crate::memfd::Memfd>());
     if memfd {
-        0x20
-    } else {
-        mount_statfs_flags(c, stats, &d.path)
+        return 0x20;
     }
+    let place = d.file.stat().ok().and_then(|stat| fifo_place(c, d, &stat));
+    mount_statfs_flags(c, stats, place.as_deref().unwrap_or(&d.path))
 }
 /// Linux's 120-byte `struct statfs` of the file system on `device`, with
 /// `f_flags` and `f_fsid` [`crate::fanotify::fsid`]'s.

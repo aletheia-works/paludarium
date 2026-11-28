@@ -60,7 +60,8 @@ const OUTER: u32 = 0x3f;
 /// protocol and ports (`flowi4_proto`, `fl4_sport`, `fl4_dport`), and for
 /// IPv6 its flow label; and whether they come in a packet (an `skb`), as
 /// `inet_rtm_getroute` builds one for IPv4 and an ICMP error's lookup takes
-/// the one it tells of (`icmp_route_lookup`), rather than a flow alone,
+/// the one it tells of (`icmp_route_lookup`, `icmp6_send`), rather than a
+/// flow alone,
 /// with the flow hash that packet carries, 0 for none: its sender's
 /// (`skb_set_hash_from_sk` of `sk_txhash`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -74,13 +75,6 @@ pub(crate) struct Flow {
 }
 
 impl Flow {
-    /// A flow of `proto` with no ports, as one that carries none has.
-    pub(crate) fn of(proto: u8) -> Self {
-        Self {
-            proto,
-            ..Self::default()
-        }
-    }
     /// A socket's flow of `proto` from the port `sport` to `dport`.
     pub(crate) fn socket(proto: u8, sport: u16, dport: u16) -> Self {
         Self {
@@ -239,17 +233,27 @@ impl Seed {
         }
     }
     /// The hash that chooses an IPv6 hop for `flow` from `src` to `dst`
-    /// (`rt6_multipath_hash`), of the fields `policy` takes ([`hashed`]).
+    /// (`rt6_multipath_hash`), of the fields `policy` takes ([`hashed`]),
+    /// a packet's as IPv4's.
     pub(crate) fn hash6(self, policy: Policy, src: Ipv6Addr, dst: Ipv6Addr, flow: Flow) -> u32 {
+        if policy.policy == 1 && flow.packet && flow.socket_hash != 0 {
+            return flow.socket_hash >> 1;
+        }
+        let (sport, dport) = flow.ports();
         let keys = Keys {
             proto: flow.proto,
             label: flow.label,
-            sport: flow.sport,
-            dport: flow.dport,
+            sport,
+            dport,
             src: src.octets(),
             dst: dst.octets(),
         };
-        self.of(hashed(policy, true), keys, |a, b| a < b) >> 1
+        let hash = self.of(hashed(policy, true), keys, |a, b| a < b);
+        if policy.policy == 3 && flow.packet {
+            mix(hash, 0) >> 1
+        } else {
+            hash >> 1
+        }
     }
 }
 
@@ -450,6 +454,51 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_packet_is_hashed_as_an_ipv4_one() {
+        let seed = Seed {
+            machine: 5,
+            user: 0,
+        };
+        let policy = |policy| Policy {
+            policy,
+            fields: FIELDS_ALL,
+        };
+        let (a, b) = (
+            "2001:db8:5::1".parse::<Ipv6Addr>().unwrap(),
+            "2001:db8:2::1".parse::<Ipv6Addr>().unwrap(),
+        );
+        let flow = Flow::socket(17, 7100, 9);
+        let packet = Flow {
+            packet: true,
+            ..flow
+        };
+        let carried = Flow {
+            socket_hash: 0x8765_4321,
+            ..packet
+        };
+        // Policy 1 takes the hash the packet carries, halved.
+        assert_eq!(seed.hash6(policy(1), a, b, carried), 0x8765_4321 >> 1);
+        assert_eq!(
+            seed.hash6(policy(1), a, b, packet),
+            seed.hash6(policy(1), a, b, flow)
+        );
+        // Policy 3 mixes a packet's outer hash with no inner one.
+        assert_ne!(
+            seed.hash6(policy(3), a, b, packet),
+            seed.hash6(policy(3), a, b, flow)
+        );
+        assert_eq!(
+            seed.hash6(policy(3), a, b, carried),
+            seed.hash6(policy(3), a, b, packet)
+        );
+        // Policy 0 dissects it, as a flow.
+        assert_eq!(
+            seed.hash6(policy(0), a, b, carried),
+            seed.hash6(policy(0), a, b, flow)
+        );
+    }
+
+    #[test]
     fn an_answer_hashes_its_ports_as_the_flow_it_answers() {
         let seed = Seed {
             machine: 5,
@@ -574,9 +623,12 @@ mod tests {
         let digest = all.iter().fold(0xcbf2_9ce4_8422_2325u64, |d, &h| {
             (d ^ u64::from(h)).wrapping_mul(0x0100_0000_01b3)
         });
+        // IPv6's packets have hashed as IPv4's since ICMPv6's errors took
+        // the packet they tell of; the other values are those of before the
+        // rewrite.
         assert_eq!(
             (all.len(), digest),
-            (1344, 5_159_730_338_909_324_338),
+            (1344, 14_694_386_852_290_287_721),
             "{:x?}",
             &all[..16]
         );

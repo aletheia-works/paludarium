@@ -1071,6 +1071,7 @@ mod linux {
         processes_stdio_flags => ("stdio-flags", "process"),
         processes_stop_cont_handler => ("stop-cont-handler", "process"),
         processes_stop_restart => ("stop-restart", "process"),
+        processes_sysctl_constants => ("sysctl-constants", "process"),
         processes_sysinfo => ("sysinfo", "process"),
         // Makes IPC and PID namespaces, for its IDs and PIDs.
         processes_sysvipc_proc => ("sysvipc-proc", "process", root),

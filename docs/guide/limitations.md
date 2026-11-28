@@ -506,11 +506,8 @@ verified.
   [Features](./features) lists (`bpf_tail_call`, `bpf_perf_event_output`,
   `bpf_trace_printk`, the ring buffer, spin locks and the rest), the map
   helpers of maps of maps, queues, stacks and bloom filters, a helper's
-  size whose value the verifier does not know, a comparison whose
-  registers are linked to more than 6 (Linux follows the 6 it finds
-  live; which are live is not followed here), a register whose bounds
-  disagree with its known bits (where Linux writes a line of a bug in
-  itself), kfuncs, the context's socket
+  size whose value the verifier does not know, `bpf_get_netns_cookie` of
+  a scalar it does not know is 0, kfuncs, the context's socket
   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
   `fd_array` and maps made with `excl_prog_hash`, `BPF_LD_IMM64` of BTF
   IDs and of functions (and so callbacks), `may_goto`, indirect jumps, a
@@ -522,15 +519,10 @@ verified.
   frames deep ("the call stack of 9 frames is too deep", `E2BIG`), not
   before the walk as master does ("recursive call from %s() to %s()",
   `EINVAL`): the differential tests compare the line with that kernel,
-  and master's check comes here once it has it. A scalar's bits and
-  bounds follow Linux 7.0's; master follows them otherwise (ranges that
-  wrap around, and steps), and where the two decide a jump, an access or
-  a size differently, it does not refuse yet: it may take a program master
-  refuses, or refuse one master takes. `bpf_get_smp_processor_id`'s result
-  is below the CPUs the emulator gives the guest, as its maps count them,
-  which may be fewer than the machine's `nr_cpu_ids` that Linux bounds it
-  by. It prunes no states, so a program
-  with many branches may reach the limits sooner. A
+  and master's check comes here once it has it. A scalar is a value the
+  verifier knows or nothing at all, where Linux keeps its bounds, so it
+  walks both ways of a jump Linux knows goes one way, and it prunes no
+  states, so a program with many branches may reach the limits sooner. A
   lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
   the immediate 0, or with a value's or a map's pointer it equals, tells,
   or an array's key is one the stack holds
@@ -653,10 +645,13 @@ verified.
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
   Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
-  socket requests, a bundle
-  (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
-  send that selects a buffer, and a receive with `MSG_WAITALL` that selects
-  one are not there yet (`EINVAL`). A multishot receive whose socket keeps
+  socket requests, a receive's bundle (`IORING_RECVSEND_BUNDLE`) and a
+  receive with `MSG_WAITALL` that selects a buffer are not there yet
+  (`EINVAL`). A send's selected buffers follow Linux master; the kernel of
+  the differential tests' runners still sends a provided buffer whole
+  whatever the length (before master's b7322810d187), so the tests do not
+  compare that, nor whether a bundle whose length runs out on the last
+  buffer goes on (8742f4b5a472). A multishot receive whose socket keeps
   having more goes on at once however many times in a row, where Linux
   requeues it after 32 (`MULTISHOT_MAX_RETRY`), letting other task work
   run first. A send or a receive with
@@ -1155,11 +1150,12 @@ verified.
   than those 10 ms can go unseen and send none, unless a read or write told
   the guest `EAGAIN`, which always gets its signal. In WebAssembly, which has
   no thread to look, they send none.
-- **Edge-triggered `epoll` on a signalfd**: a signal queued for another
-  thread of the process gives the waiting thread its edge once that thread
-  takes it in, at its next system call or within 10 ms of a wait, where
-  Linux's `signalfd_notify` wakes the file as the signal is sent; an
-  `epoll_wait` that does not wait can come before it.
+- **Edge-triggered `epoll` on a signalfd, in part**: a signal queued for
+  another thread of the process is the waiting thread's edge as it is sent,
+  but a thread already waiting sees it within 10 ms, where Linux's
+  `signalfd_notify` wakes the file at once. A signal sent to the init of a
+  nested PID namespace, which it drops as it has no handler
+  (`SIGNAL_UNKILLABLE`), still counts as sent.
 - **A POSIX timer's signal, in part**: a timer on a clock of real time
   sends to the process's leader first, where Linux's `posixtimer_get_target`
   sends to a thread of the process that its interrupt finds running. One

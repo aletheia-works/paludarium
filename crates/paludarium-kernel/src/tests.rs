@@ -8570,6 +8570,7 @@ mod io_uring {
         assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, 0);
     }
 
+    const SENDMSG: u8 = 9;
     const ACCEPT: u8 = 13;
     const CONNECT: u8 = 16;
     const SEND: u8 = 26;
@@ -8666,10 +8667,12 @@ mod io_uring {
                 -22,
             ),
             (with(net(SEND, a, 1 << 40, buf, 1, 0, 0), 44, &[4]), -14),
-            // Bundles, vectored and selecting sends are not there yet.
-            (net(SEND, a, 0, buf, 1, 0, 16), -22),
-            (net(SEND, a, 0, buf, 1, 0, 32), -22),
-            (with(net(SEND, a, 0, buf, 1, 0, 0), 1, &[1 << 5]), -22),
+            // A message takes no bundle, and a receive's is not there yet.
+            (net(SENDMSG, a, 0, buf, 0, 0, 16), -22),
+            (net(RECV, a, 0, buf, 1, 0, 16), -22),
+            // A vectored send reads its iovecs as it is prepared.
+            (net(SEND, a, 0, buf, 1025, 0, 32), -22),
+            (net(SEND, a, 0, 1 << 63, 1, 0, 32), -14),
             (net(RECV, a, 1, buf, 1, 0, 0), -22),
             (net(RECV, a, 0, buf, u32::MAX, 0, 0), -22),
             (net(RECV, a, 0, buf, 1, 0, 4), -22),
@@ -8767,6 +8770,126 @@ mod io_uring {
         assert_eq!(one(&mut f, &r, &net(RECV, b, 0, got, 8, 0, 0)), 0);
         assert_eq!(one(&mut f, &r, &net(SEND, a, 0, put, 1, 0, 0)), -32);
         assert_eq!(one(&mut f, &r, &net(SHUTDOWN, a, 0, 0, 7, 0, 0)), -22);
+    }
+
+    #[test]
+    fn sends_take_iovecs_selected_buffers_and_bundles_as_linux_7_0_does() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (a, b) = unix_pair(&mut f, 1);
+        let (put, got, iov) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+        f.mem.write(GuestAddr(put), b"abcdefghijkl").unwrap();
+        // IORING_SEND_VECTORIZED: `len` iovecs at `addr`.
+        for (i, (at, len)) in [(put, 3u64), (put + 8, 2)].into_iter().enumerate() {
+            f.mem.write_u64(GuestAddr(iov + 16 * i as u64), at).unwrap();
+            f.mem
+                .write_u64(GuestAddr(iov + 16 * i as u64 + 8), len)
+                .unwrap();
+        }
+        assert_eq!(one(&mut f, &r, &net(SEND, a, 0, iov, 2, 0, 32)), 5);
+        assert_eq!(f.ret(0, &[b, got, 16]), 5);
+        assert_eq!(bytes(&f, got, 5), b"abcij");
+        // A send that selects: no group is ENOENT, none left ENOBUFS.
+        let select = |e: [u8; 64], bgid: u16| with(with(e, 1, &[1 << 5]), 40, &bgid.to_le_bytes());
+        assert_eq!(one(&mut f, &r, &select(net(SEND, a, 0, 0, 3, 0, 0), 7)), -2);
+        // A provided buffer is cut to the length, as Linux master has it.
+        assert_eq!(one(&mut f, &r, &provide(1, put, 6, 7, 3)), 0);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(net(SEND, a, 0, 0, 3, 0, 0), 7)),
+            (3, BUFFER | 3 << 16)
+        );
+        assert_eq!(f.ret(0, &[b, got, 16]), 3);
+        assert_eq!(
+            one(&mut f, &r, &select(net(SEND, a, 0, 0, 3, 0, 0), 7)),
+            -105
+        );
+        // A ring's: one, cut to the length, its entry as it was.
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(pbuf(&mut f, &r, page, 4, 1, 0), 0);
+        for index in 0..4 {
+            entry(&f, page, index, put + 4 * (index % 3), 4, 10 + index as u16);
+        }
+        tail(&f, page, 1);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(net(SEND, a, 0, 0, 3, 0, 0), 1)),
+            (3, BUFFER | 10 << 16)
+        );
+        assert_eq!(u32_at(&f, page + 8), 4);
+        assert_eq!(head(&mut f, &r, 1), 1);
+        assert_eq!(f.ret(0, &[b, got, 16]), 3);
+        // A bundle takes as many as its length needs, and goes on with the
+        // rest once it posted, until it took the last there was.
+        tail(&f, page, 4);
+        let bundle = select(net(SEND, a, 0, 0, 8, 0, 16), 1);
+        submit_only(&mut f, &r, &[bundle]);
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 8, MORE | BUFFER | 11 << 16), (1, 4, BUFFER | 13 << 16)]
+        );
+        assert_eq!(head(&mut f, &r, 1), 4);
+        assert_eq!(f.ret(0, &[b, got, 16]), 12);
+        assert_eq!(bytes(&f, got, 12), b"efghijklabcd");
+        // IOU_PBUF_RING_INC: the bytes come off the buffer.
+        assert_eq!(pbuf(&mut f, &r, 8, 1, 2, 1 | 2), 0);
+        let mapped = f.ret(9, &[0, 4096, 3, 0x01, r.fd, 0x8000_0000 | 2 << 16]);
+        entry(&f, mapped, 0, put, 10, 9);
+        tail(&f, mapped, 1);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(net(SEND, a, 0, 0, 4, 0, 0), 2)),
+            (4, BUFFER | BUF_MORE | 9 << 16)
+        );
+        assert_eq!(f.mem.read_u64(GuestAddr(mapped)).unwrap(), put + 4);
+        assert_eq!(f.ret(0, &[b, got, 16]), 4);
+        // A bundle with no buffers to select sends what it has, then posts
+        // and sends again, with nothing left.
+        submit_only(&mut f, &r, &[net(SEND, a, 0, put, 5, 0, 16)]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 5, MORE), (1, 0, 0)]);
+        assert_eq!(f.ret(0, &[b, got, 16]), 5);
+        assert_eq!(bytes(&f, got, 5), b"abcde");
+    }
+
+    #[test]
+    fn a_send_bundle_stops_at_its_length_or_before_a_buffer_it_would_cut() {
+        // As Linux master: with its last buffer taken, the group is emptied
+        // (8742f4b5a472), and no entry is cut (70f4886bcbb9).
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (a, b) = unix_pair(&mut f, 1);
+        let (put, got) = (DATA + 0x100, DATA + 0x200);
+        f.mem.write(GuestAddr(put), b"abcdefghijklmnop").unwrap();
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(pbuf(&mut f, &r, page, 4, 1, 0), 0);
+        for index in 0..4 {
+            entry(&f, page, index, put + 4 * index, 4, 20 + index as u16);
+        }
+        let bundle = |len: u32| {
+            let e = with(net(SEND, a, 0, 0, len, 0, 16), 1, &[1 << 5]);
+            with(e, 40, &1u16.to_le_bytes())
+        };
+        // Its length runs out on the last buffer there is, which empties the
+        // group: it is over.
+        tail(&f, page, 2);
+        submit_only(&mut f, &r, &[bundle(8)]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 8, BUFFER | 20 << 16)]);
+        assert_eq!(head(&mut f, &r, 1), 2);
+        // A later buffer longer than what is left stays, whole, for the next.
+        tail(&f, page, 4);
+        submit_only(&mut f, &r, &[bundle(6)]);
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 4, MORE | BUFFER | 22 << 16), (1, 4, BUFFER | 23 << 16)]
+        );
+        assert_eq!(u32_at(&f, page + 3 * 16 + 8), 4);
+        assert_eq!(head(&mut f, &r, 1), 4);
+        assert_eq!(f.ret(0, &[b, got, 32]), 16);
+        assert_eq!(bytes(&f, got, 16), b"abcdefghijklmnop");
+        // A buffer outside the user half is EFAULT, and stays.
+        entry(&f, page, 0, 1 << 63, 4, 30);
+        tail(&f, page, 5);
+        assert_eq!(one(&mut f, &r, &bundle(4)), -14);
+        assert_eq!(head(&mut f, &r, 1), 4);
     }
 
     #[test]

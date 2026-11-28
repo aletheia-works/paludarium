@@ -12884,6 +12884,128 @@ static int io_uring_multishot_case(void) {
     sqe[1] = 1 << 5;
     sqe[40] = 4;
     um_run(&u, 1, 1, "message-overflow");
+
+    /* Sends: of iovecs (IORING_SEND_VECTORIZED), of the buffers they select,
+       a provided one whole and a ring's cut to the length, and bundles,
+       which take as many as their length needs and go on once they posted,
+       until they took the last there was. */
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp)) return 84;
+    char sout[16] = "abcdefghijkl", sin[32];
+    struct iovec siov[2] = {{sout, 3}, {sout + 8, 2}};
+    unet_push(&u, 26, 1, sp[0], 0, (long)siov, 2, 0, 32);
+    um_run(&u, 1, 1, "send-vectored");
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    unet_push(&u, 26, 1, sp[0], 0, (long)siov, 1025, 0, 32);
+    um_run(&u, 1, 1, "send-vectored-many");
+    unet_push(&u, 9, 1, sp[0], 0, (long)&mh, 0, 0, 16);
+    um_run(&u, 1, 1, "sendmsg-bundle");
+    unsigned short sgroup = 7;
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 3, 0, 0);
+    sqe[1] = 1 << 5;
+    memcpy(sqe + 40, &sgroup, 2);
+    um_run(&u, 1, 1, "send-select-none");
+    memcpy(unet_push(&u, 31, 99, 1, 3, (long)sout, 6, 0, 0) + 40, &sgroup, 2);
+    um_run(&u, 1, 1, "send-provide");
+    for (int i = 0; i < 2; i++) {
+        sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 0, 0, 0);
+        sqe[1] = 1 << 5;
+        memcpy(sqe + 40, &sgroup, 2);
+        um_run(&u, 1, 1, i ? "send-select-empty" : "send-select-provided");
+    }
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    unsigned char *sring = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (sring == MAP_FAILED) return 85;
+    for (int g = 1; g <= 2; g++) {
+        unsigned char reg[40] = {0};
+        unsigned long at = (unsigned long)sring + 4096 * (g - 1);
+        unsigned entries = g == 1 ? 4 : 1;
+        unsigned short bgid = g, flags = g == 1 ? 0 : 2;
+        memcpy(reg, &at, 8);
+        memcpy(reg + 8, &entries, 4);
+        memcpy(reg + 12, &bgid, 2);
+        memcpy(reg + 14, &flags, 2);
+        uring_show("send-ring", syscall(427, u.fd, 22, reg, 1));
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *e = sring + 16 * i;
+        unsigned long a = (unsigned long)sout + 4 * (i % 3);
+        unsigned len = 4;
+        unsigned short bid = 10 + i;
+        memcpy(e, &a, 8);
+        memcpy(e + 8, &len, 4);
+        memcpy(e + 12, &bid, 2);
+    }
+    __atomic_store_n((unsigned short *)(sring + 14), 1, __ATOMIC_RELEASE);
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 3, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 1;
+    um_run(&u, 1, 1, "send-select-ring");
+    printf("entry %u\n", *(unsigned *)(sring + 8));
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    __atomic_store_n((unsigned short *)(sring + 14), 4, __ATOMIC_RELEASE);
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 8, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 1;
+    um_run(&u, 1, 1, "send-bundle");
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    {
+        unsigned char *e = sring + 4096;
+        unsigned long a = (unsigned long)sout;
+        unsigned len = 10;
+        unsigned short bid = 9;
+        memcpy(e, &a, 8);
+        memcpy(e + 8, &len, 4);
+        memcpy(e + 12, &bid, 2);
+        __atomic_store_n((unsigned short *)(e + 14), 1, __ATOMIC_RELEASE);
+    }
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 4, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 2;
+    um_run(&u, 1, 1, "send-select-inc");
+    printf("entry +%ld %u\n", (long)(*(unsigned long *)(sring + 4096) - (unsigned long)sout),
+           *(unsigned *)(sring + 4096 + 8));
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    /* A bundle that would cut a later buffer leaves it whole for the next
+       send. (Whether one whose length runs out on the last buffer there is
+       goes on, and whether a provided buffer is cut to the length, depend
+       on the kernel: Linux master's 8742f4b5a472 and b7322810d187.) */
+    unsigned char *sring3 = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (sring3 == MAP_FAILED) return 86;
+    {
+        unsigned char reg[40] = {0};
+        unsigned long at = (unsigned long)sring3;
+        unsigned entries = 4;
+        unsigned short bgid = 6;
+        memcpy(reg, &at, 8);
+        memcpy(reg + 8, &entries, 4);
+        memcpy(reg + 12, &bgid, 2);
+        uring_show("send-ring", syscall(427, u.fd, 22, reg, 1));
+    }
+    char slong[16] = "mnopqrstuvwxyz12";
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *e = sring3 + 16 * i;
+        unsigned long a = (unsigned long)slong + 4 * i;
+        unsigned len = 4;
+        unsigned short bid = 20 + i;
+        memcpy(e, &a, 8);
+        memcpy(e + 8, &len, 4);
+        memcpy(e + 12, &bid, 2);
+    }
+    __atomic_store_n((unsigned short *)(sring3 + 14), 4, __ATOMIC_RELEASE);
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 6, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 6;
+    um_run(&u, 1, 1, "send-bundle-short");
+    printf("entry %u\n", *(unsigned *)(sring3 + 3 * 16 + 8));
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    unet_push(&u, 26, 1, sp[0], 0, (long)sout, 5, 0, 16);
+    um_run(&u, 1, 1, "send-bundle-plain");
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    close(sp[0]);
+    close(sp[1]);
     close(gram[0]);
     close(gram[1]);
     close(first);
@@ -31473,6 +31595,151 @@ static int kernel_sysctl_case(void) {
     if (held >= 0) close(held);
     return 0;
 }
+/* The sysctl-constants case's read of /proc/sys/kernel/`name` into `buf`
+   (NUL-ended, the newline kept): its length, or -errno. */
+static long kc_read(const char *name, char *buf, size_t size) {
+    char path[128];
+    snprintf(path, sizeof path, "/proc/sys/kernel/%s", name);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    long n = read(fd, buf, size - 1);
+    long r = n < 0 ? -errno : n;
+    close(fd);
+    buf[r < 0 ? 0 : r] = 0;
+    return r;
+}
+/* Whether `id` is a UUID as %pU prints one, of version 4 and RFC 4122's
+   variant, then a newline. */
+static int kc_uuid(const char *id) {
+    if (strlen(id) != 37 || id[36] != '\n') return 0;
+    for (int i = 0; i < 36; i++) {
+        int dash = i == 8 || i == 13 || i == 18 || i == 23;
+        if (dash ? id[i] != '-' : !strchr("0123456789abcdef", id[i])) return 0;
+    }
+    return id[14] == '4' && strchr("89ab", id[19]) != NULL;
+}
+/* The sysctl-constants case: /proc/sys/kernel's cap_last_cap and
+   ngroups_max, seccomp/actions_avail and random's files, as Linux's
+   kernel/sysctl.c, kernel/seccomp.c and drivers/char/random.c have them.
+   Each value against what the calls give, the modes, reads in pieces, the
+   listings, and that no one but root opens one to write (the write itself
+   as root is a unit test's, the comparison running as another user). */
+static int sysctl_constants_case(void) {
+    char buf[256];
+    struct stat st;
+    long n = kc_read("cap_last_cap", buf, sizeof buf);
+    int last = atoi(buf);
+    printf("cap_last_cap: n=%ld value=%s", n, buf);
+    printf("cap_last_cap: bset-last=%d bset-past=%d\n", prctl(PR_CAPBSET_READ, last, 0, 0, 0),
+           prctl(PR_CAPBSET_READ, last + 1, 0, 0, 0) < 0 ? -errno : 0);
+    n = kc_read("ngroups_max", buf, sizeof buf);
+    printf("ngroups_max: n=%ld value=%s", n, buf);
+    n = kc_read("seccomp/actions_avail", buf, sizeof buf);
+    printf("actions_avail: n=%ld value=%s", n, buf);
+    /* Each name is an action SECCOMP_GET_ACTION_AVAIL takes. */
+    static const struct {
+        const char *name;
+        unsigned action;
+    } actions[] = {{"kill_process", 0x80000000u}, {"kill_thread", 0},     {"trap", 0x00030000u},
+                   {"errno", 0x00050000u},        {"user_notif", 0x7fc00000u}, {"trace", 0x7ff00000u},
+                   {"log", 0x7ffc0000u},          {"allow", 0x7fff0000u}};
+    printf("actions_avail:");
+    for (size_t i = 0; i < sizeof actions / sizeof actions[0]; i++) {
+        unsigned action = actions[i].action;
+        long r = syscall(SYS_seccomp, 2, 0, &action);
+        printf(" %s=%ld", actions[i].name, r < 0 ? -errno : r);
+    }
+    printf("\n");
+    static const char *const ints[] = {"random/poolsize", "random/entropy_avail", "random/write_wakeup_threshold",
+                                       "random/urandom_min_reseed_secs"};
+    for (int i = 0; i < 4; i++) {
+        n = kc_read(ints[i], buf, sizeof buf);
+        printf("%s: n=%ld value=%s", ints[i], n, buf);
+    }
+    char boot[64], again[64], one[64], two[64];
+    kc_read("random/boot_id", boot, sizeof boot);
+    kc_read("random/boot_id", again, sizeof again);
+    kc_read("random/uuid", one, sizeof one);
+    kc_read("random/uuid", two, sizeof two);
+    printf("boot_id: formed=%d stays=%d\n", kc_uuid(boot), !strcmp(boot, again));
+    /* Whether each read draws anew is a unit test's: the harness's host
+       gives the same random bytes at each draw. */
+    printf("uuid: formed=%d\n", kc_uuid(one) && kc_uuid(two));
+    /* Modes and sizes. */
+    static const char *const all[] = {"cap_last_cap",
+                                      "ngroups_max",
+                                      "seccomp/actions_avail",
+                                      "random/boot_id",
+                                      "random/entropy_avail",
+                                      "random/poolsize",
+                                      "random/urandom_min_reseed_secs",
+                                      "random/uuid",
+                                      "random/write_wakeup_threshold"};
+    printf("modes:");
+    for (int i = 0; i < 9; i++) {
+        char path[128];
+        snprintf(path, sizeof path, "/proc/sys/kernel/%s", all[i]);
+        long r = stat(path, &st) ? -errno : 0;
+        printf(" %s=%ld/%o/%lld/%u:%u", all[i], r, st.st_mode, (long long)st.st_size, st.st_uid, st.st_gid);
+    }
+    printf("\n");
+    /* A string in pieces, from where the file is; an int from the start
+       only. */
+    int fd = open("/proc/sys/kernel/seccomp/actions_avail", O_RDONLY | O_CLOEXEC);
+    char piece[256] = {0};
+    long first = read(fd, piece, 10);
+    long rest = read(fd, piece + 10, sizeof piece - 11);
+    long after = read(fd, piece, 1);
+    close(fd);
+    kc_read("seccomp/actions_avail", buf, sizeof buf);
+    printf("pieces: first=%ld rest=%ld after=%ld same=%d\n", first, rest, after, !strcmp(piece, buf));
+    fd = open("/proc/sys/kernel/cap_last_cap", O_RDONLY | O_CLOEXEC);
+    first = read(fd, piece, 1);
+    rest = read(fd, piece + 1, 10);
+    close(fd);
+    printf("int pieces: first=%ld rest=%ld\n", first, rest);
+    /* Listings: where the new ones fall among Linux's others, by name (not
+       yama, which a kernel without Yama lacks). */
+    const char *kernel[] = {"cap_last_cap", "msgmni", "ngroups_max", "osrelease", "perf_event_paranoid",
+                            "random",       "seccomp", "sem"};
+    ksys_order("order-kernel", "/proc/sys/kernel", kernel, 8);
+    printf("kinds: random=%d seccomp=%d cap_last_cap=%d actions_avail=%d\n", ksys_lists("/proc/sys/kernel", "random"),
+           ksys_lists("/proc/sys/kernel", "seccomp"), ksys_lists("/proc/sys/kernel", "cap_last_cap"),
+           ksys_lists("/proc/sys/kernel/seccomp", "actions_avail"));
+    const char *random_names[] = {"boot_id", "entropy_avail", "poolsize", "urandom_min_reseed_secs",
+                                  "uuid",    "write_wakeup_threshold"};
+    ksys_order("order-random", "/proc/sys/kernel/random", random_names, 6);
+    int listed = 0;
+    DIR *dir = opendir("/proc/sys/kernel/random");
+    struct dirent *e;
+    while (dir && (e = readdir(dir)))
+        if (e->d_name[0] != '.') listed++;
+    if (dir) closedir(dir);
+    printf("random listed=%d\n", listed);
+    /* As someone other than root, nothing opens to write. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 && (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(2);
+        printf("not root:");
+        for (int i = 0; i < 9; i++) {
+            char path[128];
+            snprintf(path, sizeof path, "/proc/sys/kernel/%s", all[i]);
+            int w = open(path, O_WRONLY | O_CLOEXEC);
+            printf(" %s=%d", all[i], w < 0 ? -errno : 0);
+            if (w >= 0) close(w);
+        }
+        printf(" read=%ld\n", kc_read("random/poolsize", buf, sizeof buf));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("not root: child=%d\n", status);
+    return 0;
+}
+
 /* The uts-sysctl case's files, under /proc/sys/kernel. */
 static int us_open(const char *name, int flags) {
     char path[96];
@@ -45447,6 +45714,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
+    if (!strcmp(mode, "sysctl-constants")) return sysctl_constants_case();
     if (!strcmp(mode, "poll-default")) return poll_default_case();
     if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
     if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();

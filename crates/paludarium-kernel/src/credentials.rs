@@ -16,7 +16,7 @@ const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
 const CAP_SETPCAP: u64 = 1 << 8;
 /// `CAP_LAST_CAP`, the highest capability `prctl` takes.
-const CAP_LAST_CAP: u64 = 40;
+pub(crate) const CAP_LAST_CAP: u64 = 40;
 const CAP_SYS_RAWIO: u64 = 1 << 17;
 const CAP_SYS_CHROOT: u64 = 1 << 18;
 pub(crate) const CAP_SYS_PTRACE: u64 = 1 << 19;
@@ -36,7 +36,7 @@ const SET_USER_ID: u32 = 0o4000;
 const SET_GROUP_ID: u32 = 0o2000;
 const GROUP_EXECUTE: u32 = 0o010;
 /// `NGROUPS_MAX`.
-const MAX_GROUPS: u64 = 65536;
+pub(crate) const MAX_GROUPS: u64 = 65536;
 /// The ID that means "unchanged", and that names no user or group.
 const UNCHANGED: u32 = u32::MAX;
 /// `capget` and `capset`'s header versions: one 32-bit set of each kind, then

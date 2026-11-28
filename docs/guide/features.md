@@ -2170,7 +2170,23 @@ kernel.
   again once the socket is ready, unless it asked not to (`MSG_DONTWAIT`,
   `IORING_ACCEPT_DONTWAIT`), when it completes with `EAGAIN`.
   `IORING_RECVSEND_POLL_FIRST` and `IORING_ACCEPT_POLL_FIRST` wait first.
-  A send adds `MSG_NOSIGNAL`. With `MSG_WAITALL`, a stream or
+  A send adds `MSG_NOSIGNAL`. With `IORING_SEND_VECTORIZED` it sends the
+  iovecs at its address, as many as its length says, which it reads as it
+  is prepared (`io_net_import_vec`). With `IOSQE_BUFFER_SELECT` it sends
+  from the buffers it selects as it first runs, and keeps them while it
+  waits (`io_buffers_select`): a group it does not find is `ENOENT`, one
+  with none left `ENOBUFS`, and a ring's buffer outside the user half
+  `EFAULT`. A buffer is cut to the length, as Linux master cuts it, its
+  ring entry as it was. Its completion names the first, as a
+  read's does, and so does one that fails. With `IORING_RECVSEND_BUNDLE` a
+  send sends all it has (`MSG_WAITALL`), and one that selects takes as
+  many of a ring's buffers as its length needs, at most 256, leaving one
+  it would cut for the next unless the ring has `IOU_PBUF_RING_INC`; taking
+  the last one there is empties the group. A bundle that
+  sent anything posts with `IORING_CQE_F_MORE` and sends again at once,
+  with no length and new buffers, until it sends nothing, takes its
+  group's last buffers or waited (`io_send_finish`); one that selects none
+  sends nothing the second time. With `MSG_WAITALL`, a stream or
   sequenced-packet socket's send or receive goes on to its whole length
   and gives all it moved; one that fails on the way, as it asked not to
   wait or was cancelled, gives what it moved too (`io_sendrecv_fail`). A
@@ -4924,9 +4940,27 @@ kernel.
   (`ptrace`, `process_vm_readv`, `pidfd_getfd`, `/proc/<pid>/mem` and the
   other files that attach), and at 2 `PTRACE_TRACEME` needs a tracer with
   `CAP_SYS_PTRACE` in the caller's user namespace and at 3 is refused
-  (`EPERM`), as `yama_ptrace_traceme`. `/proc/sys/kernel` lists only these,
-  the six below and `yama`, and each directory of `/proc/sys` lists its
-  entries by name, as Linux's tree of them keeps them.
+  (`EPERM`), as `yama_ptrace_traceme`.
+  `/proc/sys/kernel` also has the machine's constants, of mode 0444 and
+  root's, which no one opens to write (`EACCES`): `cap_last_cap` (40, the
+  highest capability `prctl` takes) and `ngroups_max` (65536, the most
+  groups `setgroups` takes), as Linux's `kernel/sysctl.c`; and
+  `seccomp/actions_avail`, the names of the actions
+  `SECCOMP_GET_ACTION_AVAIL` takes, as `kernel/seccomp.c` has it
+  (`actions_logged`, which Linux has beside it, is not made, as nothing is
+  logged). `/proc/sys/kernel/random` has the files of Linux's
+  `drivers/char/random.c`: `poolsize`, `entropy_avail` and
+  `write_wakeup_threshold` 256, the bits of a pool that is ready, as on a
+  booted machine, and `urandom_min_reseed_secs` 60, of which the last two
+  are of mode 0644 and take what root writes whole, to no effect
+  (`proc_do_rointvec`); `boot_id`, a random version 4 UUID the machine draws
+  at its first read and keeps, and `uuid`, a new one at each read
+  (`proc_do_uuid`). A string among these is read from where the file is, as
+  `proc_dostring` reads it, and an `int` only from the start.
+  `/proc/sys/kernel` lists only these, the six below and the directories
+  `random`, `seccomp` and `yama`, and each directory of `/proc/sys` lists
+  its entries by name, directories among files, as Linux's tree of them
+  keeps them.
 
 - `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
   `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`
@@ -6228,19 +6262,9 @@ kernel.
   and no wider than the spill, which the load zero- or sign-extends), a
   load through a scalar ("R%d invalid mem
   access 'scalar'", `EACCES`) and the exit's R0, which may be any value.
-  Of a scalar it knows the bits and the unsigned and signed bounds, of 64
-  and of 32 bits, as Linux 7.0's verifier follows them (`tnum`,
-  `umin_value` to `s32_max_value`): through each ALU operation, the zero or
-  sign extension of a load, and `bpf_get_smp_processor_id`'s result below
-  the CPUs. A copy, a spill and its fill link a scalar to its copy, and to
-  one with a constant added (`BPF_ADD_CONST`). A conditional jump goes one
-  way where the bounds decide it (`is_branch_taken`), and is walked both
-  ways otherwise, each with what holds there (`reg_set_min_max`) in the
-  registers compared and those linked to them (`sync_linked_regs`). A
-  `BPF_AND` or `BPF_OR` of a constant to a register that is -1 or 0 is
-  walked once for each (`maybe_fork_scalars`). It gives up as Linux does
-  after 1,000,000 instructions or 8,192 jumps waiting to be walked
-  (`E2BIG`).
+  A conditional jump whose operands it knows goes one way; any other is
+  walked both ways. It gives up as Linux does after 1,000,000 instructions
+  or 8,192 jumps waiting to be walked (`E2BIG`).
 
 - Programs use maps as Linux's verifier lets them. A `BPF_LD_IMM64` of a
   map's descriptor (`BPF_PSEUDO_MAP_FD`) gives the map, and one of its
@@ -6637,7 +6661,8 @@ kernel.
   forked child's inherited file reads the child's signals. Edge-triggered
   `epoll` gets an edge for each signal queued to the process or any of its
   threads while one of the file's signals is pending for the waiter, as Linux's `signalfd_notify`
-  wakes the file for each: another real-time signal of a number already
+  wakes the file for each, as it is sent, even when another thread has yet
+  to take it in: another real-time signal of a number already
   waiting counts, a standard signal already pending or one ignored and
   unblocked does not; a new mask is an edge too. `signalfd` on a
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);

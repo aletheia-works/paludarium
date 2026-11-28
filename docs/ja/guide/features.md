@@ -1884,7 +1884,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EAGAIN`、または進行中の接続）は、見つけたファイルを持ったままソケットを待ち、ソケットの
   準備ができるともう一度実行します。ただし待たないように頼んだもの（`MSG_DONTWAIT`、
   `IORING_ACCEPT_DONTWAIT`）は `EAGAIN` で完了します。`IORING_RECVSEND_POLL_FIRST` と
-  `IORING_ACCEPT_POLL_FIRST` は先に待ちます。送信は `MSG_NOSIGNAL` を加えます。`MSG_WAITALL` では、
+  `IORING_ACCEPT_POLL_FIRST` は先に待ちます。送信は `MSG_NOSIGNAL` を加えます。
+  `IORING_SEND_VECTORIZED` では、アドレスにある iovec を長さの数だけ送り、iovec は準備のときに
+  読みます（`io_net_import_vec`）。`IOSQE_BUFFER_SELECT` では、最初に実行するときに選んだバッファーから送り、
+  待つあいだも持ち続けます（`io_buffers_select`）。見つからないグループは `ENOENT`、残りのないグループは
+  `ENOBUFS`、ユーザー空間の外にあるリングのバッファーは `EFAULT` です。バッファーは Linux master と同じく
+  長さに切り詰め、リングのエントリーはそのままにします。完了は、読み込みと同じく
+  最初のバッファーを示し、失敗した完了も同じです。`IORING_RECVSEND_BUNDLE` の送信はあるものを
+  すべて送り（`MSG_WAITALL`）、バッファーを選ぶものは長さに要るだけのリングのバッファーを、最大 256 個
+  取ります。切り詰めることになるバッファーは、リングが `IOU_PBUF_RING_INC` でなければ次に残し、
+  最後のバッファーを取るとグループは空になります。何か送ったバンドルは `IORING_CQE_F_MORE` 付きで投稿して、長さなしの新しいバッファーで
+  すぐにまた送り、何も送らなくなるか、グループの最後のバッファーを取るか、待ったところで終わります
+  （`io_send_finish`）。バッファーを選ばないものは、2 度目には何も送りません。`MSG_WAITALL` では、
   ストリームまたは順序付きパケットのソケットの送受信は長さ全体まで続け、動かした分をすべて
   返します。途中で失敗したもの（待たないように頼んだものや、取り消されたもの）も、それまでに動かした分を
   返します（`io_sendrecv_fail`）。受信は提供されたバッファーを選べ（`ENOBUFS`）、そのバッファーは、Linux master の
@@ -4215,8 +4226,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>/mem` など、アタッチするファイル）。`yama_ptrace_traceme` と同じく、2 では
   `PTRACE_TRACEME` に、呼び出し元のユーザー名前空間で `CAP_SYS_PTRACE` を持つトレーサーを求め、
   3 では断ります（`EPERM`）。
-  `/proc/sys/kernel` にあるのはこれらと次の 6 つ、そして `yama` だけで、`/proc/sys` のどの
-  ディレクトリも、Linux の木と同じく、名前の順に並べます。
+  `/proc/sys/kernel` には、マシンの定数もあります。root の持つモード 0444 のファイルで、
+  書くために開ける者はいません（`EACCES`）。Linux の `kernel/sysctl.c` と同じ
+  `cap_last_cap`（40。`prctl` が取る最大のケーパビリティ）と `ngroups_max`（65536。
+  `setgroups` が取るグループの最大数）、そして `kernel/seccomp.c` と同じ
+  `seccomp/actions_avail`（`SECCOMP_GET_ACTION_AVAIL` が取るアクションの名前）です。
+  Linux でその隣にある `actions_logged` は、何もログに残さないので作りません。
+  `/proc/sys/kernel/random` には Linux の `drivers/char/random.c` のファイルがあります。
+  `poolsize`、`entropy_avail`、`write_wakeup_threshold` は、起動を終えたマシンと同じく
+  準備のできたプールのビット数の 256 で、`urandom_min_reseed_secs` は 60 です。このうち
+  最後の 2 つはモード 0644 で、root が書いたものを丸ごと受け取り、何も変えません
+  （`proc_do_rointvec`）。`boot_id` はマシンが最初に読まれたときに引いて保つ、ランダムな
+  バージョン 4 の UUID で、`uuid` は読むたびに新しいものです（`proc_do_uuid`）。これらのうち
+  文字列のものは、`proc_dostring` と同じくファイルの今の位置から読め、`int` のものは先頭からしか
+  読めません。
+  `/proc/sys/kernel` にあるのはこれらと次の 6 つ、そしてディレクトリの `random`、`seccomp`、
+  `yama` だけで、`/proc/sys` のどの
+  ディレクトリも、Linux の木と同じく、ディレクトリもファイルと混ぜて名前の順に並べます。
 
 - `/proc/sys/kernel` には、Linux の `kernel/utsname_sysctl.c` と同じく、UTS 名前空間の名前も
   あります。`arch`、`ostype`、`osrelease`、`version`（root のモード 0444）と、`hostname`、
@@ -5316,17 +5342,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   まるごと読むポインタ、Linux がわかるところでのスタックからの読み込みの値（書いた 0 か、
   スピルしたスカラーをその先頭からスピル以下の幅で読んだもの。ロードがゼロ拡張か符号拡張
   します）、スカラーを通した読み込み（"R%d invalid mem access 'scalar'"、
-  `EACCES`）、exit のときの R0（値は何でもかまいません）です。スカラーについては、
-  Linux 7.0 の検証器と同じく、ビットと、64 ビットと 32 ビットの符号なしと符号付きの範囲を
-  知っています（`tnum`、`umin_value` から `s32_max_value`）。それぞれの ALU 演算、ロードの
-  ゼロ拡張と符号拡張、CPU の数より小さい `bpf_get_smp_processor_id` の結果を通して追います。
-  コピー、スピルとそのフィル、定数を足したコピー（`BPF_ADD_CONST`）は元のスカラーとつながり
-  ます。条件ジャンプは、範囲で決まるところでは一方へだけ進み（`is_branch_taken`）、ほかは
-  両方を、それぞれの側で成り立つことを比べたレジスタとそれにつながるレジスタに入れて
-  たどります（`reg_set_min_max`、`sync_linked_regs`）。-1 か 0 のレジスタに定数を
-  `BPF_AND` か `BPF_OR` すると、それぞれの値で一度ずつたどります（`maybe_fork_scalars`）。
-  Linux と同じく、1,000,000 命令か、たどるのを待つジャンプが 8,192 個を超えるとあきらめます
-  （`E2BIG`）。
+  `EACCES`）、exit のときの R0（値は何でもかまいません）です。オペランドを知っている
+  条件ジャンプは一方へだけ進み、ほかは両方をたどります。Linux と同じく、1,000,000 命令か、
+  たどるのを待つジャンプが 8,192 個を超えるとあきらめます（`E2BIG`）。
 
 - プログラムは、Linux の検証器が許すとおりにマップを使えます。マップのディスクリプタの
   `BPF_LD_IMM64`（`BPF_PSEUDO_MAP_FD`）はマップを、その値の `BPF_LD_IMM64`
@@ -5641,7 +5659,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルは子のシグナルを読みます。エッジトリガーの `epoll` は、ファイルのシグナルが
   待つスレッドに保留されている間、プロセスかそのどれかのスレッドにシグナルが積まれる
   たびにエッジを受けます。
-  Linux の `signalfd_notify` が、そのたびにファイルを起こすのと同じです。同じ番号が
+  Linux の `signalfd_notify` が、そのたびにファイルを起こすのと同じで、ほかのスレッドが
+  まだ取り込んでいなくても、送られたときに数えます。同じ番号が
   待っているリアルタイムシグナルも数え、すでに保留されている標準のシグナルや、
   ブロックされずに無視されるシグナルは数えません。マスクが変わるのもエッジです。
   signalfd のディスクリプタに `signalfd` を呼ぶと

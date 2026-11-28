@@ -499,6 +499,7 @@ impl Kernel {
 /// fatal when blocked or ignored.
 pub(crate) fn forced_sigsegv() -> signals::PendingSignal {
     signals::PendingSignal {
+        counted: false,
         target: signals::PendingTarget::Thread,
         number: paludarium_types::signal::SIGSEGV,
         code: 0x80,

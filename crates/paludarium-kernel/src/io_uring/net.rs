@@ -14,8 +14,8 @@ use paludarium_host::FileHandle;
 use paludarium_types::{Errno, GuestAddr};
 
 use super::{
-    Chosen, POLL_IN_EVENTS, POLL_OUT_EVENTS, POLL_UNMASK, Ring, Waits, Work, file_of, give_back,
-    int_at, select, u16_at, u32_at, u64_at,
+    Chosen, POLL_IN_EVENTS, POLL_OUT_EVENTS, POLL_UNMASK, Picked, Ring, Waits, Work, file_of,
+    give_back, int_at, select, u16_at, u32_at, u64_at,
 };
 use crate::files::Descriptor;
 use crate::sockets::MessageHeader;
@@ -106,6 +106,14 @@ impl Net {
     /// Whether it goes on after `res`, which it posts: an accept after any
     /// connection, a receive after any bytes but the last it may take.
     pub(super) fn goes_on(&mut self, res: i32) -> bool {
+        if let Op::Transfer {
+            bundle: true,
+            ref mut next,
+            ..
+        } = self.op
+        {
+            return std::mem::take(next);
+        }
         if !self.multishot || self.ended {
             return false;
         }
@@ -126,6 +134,24 @@ impl Net {
     /// receive after `MULTISHOT_MAX_RETRY` tries in a row, which gives
     /// other task work a turn; here it goes on.
     pub(super) fn posted(&mut self, flags: u32) {
+        // `io_mshot_prep_retry`: a bundle sends again at once, all its
+        // buffer sent (`sr->len` is 0), and selects anew.
+        if let Op::Transfer {
+            bundle: true,
+            ref mut len,
+            ref mut done,
+            ref mut vector,
+            ref mut picked,
+            ..
+        } = self.op
+        {
+            (*len, *done) = (0, 0);
+            if let Some(vector) = vector {
+                vector.clear();
+            }
+            *picked = None;
+            return;
+        }
         let Some(file) = self.found.as_ref().map(|found| Arc::clone(&found.file)) else {
             return;
         };
@@ -177,15 +203,24 @@ enum Op {
         done: u64,
         /// The `msghdr` of an `IORING_OP_SENDMSG` or `_RECVMSG`, at `buf`.
         message: Option<Box<MessageHeader>>,
+        /// A send with `IORING_RECVSEND_BUNDLE`, and whether it goes on
+        /// after the completion it posts (`io_send_finish`).
+        bundle: bool,
+        next: bool,
+        /// The buffers of a send with `IORING_SEND_VECTORIZED`, as they are
+        /// left to go.
+        vector: Option<Vec<(u64, usize)>>,
+        /// The buffers a send selected, as they are left to go, which it
+        /// keeps until it completes.
+        picked: Option<Picked>,
     },
 }
 
 /// Prepares a socket request from its entry (`io_shutdown_prep`,
 /// `io_socket_prep`, `io_accept_prep`, `io_connect_prep` and
 /// `io_sendmsg_prep` or `io_recvmsg_prep` with `io_send_setup`), but for
-/// what it reads of the caller's memory ([`prepare_memory`]). Bundles,
-/// vectored sends and a send's selected buffer are not there yet
-/// (`EINVAL`).
+/// what it reads of the caller's memory ([`prepare_memory`]). A receive's
+/// bundle is not there yet (`EINVAL`).
 pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Errno> {
     let fixed = sqe_flags & super::IOSQE_FIXED_FILE != 0;
     let select = sqe_flags & super::IOSQE_BUFFER_SELECT != 0;
@@ -273,11 +308,19 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
             if ioprio & !if send { SENDMSG_FLAGS } else { RECVMSG_FLAGS } != 0 {
                 return Err(Errno::EINVAL);
             }
-            let msg_flags = if send {
+            let bundle = ioprio & RECVSEND_BUNDLE != 0;
+            let mut msg_flags = if send {
                 rw_flags | MSG_NOSIGNAL
             } else {
                 rw_flags
             };
+            // A bundle sends all it has (`MSG_WAITALL`), but no message.
+            if bundle && send {
+                if message {
+                    return Err(Errno::EINVAL);
+                }
+                msg_flags |= MSG_WAITALL;
+            }
             if !send && ioprio & RECV_MULTISHOT != 0 {
                 if !select || msg_flags & MSG_WAITALL != 0 {
                     return Err(Errno::EINVAL);
@@ -292,16 +335,14 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 // Only a multishot receive takes `optlen`.
                 return Err(Errno::EINVAL);
             }
-            // Bundles, vectored sends, a send's selected buffer and a
-            // selected buffer that a receive fills whole are not there yet.
-            // A message is no bundle, and its iovecs are vectored anyway.
-            let vectored = ioprio & SEND_VECTORIZED != 0 && !message;
-            if ioprio & RECVSEND_BUNDLE != 0
-                || vectored
-                || select && (send || msg_flags & MSG_WAITALL != 0)
-            {
+            // A receive's bundle and a selected buffer that a receive fills
+            // whole are not there yet; `IORING_OP_RECVMSG` takes no bundle.
+            if !send && (bundle || select && msg_flags & MSG_WAITALL != 0) {
                 return Err(Errno::EINVAL);
             }
+            // A message's iovecs are vectored anyway, and a send that
+            // selects its buffers takes no others.
+            let vectored = ioprio & SEND_VECTORIZED != 0 && !message && !select;
             // `__pad3[0]`, and what a message has none of.
             if send && !message && u16_at(sqe, 46) != 0
                 || send && message && (off != 0 || file_index != 0)
@@ -318,6 +359,10 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 group: select.then_some(buf_index),
                 done: 0,
                 message: message.then(Box::default),
+                bundle,
+                next: false,
+                vector: vectored.then(Vec::new),
+                picked: None,
             }
         }
         _ => return Err(super::EOPNOTSUPP),
@@ -353,6 +398,7 @@ pub(super) fn prepare_memory(c: &Context<'_>, net: &mut Net) -> Result<(), Errno
             group,
             send,
             ref mut message,
+            ref mut vector,
             ..
         } => {
             if let Some(message) = message {
@@ -365,6 +411,11 @@ pub(super) fn prepare_memory(c: &Context<'_>, net: &mut Net) -> Result<(), Errno
             }
             if let Some((at, to_len)) = to {
                 crate::inet::read_raw(c, at, u64::from(to_len))?;
+            }
+            // `io_net_import_vec`: `len` iovecs at `buf`.
+            if let Some(vector) = vector {
+                *vector = crate::files::iovecs_checked(c.mem, buf, u64::from(*len), |_, _| Ok(()))?;
+                return Ok(());
             }
             *len = (*len).min(crate::files::MAX_RW_COUNT as u32);
             if group.is_none() {
@@ -513,7 +564,7 @@ pub(super) fn run(
     match issued {
         Issued::Done(res, flags, failed) => (res, flags, failed || res < 0, None),
         // `io_queue_async`: one that asked not to wait fails.
-        Issued::Again(_) if nowait => (failed(net, Errno::EAGAIN), 0, true, None),
+        Issued::Again(_) if nowait => (failed(net, Errno::EAGAIN), kept(net), true, None),
         Issued::Again(mask) => (
             0,
             0,
@@ -534,6 +585,18 @@ pub(super) fn failed(net: &Net, e: Errno) -> i32 {
     match net.op {
         Op::Transfer { done, .. } if done != 0 => done as i32,
         _ => -e.0,
+    }
+}
+
+/// The completion's flags of a send that fails with the buffers it
+/// selected, which it used (`io_put_kbuf`).
+pub(super) fn kept(net: &Net) -> u32 {
+    match &net.op {
+        Op::Transfer {
+            picked: Some(picked),
+            ..
+        } => picked.flags(),
+        _ => 0,
     }
 }
 
@@ -763,6 +826,10 @@ fn transfer(
         group,
         done,
         message,
+        bundle,
+        next,
+        vector,
+        picked,
     } = op
     else {
         unreachable!()
@@ -784,27 +851,47 @@ fn transfer(
     }
     let call_flags = *msg_flags | MSG_DONTWAIT;
     let chosen = match *group {
-        Some(bgid) => match select(c, ring, bgid, *len, true) {
+        Some(bgid) if !send => match select(c, ring, bgid, *len, true) {
             Ok(chosen) => Some(chosen),
             Err(e) => return Issued::Done(-e.0, 0, true),
         },
-        None => None,
+        _ => None,
     };
-    let (at, count) = match &chosen {
-        Some(chosen) => (
+    // A send selects its buffers once, and keeps them while it waits
+    // (`io_do_buffer_select`).
+    if send
+        && let Some(bgid) = *group
+        && picked.is_none()
+    {
+        match super::select_send(c, ring, bgid, *len, *bundle) {
+            Ok(chosen) => *picked = Some(chosen),
+            Err(e) => return Issued::Done(-e.0, 0, true),
+        }
+    }
+    let pieces = match (&*picked, &*vector) {
+        (Some(picked), _) => Some(picked.pieces.clone()),
+        (None, Some(vector)) => Some(vector.clone()),
+        _ => None,
+    };
+    let (at, count) = match (&chosen, &pieces) {
+        (Some(chosen), _) => (
             chosen.addr,
             chosen.len.min(crate::files::MAX_RW_COUNT as u32),
         ),
-        None => (*buf, *len),
+        (None, Some(pieces)) if pieces.len() == 1 => (pieces[0].0, pieces[0].1 as u32),
+        _ => (*buf, *len),
     };
+    // A send of several buffers goes as a message of them.
+    let several = pieces.filter(|pieces| pieces.len() != 1);
     if let Some(message) = message
         && chosen.is_some()
     {
         message.iov = vec![(at, count as usize)];
     }
-    let total = match message {
-        Some(message) => message.iov.iter().map(|&(_, len)| len as u64).sum(),
-        None => u64::from(count),
+    let total = match (&*message, &several) {
+        (Some(message), _) => message.iov.iter().map(|&(_, len)| len as u64).sum(),
+        (None, Some(pieces)) => pieces.iter().map(|&(_, len)| len as u64).sum(),
+        (None, None) => u64::from(count),
     };
     let whole = *msg_flags & MSG_WAITALL != 0;
     // A receive with ancillary data is not gone on with.
@@ -836,6 +923,11 @@ fn transfer(
                 && u32::from_le_bytes(flags) & (MSG_TRUNC | MSG_CTRUNC) != 0;
         }
         result
+    } else if let Some(pieces) = several {
+        let name = to.filter(|&(_, len)| len != 0);
+        let header = MessageHeader::of_send(name.map(|(at, len)| (at, usize::from(len))), pieces);
+        let a = [0, *buf, u64::from(asked), 0, 0, 0];
+        crate::sockets::with_header(*buf, &header, || crate::sockets::route_file(c, 46, a, file))
     } else {
         let (to_at, to_len) = to.map_or((0, 0), |(at, len)| (at, u64::from(len)));
         let a = [0, at, u64::from(count), u64::from(asked), to_at, to_len];
@@ -866,9 +958,11 @@ fn transfer(
             Ok(n) if n > 0 && crate::sockets::is_stream(file) => {
                 // A selected buffer is never filled whole: the preparation
                 // refused that.
-                match message {
-                    Some(message) => go_on(message, n, send),
-                    None => {
+                match (message, picked, vector) {
+                    (Some(message), ..) => go_on(message, n, send),
+                    (None, Some(picked), _) => advance(&mut picked.pieces, n),
+                    (None, None, Some(vector)) => advance(vector, n),
+                    (None, None, None) => {
                         *buf = buf.wrapping_add(n);
                         *len -= n as u32;
                     }
@@ -893,6 +987,14 @@ fn transfer(
         } else {
             cflags |= give_back(c, ring, chosen, &Ok(res as u64));
         }
+    }
+    if let Some(picked) = &*picked {
+        cflags |= picked.flags();
+    }
+    // `io_send_finish`: a bundle posts what it sent and goes on, unless it
+    // sent nothing, took its group's last buffers or waited.
+    if *bundle {
+        *next = res > 0 && !picked.as_ref().is_some_and(|picked| picked.emptied) && !polled;
     }
     if inq.is_some_and(|inq| inq > 0) {
         cflags |= CQE_F_SOCK_NONEMPTY;
@@ -997,17 +1099,22 @@ fn receive_messages(
 /// What is left of a message after `n` bytes of it, a send's without its
 /// ancillary data, which went.
 fn go_on(message: &mut MessageHeader, n: u64, send: bool) {
+    advance(&mut message.iov, n);
+    if send {
+        (message.control, message.control_len) = (0, 0);
+    }
+}
+
+/// What is left of `pieces` once `n` bytes of them went.
+fn advance(pieces: &mut Vec<(u64, usize)>, n: u64) {
     let mut n = n as usize;
-    message.iov.retain_mut(|(base, len)| {
+    pieces.retain_mut(|(base, len)| {
         let here = n.min(*len);
         *base = base.wrapping_add(here as u64);
         *len -= here;
         n -= here;
         *len != 0
     });
-    if send {
-        (message.control, message.control_len) = (0, 0);
-    }
 }
 
 /// `io_kbuf_recycle`: a provided buffer goes back to the front of its

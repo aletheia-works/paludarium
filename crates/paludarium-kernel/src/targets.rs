@@ -39,6 +39,11 @@ pub(crate) struct Tif {
     killable: AtomicBool,
     /// What wakes it from such a wait.
     wake: Arc<AtomicBool>,
+    /// Its own pending standard signals as its last drain, take or discard
+    /// left them, or more: all of them until that first drain, and those
+    /// queued for it since then without its inbox, which it has not drained
+    /// yet ([`Self::queues`] counts on no fewer).
+    own: AtomicU64,
 }
 
 impl Tif {
@@ -46,10 +51,35 @@ impl Tif {
         Self {
             // A new thread looks, as `calculate_sigpending` has it.
             look: AtomicBool::new(true),
+            own: AtomicU64::new(u64::MAX),
             asleep,
             wake,
             ..Self::default()
         }
+    }
+    pub(crate) fn set_own(&self, set: u64) {
+        self.own.store(set, Ordering::SeqCst);
+    }
+    /// No standard signal `number` is pending for the thread any more: a
+    /// discard took them all away, though the thread drops its own only at
+    /// its next drain.
+    pub(crate) fn forget_own(&self, number: i32) {
+        if (1..32).contains(&number) {
+            self.own
+                .fetch_and(!(1u64 << (number - 1)), Ordering::SeqCst);
+        }
+    }
+    /// Whether Linux's `__send_signal_locked` queues signal `number` sent to
+    /// this thread alone, and so wakes the process's signal files
+    /// (`signalfd_notify`): `prepare_signal` does not drop it as ignored,
+    /// as it does one neither blocked, nor waited for (`real_blocked`), nor
+    /// for a traced thread, whose action ignores it (`ignored`); and no
+    /// standard signal of its number is pending for the thread already
+    /// (`legacy_queue`).
+    pub(crate) fn queues(&self, number: i32, ignored: bool) -> bool {
+        let bit = 1u64 << (number - 1);
+        let kept = self.blocked() & bit != 0 || self.traced.load(Ordering::SeqCst) || !ignored;
+        kept && (number >= 32 || self.own.load(Ordering::SeqCst) & bit == 0)
     }
     pub(crate) fn blocked(&self) -> u64 {
         self.blocked.load(Ordering::SeqCst)
@@ -211,6 +241,13 @@ impl Targets {
         let mut list = self.list();
         (list.leader, list.current) = (tid, tid);
         list.threads = vec![(tid, Arc::clone(tif))];
+    }
+    /// A discard took every pending signal `number` away from the threads
+    /// (`flush_sigqueue_mask` on each): one sent next counts as it is sent.
+    pub(crate) fn forget_own(&self, number: i32) {
+        for (_, tif) in &self.list().threads {
+            tif.forget_own(number);
+        }
     }
     /// No thread is in a group stop any more: SIGCONT came.
     pub(crate) fn resume(&self) {

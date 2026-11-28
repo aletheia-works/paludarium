@@ -292,6 +292,14 @@ static int case_edges(void) {
     pthread_kill(other, SIGUSR2);
     say("other thread's signal %d", epoll_wait(edge, out, 2, 1000));
     say("other thread quiet %d", epoll_wait(edge, out, 2, 200));
+    /* With no wait: the signal is counted as it is sent, not as the other
+       thread takes it in, which comes to nothing more later; a standard
+       signal already pending for that thread queues nothing. */
+    pthread_kill(other, SIGUSR2);
+    say("other thread's again %d", epoll_wait(edge, out, 2, 0));
+    pthread_kill(other, rt);
+    say("other thread's at once %d", epoll_wait(edge, out, 2, 0));
+    say("other thread quiet again %d", epoll_wait(edge, out, 2, 200));
     write(edge_thread_pipe[1], "x", 1);
     pthread_join(other, NULL);
     struct signalfd_siginfo info[8];

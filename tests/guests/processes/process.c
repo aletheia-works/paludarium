@@ -19211,10 +19211,6 @@ static int grl_inner(const char *self) {
     for (unsigned i = 0; i < 3; i++) printf("exec %s=%d\n", runs[i], gl_exec(self, runs[i], 0));
     return 0;
 }
-/* `execve` through a magic link on the way (`/proc/self/fd/<n>/name`,
- * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
- * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
- * `self/mounts` (`proc_symlink`). */
 /* The magic-link-names case: a link of /proc or /dev that is the last
    name, with a trailing slash, is the name the calls that make, remove or
    rename it find (EEXIST, EISDIR, ENOTDIR), not the file it leads to. Only
@@ -19257,6 +19253,10 @@ static int magic_link_names_case(void) {
     printf("cleaned=%d\n", rmdir(base) == 0);
     return 0;
 }
+/* `execve` through a magic link on the way (`/proc/self/fd/<n>/name`,
+ * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
+ * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
+ * `self/mounts` (`proc_symlink`). */
 static int proc_links_case(const char *self) {
     char exe[4096], dir[4096];
     if (!realpath(self, exe)) return 1;

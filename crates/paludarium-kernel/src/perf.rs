@@ -27,7 +27,7 @@ mod side_band;
 
 pub(crate) use buffer::{buffers_mapped, scheduled_in};
 pub(crate) use sample::{Task, Who, clock_due, overflow, samples_faults, sampling};
-pub(crate) use side_band::{Space, comm, wanted};
+pub(crate) use side_band::{Space, comm, switched, switches, wanted};
 
 use crate::ThreadGroup;
 use crate::syscalls::{Context, Outcome};
@@ -148,6 +148,7 @@ mod bit {
     pub const EXCLUDE_CALLCHAIN_KERNEL: u32 = 21;
     pub const EXCLUDE_CALLCHAIN_USER: u32 = 22;
     pub const USE_CLOCKID: u32 = 25;
+    pub const CONTEXT_SWITCH: u32 = 26;
     pub const WRITE_BACKWARD: u32 = 27;
     pub const NAMESPACES: u32 = 28;
     pub const AUX_OUTPUT: u32 = 31;
@@ -552,6 +553,10 @@ pub(crate) struct Events {
     /// Whether an event has asked for side-band records, so that
     /// the hooks look for those that take them only then ([`side_band`]).
     side_band: std::sync::atomic::AtomicBool,
+    /// Whether an event with `context_switch` has been opened, so that a
+    /// thread's return from a sleep writes its `PERF_RECORD_SWITCH`
+    /// records only then (`nr_switch_events`).
+    switches: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -632,7 +637,11 @@ impl Events {
         lists.side_band.retain(|event| event.strong_count() > 0);
         lists.asking.retain(|event| event.strong_count() > 0);
         lists.cpu_sampling.retain(|event| event.strong_count() > 0);
-        if side_band::asks(&event.attr) {
+        let switches = event.attr.flag(bit::CONTEXT_SWITCH);
+        if switches {
+            self.switches.store(true, Ordering::Relaxed);
+        }
+        if side_band::asks(&event.attr) || switches {
             self.side_band.store(true, Ordering::Relaxed);
             lists.asking.push(erase(event));
             if matches!(event.target, Target::Cpu) {

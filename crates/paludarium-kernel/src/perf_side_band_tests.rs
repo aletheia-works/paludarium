@@ -923,3 +923,73 @@ fn mmap2_records_give_the_build_id_an_event_asks_for() {
         }
     }
 }
+
+/// A sleep is a `PERF_RECORD_SWITCH` out and one back in, written as the
+/// thread runs again: to an event of the thread with the thread's IDs
+/// alone, and to one of its CPU as `SWITCH_CPU_WIDE` with the idle task as
+/// the thread that ran instead. A disabled event and one without
+/// `context_switch` take none.
+#[test]
+fn a_sleep_is_a_switch_out_and_back_in() {
+    const ATTR_CONTEXT_SWITCH: u64 = 1 << 26;
+    const RECORD_SWITCH: u64 = 14;
+    const RECORD_SWITCH_CPU_WIDE: u64 = 15;
+    const SWITCH_OUT: u64 = 1 << 13;
+    let mut env = Env::new();
+    let pid = env.call(GETPID, [0; 6]) as u32;
+    let tid = env.call(GETTID, [0; 6]) as u32;
+    env.pin();
+    let (own_fd, own) = env.open_side_band(0, -1, ATTR_CONTEXT_SWITCH).unwrap();
+    let (cpu_fd, cpu) = env.open_side_band(-1, 0, ATTR_CONTEXT_SWITCH).unwrap();
+    let (_, disabled) = env.open_side_band(0, -1, ATTR_CONTEXT_SWITCH).unwrap();
+    let (comm_fd, comm) = env.open_side_band(0, -1, ATTR_COMM).unwrap();
+    for fd in [own_fd, cpu_fd, comm_fd] {
+        env.ioctl(fd, IOC_ENABLE);
+    }
+    let _ = paludarium_host::switches::take();
+    for _ in 0..2 {
+        paludarium_host::switches::sleep(&mut false);
+    }
+    env.call(GETPID, [0; 6]);
+    // A call that did not sleep writes none.
+    env.call(GETPID, [0; 6]);
+    for page in [own, cpu, disabled, comm] {
+        let mut seen = Vec::new();
+        env.each_record(page, |_, record| seen.push(record.to_vec()));
+        let records: Vec<String> = seen
+            .iter()
+            .map(|record| {
+                let kind = record[0] & 0xffff_ffff;
+                let out = record[0] >> 32 & SWITCH_OUT != 0;
+                let ids = halves(record[record.len() - 1]) == [pid, tid];
+                let instead = match kind {
+                    RECORD_SWITCH => String::new(),
+                    RECORD_SWITCH_CPU_WIDE => format!(" instead {:?}", halves(record[1])),
+                    _ => " other".to_string(),
+                };
+                format!(
+                    "{kind} out {out} size {} ids {ids}{instead}",
+                    record[0] >> 48
+                )
+            })
+            .collect();
+        env.say(format!("{records:?}"));
+    }
+    let own_pair = [
+        "14 out true size 16 ids true",
+        "14 out false size 16 ids true",
+    ];
+    let cpu_pair = [
+        "15 out true size 24 ids true instead [0, 0]",
+        "15 out false size 24 ids true instead [0, 0]",
+    ];
+    check(
+        &env.lines,
+        &[
+            &format!("{:?}", [own_pair, own_pair].concat()),
+            &format!("{:?}", [cpu_pair, cpu_pair].concat()),
+            "[]",
+            "[]",
+        ],
+    );
+}

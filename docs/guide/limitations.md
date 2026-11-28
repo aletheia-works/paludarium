@@ -430,8 +430,13 @@ verified.
   start-up) as if its pages were all cached, where Linux gives none for a
   page it has not read or has evicted; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
-  failed `clone` writes neither; and `NAMESPACES`, `CGROUP`,
-  `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
+  failed `clone` writes neither; a thread is switched out only when it
+  sleeps, never preempted (`PERF_RECORD_MISC_SWITCH_OUT_PREEMPT`), and both
+  `SWITCH` records of a sleep are written as it runs again, the first with
+  the time it woke, where Linux writes it as the thread goes to sleep; an
+  event of a CPU takes only the guest's threads' switches, each with the
+  idle task (0) as the thread that ran instead; and `NAMESPACES`, `CGROUP`,
+  `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE` and `AUX` records are not
   written. When `REFRESH`'s last overflow disables the event, its count
   stops there, but its times (a clock's apart) and its group's other
   events go on up to that point. Its user page shows the count and

@@ -1,8 +1,9 @@
 //! The side-band records, as Linux's `kernel/events/core.c` writes them
 //! to the buffers of the events that ask for them: `PERF_RECORD_MMAP` and
 //! `MMAP2` of a mapping (`perf_event_mmap`), `COMM` of a new name
-//! (`perf_event_comm`), and `FORK` and `EXIT` of a task
-//! (`perf_event_task`). Each goes to the enabled events of the CPU of the
+//! (`perf_event_comm`), `FORK` and `EXIT` of a task
+//! (`perf_event_task`), and `SWITCH` or `SWITCH_CPU_WIDE` of a thread that
+//! went to sleep and runs again (`perf_event_switch`). Each goes to the enabled events of the CPU of the
 //! thread that writes it and those that count it (`perf_iterate_sb`),
 //! through the buffer that event writes to, with the `sample_id` of that
 //! thread.
@@ -19,11 +20,14 @@ const RECORD_COMM: u32 = 3;
 const RECORD_EXIT: u32 = 4;
 const RECORD_FORK: u32 = 7;
 const RECORD_MMAP2: u32 = 10;
+const RECORD_SWITCH: u32 = 14;
+const RECORD_SWITCH_CPU_WIDE: u32 = 15;
 
 const MISC_USER: u16 = 2;
 const MISC_COMM_EXEC: u16 = 1 << 13;
 const MISC_MMAP_DATA: u16 = 1 << 13;
 const MISC_MMAP_BUILD_ID: u16 = 1 << 14;
+const MISC_SWITCH_OUT: u16 = 1 << 13;
 
 const PROT_READ: u32 = 1;
 const PROT_WRITE: u32 = 2;
@@ -57,6 +61,12 @@ fn open(events: &Events, kinds: &[u32]) -> bool {
             .filter_map(super::event)
             .any(|event| kinds.iter().any(|&kind| event.attr.flag(kind)))
 }
+/// Whether an event with `context_switch` has been opened
+/// (`nr_switch_events`), so that a thread's sleeps are looked for.
+pub(crate) fn switches(events: &Events) -> bool {
+    events.switches.load(Ordering::Relaxed)
+}
+
 /// Whether the records of mappings are written (`perf_event_mmap`), which
 /// `mmap2` alone does not have done.
 fn maps(events: &Events) -> bool {
@@ -188,6 +198,45 @@ fn comm_from(
         let mut body = event.pid_tid_of(pid, tid).to_vec();
         body.extend_from_slice(&name);
         event.side_band(RECORD_COMM, misc, &body, who);
+    }
+}
+
+/// The `sleeps` of thread `who` of `group` since it last ran its code,
+/// each a switch out of the CPU and back in: a `PERF_RECORD_SWITCH` with
+/// `PERF_RECORD_MISC_SWITCH_OUT` and one without it, to the enabled events
+/// with `context_switch` of the CPU and those that count the thread, as
+/// `perf_event_task_sched_out` and `perf_event_task_sched_in` write them.
+/// Both are written as it runs again. A thread that `started` was switched
+/// in for its first run, which comes first, alone: inherited events take
+/// that of a new thread or child. An event of a CPU takes
+/// `SWITCH_CPU_WIDE`, which gives the thread that ran instead, here the
+/// idle task (0): no other guest thread takes the CPU from a sleeping one.
+/// A sleeping thread is not runnable, so no switch is a preemption
+/// (`PERF_RECORD_MISC_SWITCH_OUT_PREEMPT`).
+pub(crate) fn switched(
+    events: &Events,
+    group: &ThreadGroup,
+    who: &Who,
+    started: bool,
+    sleeps: u64,
+) {
+    if !started && sleeps == 0 || !switches(events) {
+        return;
+    }
+    let takers = receivers(events, group, who.tid, who, |attr| {
+        attr.flag(bit::CONTEXT_SWITCH)
+    });
+    let first = started.then_some(0);
+    let pairs = (0..sleeps).flat_map(|_| [MISC_SWITCH_OUT, 0]);
+    for misc in first.into_iter().chain(pairs) {
+        for event in &takers {
+            if matches!(event.target, super::Target::Cpu) {
+                let idle = event.pid_tid_of(0, 0);
+                event.side_band(RECORD_SWITCH_CPU_WIDE, misc, &idle, who);
+            } else {
+                event.side_band(RECORD_SWITCH, misc, &[], who);
+            }
+        }
     }
 }
 

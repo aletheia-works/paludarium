@@ -234,6 +234,12 @@ pub(crate) struct CpuAccount {
     /// Whether the thread has slept or moved to another CPU since perf last
     /// looked ([`Kernel::scheduled_in`]).
     resumed: bool,
+    /// The times it has slept since then, each a switch out and back in
+    /// for the events with `context_switch` ([`perf::switched`]).
+    slept: u64,
+    /// Whether perf has seen it run: a new thread's first run is a switch
+    /// in alone.
+    ran: bool,
 }
 impl Clone for CpuAccount {
     fn clone(&self) -> Self {
@@ -946,6 +952,7 @@ pub(crate) fn account_cpu(
     let switches = paludarium_host::switches::take();
     if switches != 0 {
         account.resumed = true;
+        account.slept = account.slept.saturating_add(switches);
         usage.switches.fetch_add(switches, Ordering::SeqCst);
         // Its sleeps since its last account were on the CPU it was on
         // then, though another thread's `sched_setaffinity` moved its
@@ -1790,8 +1797,10 @@ impl Kernel {
         // its last system call too, as Linux's tick does, and so do the
         // sampling perf events, whose clocks overflow as it runs.
         let sampling = perf::sampling(&self.processes.perf_events);
-        // So does a thread that slept, whose events' user pages show it.
-        let slept = perf::buffers_mapped(&self.processes.perf_events)
+        // So does a thread that slept, whose events' user pages and
+        // switch records show it.
+        let slept = (perf::buffers_mapped(&self.processes.perf_events)
+            || perf::switches(&self.processes.perf_events))
             && paludarium_host::switches::pending();
         if self.group.cpu_timers_armed() || sampling || slept {
             account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
@@ -2512,10 +2521,27 @@ impl Kernel {
 
     /// After [`account_cpu`]: a thread that slept or moved to another CPU
     /// since its last account was scheduled in again, which updates its
-    /// events' user pages ([`perf::scheduled_in`]).
+    /// events' user pages ([`perf::scheduled_in`]), and its first run and
+    /// its sleeps are written as switch records ([`perf::switched`]).
     fn scheduled_in(&self, thread: &mut Thread) {
         if std::mem::take(&mut thread.state.cpu.resumed) {
             perf::scheduled_in(&self.processes.perf_events, &self.group, thread.tid);
+        }
+        let sleeps = std::mem::take(&mut thread.state.cpu.slept);
+        let started = !std::mem::replace(&mut thread.state.cpu.ran, true);
+        if (started || sleeps != 0) && perf::switches(&self.processes.perf_events) {
+            let who = perf::Who {
+                pid: thread.state.pid,
+                tid: thread.tid,
+                cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+            };
+            perf::switched(
+                &self.processes.perf_events,
+                &self.group,
+                &who,
+                started,
+                sleeps,
+            );
         }
     }
 

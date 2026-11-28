@@ -6020,7 +6020,11 @@ kernel.
   (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack
   and mappings; and
   `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
-  that is made or ends. A `cpu-clock` or `task-clock` event whose
+  that is made or ends; and with `context_switch`, `PERF_RECORD_SWITCH`
+  (`SWITCH_CPU_WIDE` for an event of a CPU, with the thread that ran
+  instead) of each sleep of a thread, one with `PERF_RECORD_MISC_SWITCH_OUT`
+  and one without it as it runs again, and one without it alone for a new
+  thread's or child's first run, which inherited events take. A `cpu-clock` or `task-clock` event whose
   interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
   throttled until the next tick, its count stopped meanwhile, with
   `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,

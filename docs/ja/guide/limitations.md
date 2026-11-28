@@ -540,7 +540,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
   だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、
   受信のバンドル（`IORING_RECVSEND_BUNDLE`）と、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません
-  （`EINVAL`）。
+  （`EINVAL`）。送信が選ぶバッファーは Linux master に合わせます。差分テストのランナーのカーネルは、
+  提供されたバッファーを長さにかかわらずまだ丸ごと送る（master の b7322810d187 より前）ので、テストは
+  それを比べず、長さが最後のバッファーで尽きるバンドルが続くかどうか（8742f4b5a472）も比べません。
   ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
   （`MULTISHOT_MAX_RETRY`）続くとキューに戻し、ほかのタスクワークを先に動かします。
   `IORING_RECVSEND_FIXED_BUF` を付けた送受信は、差分テストを走らせるカーネルである Linux 7.0 と

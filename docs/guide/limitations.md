@@ -655,7 +655,11 @@ verified.
   Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
   socket requests, a receive's bundle (`IORING_RECVSEND_BUNDLE`) and a
   receive with `MSG_WAITALL` that selects a buffer are not there yet
-  (`EINVAL`). A multishot receive whose socket keeps
+  (`EINVAL`). A send's selected buffers follow Linux master; the kernel of
+  the differential tests' runners still sends a provided buffer whole
+  whatever the length (before master's b7322810d187), so the tests do not
+  compare that, nor whether a bundle whose length runs out on the last
+  buffer goes on (8742f4b5a472). A multishot receive whose socket keeps
   having more goes on at once however many times in a row, where Linux
   requeues it after 32 (`MULTISHOT_MAX_RETRY`), letting other task work
   run first. A send or a receive with

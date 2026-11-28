@@ -12908,7 +12908,7 @@ static int io_uring_multishot_case(void) {
     memcpy(unet_push(&u, 31, 99, 1, 3, (long)sout, 6, 0, 0) + 40, &sgroup, 2);
     um_run(&u, 1, 1, "send-provide");
     for (int i = 0; i < 2; i++) {
-        sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 3, 0, 0);
+        sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 0, 0, 0);
         sqe[1] = 1 << 5;
         memcpy(sqe + 40, &sgroup, 2);
         um_run(&u, 1, 1, i ? "send-select-empty" : "send-select-provided");
@@ -12967,8 +12967,10 @@ static int io_uring_multishot_case(void) {
     printf("entry +%ld %u\n", (long)(*(unsigned long *)(sring + 4096) - (unsigned long)sout),
            *(unsigned *)(sring + 4096 + 8));
     printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
-    /* A bundle whose length runs out on the last buffer there is goes on
-       and finds none; one that would cut a later buffer leaves it whole. */
+    /* A bundle that would cut a later buffer leaves it whole for the next
+       send. (Whether one whose length runs out on the last buffer there is
+       goes on, and whether a provided buffer is cut to the length, depend
+       on the kernel: Linux master's 8742f4b5a472 and b7322810d187.) */
     unsigned char *sring3 = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (sring3 == MAP_FAILED) return 86;
@@ -12992,13 +12994,11 @@ static int io_uring_multishot_case(void) {
         memcpy(e + 8, &len, 4);
         memcpy(e + 12, &bid, 2);
     }
-    for (int round = 0; round < 2; round++) {
-        __atomic_store_n((unsigned short *)(sring3 + 14), round ? 4 : 2, __ATOMIC_RELEASE);
-        sqe = unet_push(&u, 26, 1, sp[0], 0, 0, round ? 6 : 8, 0, 16);
-        sqe[1] = 1 << 5;
-        sqe[40] = 6;
-        um_run(&u, 1, 1, round ? "send-bundle-short" : "send-bundle-exact");
-    }
+    __atomic_store_n((unsigned short *)(sring3 + 14), 4, __ATOMIC_RELEASE);
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 6, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 6;
+    um_run(&u, 1, 1, "send-bundle-short");
     printf("entry %u\n", *(unsigned *)(sring3 + 3 * 16 + 8));
     printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
     unet_push(&u, 26, 1, sp[0], 0, (long)sout, 5, 0, 16);

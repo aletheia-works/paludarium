@@ -1826,9 +1826,9 @@ impl Picked {
     }
 }
 
-/// The buffers of group `bgid` a send of `len` bytes (0 for any) takes
-/// (Linux's `io_buffers_select`): no group is `ENOENT`, and one with none
-/// left `ENOBUFS`. A provided buffer goes whole, whatever `len` is; a
+/// The buffers of group `bgid` a send of `len` bytes (0 for any) takes, as
+/// Linux master's `io_buffers_select` has them: no group is `ENOENT`, and
+/// one with none left `ENOBUFS`. A provided buffer is cut to `len`; a
 /// ring's are as [`BufferRing::take_for_send`] takes them.
 pub(super) fn select_send(
     c: &Context<'_>,
@@ -1845,9 +1845,14 @@ pub(super) fn select_send(
         None => Err(Errno::ENOENT),
         Some(BufferList::Provided(list)) => {
             let buffer = list.pop_front().ok_or(ENOBUFS)?;
+            let size = if len == 0 {
+                buffer.len
+            } else {
+                len.min(buffer.len)
+            };
             Ok(Picked {
                 bid: buffer.bid,
-                pieces: vec![(buffer.addr, buffer.len as usize)],
+                pieces: vec![(buffer.addr, size as usize)],
                 more: false,
                 emptied: list.is_empty(),
             })
@@ -1857,18 +1862,18 @@ pub(super) fn select_send(
 }
 
 impl BufferRing {
-    /// The buffers a send of up to `want` bytes (0 for any) takes from the
-    /// head, which are used at once, as Linux's `io_ring_buffers_peek` and
-    /// `io_kbuf_commit` take them. None ready, or a first of no bytes, is
-    /// `ENOBUFS`.
+    /// The buffers a send of up to `want` bytes (0 for any, and no more
+    /// than `MAX_RW_COUNT`) takes from the head, which are used at once, as
+    /// Linux master's `io_ring_buffers_peek` and `io_kbuf_commit` take them.
+    /// None ready, or a first of no bytes, is `ENOBUFS`, and one outside the
+    /// user half `EFAULT`.
     ///
     /// A send takes one; a bundle as many as are ready, but no more than
     /// 1024, 256, or what `want` needs at the first's length. Each gives
-    /// what is left of `want` at most. One cut short stays only as the
-    /// first, its entry then cut too, unless the ring has
-    /// `IOU_PBUF_RING_INC`, whose bytes come off the buffer instead. The
-    /// group counts as emptied when every buffer ready went whole with bytes
-    /// still to send.
+    /// what is left of `want` at most, its entry as it was. One cut short
+    /// stays only as the first, unless the ring has `IOU_PBUF_RING_INC`,
+    /// whose bytes come off the buffer instead. The group counts as emptied
+    /// when every buffer ready was taken.
     fn take_for_send(&mut self, c: &Context<'_>, want: u32, bundle: bool) -> Result<Picked, Errno> {
         let ready = self.tail(c)?.wrapping_sub(self.head);
         if ready == 0 {
@@ -1878,7 +1883,8 @@ impl BufferRing {
         if first_len == 0 {
             return Err(ENOBUFS);
         }
-        let budget = if want == 0 { i32::MAX as u32 } else { want };
+        let budget =
+            (if want == 0 { i32::MAX as u32 } else { want }).min(crate::files::MAX_RW_COUNT as u32);
         let most = if bundle {
             u32::from(ready)
                 .min(1024)
@@ -1889,19 +1895,14 @@ impl BufferRing {
         };
         let mut pieces = Vec::new();
         let mut left = budget;
-        let mut refused = false;
         for offset in 0..most as u16 {
             let index = self.head.wrapping_add(offset);
             let (addr, size, _) = self.entry(c, index)?;
             let part = size.min(left);
-            if part < size && !self.incremental {
-                if !pieces.is_empty() {
-                    refused = true;
-                    break;
-                }
-                let at = 16 * u64::from(index & self.mask) + 8;
-                self.store(c, at, &part.to_le_bytes())?;
+            if part < size && !self.incremental && !pieces.is_empty() {
+                break;
             }
+            crate::sockets::access_ok_u64(addr, u64::from(part))?;
             pieces.push((addr, part as usize));
             left -= part;
             if left == 0 {
@@ -1909,7 +1910,7 @@ impl BufferRing {
             }
         }
         let taken = pieces.len() as u16;
-        let emptied = !refused && left != 0 && taken == ready;
+        let emptied = taken == ready;
         let more = if self.incremental {
             !self.commit(c, budget - left)?
         } else {

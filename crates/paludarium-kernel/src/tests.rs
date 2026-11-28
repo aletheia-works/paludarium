@@ -8793,18 +8793,18 @@ mod io_uring {
         // A send that selects: no group is ENOENT, none left ENOBUFS.
         let select = |e: [u8; 64], bgid: u16| with(with(e, 1, &[1 << 5]), 40, &bgid.to_le_bytes());
         assert_eq!(one(&mut f, &r, &select(net(SEND, a, 0, 0, 3, 0, 0), 7)), -2);
-        // A provided buffer goes whole, whatever the length.
+        // A provided buffer is cut to the length, as Linux master has it.
         assert_eq!(one(&mut f, &r, &provide(1, put, 6, 7, 3)), 0);
         assert_eq!(
             one_flags(&mut f, &r, &select(net(SEND, a, 0, 0, 3, 0, 0), 7)),
-            (6, BUFFER | 3 << 16)
+            (3, BUFFER | 3 << 16)
         );
-        assert_eq!(f.ret(0, &[b, got, 16]), 6);
+        assert_eq!(f.ret(0, &[b, got, 16]), 3);
         assert_eq!(
             one(&mut f, &r, &select(net(SEND, a, 0, 0, 3, 0, 0), 7)),
             -105
         );
-        // A ring's: one, cut to the length, its entry with it.
+        // A ring's: one, cut to the length, its entry as it was.
         let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
         assert_eq!(pbuf(&mut f, &r, page, 4, 1, 0), 0);
         for index in 0..4 {
@@ -8815,7 +8815,7 @@ mod io_uring {
             one_flags(&mut f, &r, &select(net(SEND, a, 0, 0, 3, 0, 0), 1)),
             (3, BUFFER | 10 << 16)
         );
-        assert_eq!(u32_at(&f, page + 8), 3);
+        assert_eq!(u32_at(&f, page + 8), 4);
         assert_eq!(head(&mut f, &r, 1), 1);
         assert_eq!(f.ret(0, &[b, got, 16]), 3);
         // A bundle takes as many as its length needs, and goes on with the
@@ -8851,6 +8851,8 @@ mod io_uring {
 
     #[test]
     fn a_send_bundle_stops_at_its_length_or_before_a_buffer_it_would_cut() {
+        // As Linux master: with its last buffer taken, the group is emptied
+        // (8742f4b5a472), and no entry is cut (70f4886bcbb9).
         const MORE: u32 = 2;
         let mut f = fixture();
         let r = ring(&mut f);
@@ -8866,14 +8868,11 @@ mod io_uring {
             let e = with(net(SEND, a, 0, 0, len, 0, 16), 1, &[1 << 5]);
             with(e, 40, &1u16.to_le_bytes())
         };
-        // Its length runs out on the last buffer there is: the group does not
-        // count as emptied, so it goes on and finds none.
+        // Its length runs out on the last buffer there is, which empties the
+        // group: it is over.
         tail(&f, page, 2);
         submit_only(&mut f, &r, &[bundle(8)]);
-        assert_eq!(
-            reap_flags(&mut f, &r),
-            [(1, 8, MORE | BUFFER | 20 << 16), (1, -105, 0)]
-        );
+        assert_eq!(reap_flags(&mut f, &r), [(1, 8, BUFFER | 20 << 16)]);
         assert_eq!(head(&mut f, &r, 1), 2);
         // A later buffer longer than what is left stays, whole, for the next.
         tail(&f, page, 4);
@@ -8886,6 +8885,11 @@ mod io_uring {
         assert_eq!(head(&mut f, &r, 1), 4);
         assert_eq!(f.ret(0, &[b, got, 32]), 16);
         assert_eq!(bytes(&f, got, 16), b"abcdefghijklmnop");
+        // A buffer outside the user half is EFAULT, and stays.
+        entry(&f, page, 0, 1 << 63, 4, 30);
+        tail(&f, page, 5);
+        assert_eq!(one(&mut f, &r, &bundle(4)), -14);
+        assert_eq!(head(&mut f, &r, 1), 4);
     }
 
     #[test]

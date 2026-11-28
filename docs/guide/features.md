@@ -2171,12 +2171,14 @@ kernel.
   is prepared (`io_net_import_vec`). With `IOSQE_BUFFER_SELECT` it sends
   from the buffers it selects as it first runs, and keeps them while it
   waits (`io_buffers_select`): a group it does not find is `ENOENT`, one
-  with none left `ENOBUFS`. A provided buffer goes whole, whatever the
-  length; a ring's is cut to the length, and so is its entry unless the
-  ring has `IOU_PBUF_RING_INC`. Its completion names the first, as a
+  with none left `ENOBUFS`, and a ring's buffer outside the user half
+  `EFAULT`. A buffer is cut to the length, as Linux master cuts it, its
+  ring entry as it was. Its completion names the first, as a
   read's does, and so does one that fails. With `IORING_RECVSEND_BUNDLE` a
   send sends all it has (`MSG_WAITALL`), and one that selects takes as
-  many of a ring's buffers as its length needs, at most 256. A bundle that
+  many of a ring's buffers as its length needs, at most 256, leaving one
+  it would cut for the next unless the ring has `IOU_PBUF_RING_INC`; taking
+  the last one there is empties the group. A bundle that
   sent anything posts with `IORING_CQE_F_MORE` and sends again at once,
   with no length and new buffers, until it sends nothing, takes its
   group's last buffers or waited (`io_send_finish`); one that selects none

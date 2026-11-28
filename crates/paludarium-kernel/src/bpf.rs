@@ -2663,16 +2663,20 @@ const LISTS: usize = 5;
 /// they are taken from: each element on it has a stamp, smaller than
 /// every other's when it is put at the front.
 ///
-/// How Linux keeps them, as its documentation (`map_hash.rst`, "LRU
-/// hash eviction") and the commit that brought them (3a08c2fd7634) tell,
-/// and as the differential tests check it: a key is put on the CPU's
+/// The data structure is this file's own; the steps that choose a key to
+/// evict are Linux's, kept as they were, because which key goes is what a
+/// program sees (the tests fix it with digests of long traces, and the
+/// differential tests compare it with Linux). Its documentation
+/// (`map_hash.rst`, "LRU hash eviction") and the commit that brought the
+/// lists (3a08c2fd7634) describe the steps: a key is put on the CPU's
 /// pending list; a program's lookup sets its reference. When the CPU's
 /// free batch is empty, the pending keys go to the active list
 /// (referenced) or the inactive one, the lists are rotated, and a batch of
 /// `target_free` is taken from the free list, or failing that, shrunk off
 /// the inactive list's back. A per-CPU LRU (`BPF_F_NO_COMMON_LRU`) has no
 /// batches: an element is taken from the free list and put on the
-/// inactive one.
+/// inactive one, and an empty free list is shrunk by
+/// [`PER_CPU_FREE_TARGET`].
 struct Lru {
     /// Each list's elements by stamp.
     lists: [BTreeMap<i64, usize>; LISTS],
@@ -2691,8 +2695,9 @@ struct Lru {
     /// Where the inactive list's next rotation starts: an element on it,
     /// or `None`, before its front.
     cursor: Option<usize>,
-    /// The batch size (`target_free`), and how many elements one rotation
-    /// or shrinking looks at.
+    /// How many free elements a shrinking makes: a common LRU's batch size
+    /// (`target_free`), or a per-CPU one's [`PER_CPU_FREE_TARGET`]; and
+    /// how many elements one rotation or shrinking looks at.
     target_free: usize,
     scans: usize,
     per_cpu: bool,
@@ -2701,8 +2706,11 @@ struct Lru {
 /// How many elements a common LRU's rotation looks at, and the most a
 /// batch takes.
 const COMMON_SCANS: usize = 128;
-/// How many a per-CPU LRU's looks at, and shrinks at once.
+/// How many a per-CPU LRU's looks at.
 const PER_CPU_SCANS: usize = 4;
+/// How many elements a per-CPU LRU frees when its free list is empty, 4
+/// as its scans are, but a number of its own.
+const PER_CPU_FREE_TARGET: usize = 4;
 
 impl Lru {
     /// Every element free, the last one first. A common LRU has all of
@@ -2720,7 +2728,11 @@ impl Lru {
             values: vec![None; elements],
             table: BTreeMap::new(),
             cursor: None,
-            target_free: (share / 2).clamp(1, COMMON_SCANS),
+            target_free: if per_cpu {
+                PER_CPU_FREE_TARGET
+            } else {
+                (share / 2).clamp(1, COMMON_SCANS)
+            },
             scans: if per_cpu { PER_CPU_SCANS } else { COMMON_SCANS },
             per_cpu,
         };
@@ -2947,7 +2959,7 @@ impl Lru {
         if self.per_cpu {
             self.rotate();
             if self.len(List::Free) == 0 {
-                self.shrink(PER_CPU_SCANS, List::Free);
+                self.shrink(self.target_free, List::Free);
             }
             let i = self.front_of(List::Free)?;
             self.refile(i, List::Inactive);

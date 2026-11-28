@@ -12967,6 +12967,40 @@ static int io_uring_multishot_case(void) {
     printf("entry +%ld %u\n", (long)(*(unsigned long *)(sring + 4096) - (unsigned long)sout),
            *(unsigned *)(sring + 4096 + 8));
     printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    /* A bundle whose length runs out on the last buffer there is goes on
+       and finds none; one that would cut a later buffer leaves it whole. */
+    unsigned char *sring3 = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (sring3 == MAP_FAILED) return 86;
+    {
+        unsigned char reg[40] = {0};
+        unsigned long at = (unsigned long)sring3;
+        unsigned entries = 4;
+        unsigned short bgid = 6;
+        memcpy(reg, &at, 8);
+        memcpy(reg + 8, &entries, 4);
+        memcpy(reg + 12, &bgid, 2);
+        uring_show("send-ring", syscall(427, u.fd, 22, reg, 1));
+    }
+    char slong[16] = "mnopqrstuvwxyz12";
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *e = sring3 + 16 * i;
+        unsigned long a = (unsigned long)slong + 4 * i;
+        unsigned len = 4;
+        unsigned short bid = 20 + i;
+        memcpy(e, &a, 8);
+        memcpy(e + 8, &len, 4);
+        memcpy(e + 12, &bid, 2);
+    }
+    for (int round = 0; round < 2; round++) {
+        __atomic_store_n((unsigned short *)(sring3 + 14), round ? 4 : 2, __ATOMIC_RELEASE);
+        sqe = unet_push(&u, 26, 1, sp[0], 0, 0, round ? 6 : 8, 0, 16);
+        sqe[1] = 1 << 5;
+        sqe[40] = 6;
+        um_run(&u, 1, 1, round ? "send-bundle-short" : "send-bundle-exact");
+    }
+    printf("entry %u\n", *(unsigned *)(sring3 + 3 * 16 + 8));
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
     unet_push(&u, 26, 1, sp[0], 0, (long)sout, 5, 0, 16);
     um_run(&u, 1, 1, "send-bundle-plain");
     printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);

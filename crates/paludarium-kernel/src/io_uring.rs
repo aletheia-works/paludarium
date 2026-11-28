@@ -1826,20 +1826,10 @@ impl Picked {
     }
 }
 
-/// The buffers of group `bgid` a send of `len` bytes (0 for any) takes, as
-/// `io_buffers_select` chooses them: no group is `ENOENT`, and one with none
-/// left `ENOBUFS`.
-///
-/// - Provided buffers: the first goes from the group, whole, whatever
-///   `len` is (`io_provided_buffers_select`).
-/// - A ring: from its head, one, or with `bundle` as many as there are, at
-///   most 256 and no more than `len` needs at the first's length
-///   (`io_ring_buffers_peek`). The last is cut to the bytes left; a ring
-///   without `IOU_PBUF_RING_INC` then has the first's entry cut too, or
-///   stops before any later one. They are used at once (`io_kbuf_commit`),
-///   all of them, or with `IOU_PBUF_RING_INC` the bytes taken; the group
-///   counts as emptied when the peek took every buffer there was without
-///   running out of bytes first.
+/// The buffers of group `bgid` a send of `len` bytes (0 for any) takes
+/// (Linux's `io_buffers_select`): no group is `ENOENT`, and one with none
+/// left `ENOBUFS`. A provided buffer goes whole, whatever `len` is; a
+/// ring's are as [`BufferRing::take_for_send`] takes them.
 pub(super) fn select_send(
     c: &Context<'_>,
     ring: &Ring,
@@ -1862,63 +1852,76 @@ pub(super) fn select_send(
                 emptied: list.is_empty(),
             })
         }
-        Some(BufferList::Ring(buffers)) => {
-            let tail = buffers.tail(c)?;
-            let start = buffers.head;
-            let mut avail = u32::from(tail.wrapping_sub(start)).min(1024);
-            if avail == 0 {
-                return Err(ENOBUFS);
-            }
-            let mut max = if len == 0 { i32::MAX as u32 } else { len };
-            let (_, first, bid) = buffers.entry(c, start)?;
-            if first == 0 {
-                return Err(ENOBUFS);
-            }
-            let needed = max.div_ceil(first).min(256);
-            avail = avail.min(needed);
-            let mut count = if bundle { avail } else { 1 };
-            let mut head = start;
-            let mut pieces = Vec::new();
-            let mut taken = 0u32;
-            loop {
-                let (addr, mut size, _) = buffers.entry(c, head)?;
-                if size > max {
-                    size = max;
-                    if !buffers.incremental {
-                        if !pieces.is_empty() {
-                            break;
-                        }
-                        let at = 16 * u64::from(head & buffers.mask) + 8;
-                        buffers.store(c, at, &size.to_le_bytes())?;
-                    }
-                }
-                pieces.push((addr, size as usize));
-                taken += size;
-                max -= size;
-                if max == 0 {
-                    break;
-                }
-                head = head.wrapping_add(1);
-                count -= 1;
-                if count == 0 {
-                    break;
-                }
-            }
-            let emptied = head == tail;
-            let used = pieces.len() as u16;
-            let more = if buffers.incremental {
-                !buffers.commit(c, taken)?
-            } else {
-                buffers.head = start.wrapping_add(used);
-                false
-            };
-            Ok(Picked {
-                bid,
-                pieces,
-                more,
-                emptied,
-            })
+        Some(BufferList::Ring(buffers)) => buffers.take_for_send(c, len, bundle),
+    }
+}
+
+impl BufferRing {
+    /// The buffers a send of up to `want` bytes (0 for any) takes from the
+    /// head, which are used at once, as Linux's `io_ring_buffers_peek` and
+    /// `io_kbuf_commit` take them. None ready, or a first of no bytes, is
+    /// `ENOBUFS`.
+    ///
+    /// A send takes one; a bundle as many as are ready, but no more than
+    /// 1024, 256, or what `want` needs at the first's length. Each gives
+    /// what is left of `want` at most. One cut short stays only as the
+    /// first, its entry then cut too, unless the ring has
+    /// `IOU_PBUF_RING_INC`, whose bytes come off the buffer instead. The
+    /// group counts as emptied when every buffer ready went whole with bytes
+    /// still to send.
+    fn take_for_send(&mut self, c: &Context<'_>, want: u32, bundle: bool) -> Result<Picked, Errno> {
+        let ready = self.tail(c)?.wrapping_sub(self.head);
+        if ready == 0 {
+            return Err(ENOBUFS);
         }
+        let (_, first_len, bid) = self.entry(c, self.head)?;
+        if first_len == 0 {
+            return Err(ENOBUFS);
+        }
+        let budget = if want == 0 { i32::MAX as u32 } else { want };
+        let most = if bundle {
+            u32::from(ready)
+                .min(1024)
+                .min(256)
+                .min(budget.div_ceil(first_len))
+        } else {
+            1
+        };
+        let mut pieces = Vec::new();
+        let mut left = budget;
+        let mut refused = false;
+        for offset in 0..most as u16 {
+            let index = self.head.wrapping_add(offset);
+            let (addr, size, _) = self.entry(c, index)?;
+            let part = size.min(left);
+            if part < size && !self.incremental {
+                if !pieces.is_empty() {
+                    refused = true;
+                    break;
+                }
+                let at = 16 * u64::from(index & self.mask) + 8;
+                self.store(c, at, &part.to_le_bytes())?;
+            }
+            pieces.push((addr, part as usize));
+            left -= part;
+            if left == 0 {
+                break;
+            }
+        }
+        let taken = pieces.len() as u16;
+        let emptied = !refused && left != 0 && taken == ready;
+        let more = if self.incremental {
+            !self.commit(c, budget - left)?
+        } else {
+            self.head = self.head.wrapping_add(taken);
+            false
+        };
+        Ok(Picked {
+            bid,
+            pieces,
+            more,
+            emptied,
+        })
     }
 }
 

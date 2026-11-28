@@ -8850,6 +8850,45 @@ mod io_uring {
     }
 
     #[test]
+    fn a_send_bundle_stops_at_its_length_or_before_a_buffer_it_would_cut() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (a, b) = unix_pair(&mut f, 1);
+        let (put, got) = (DATA + 0x100, DATA + 0x200);
+        f.mem.write(GuestAddr(put), b"abcdefghijklmnop").unwrap();
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(pbuf(&mut f, &r, page, 4, 1, 0), 0);
+        for index in 0..4 {
+            entry(&f, page, index, put + 4 * index, 4, 20 + index as u16);
+        }
+        let bundle = |len: u32| {
+            let e = with(net(SEND, a, 0, 0, len, 0, 16), 1, &[1 << 5]);
+            with(e, 40, &1u16.to_le_bytes())
+        };
+        // Its length runs out on the last buffer there is: the group does not
+        // count as emptied, so it goes on and finds none.
+        tail(&f, page, 2);
+        submit_only(&mut f, &r, &[bundle(8)]);
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 8, MORE | BUFFER | 20 << 16), (1, -105, 0)]
+        );
+        assert_eq!(head(&mut f, &r, 1), 2);
+        // A later buffer longer than what is left stays, whole, for the next.
+        tail(&f, page, 4);
+        submit_only(&mut f, &r, &[bundle(6)]);
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 4, MORE | BUFFER | 22 << 16), (1, 4, BUFFER | 23 << 16)]
+        );
+        assert_eq!(u32_at(&f, page + 3 * 16 + 8), 4);
+        assert_eq!(head(&mut f, &r, 1), 4);
+        assert_eq!(f.ret(0, &[b, got, 32]), 16);
+        assert_eq!(bytes(&f, got, 16), b"abcdefghijklmnop");
+    }
+
+    #[test]
     fn a_receive_gives_back_its_provided_buffer_while_it_waits() {
         let mut f = fixture();
         let r = ring(&mut f);

@@ -19215,6 +19215,48 @@ static int grl_inner(const char *self) {
  * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
  * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
  * `self/mounts` (`proc_symlink`). */
+/* The magic-link-names case: a link of /proc or /dev that is the last
+   name, with a trailing slash, is the name the calls that make, remove or
+   rename it find (EEXIST, EISDIR, ENOTDIR), not the file it leads to. Only
+   errno values are printed. */
+static int mln_e(int rc) { return rc < 0 ? errno : 0; }
+static int magic_link_names_case(void) {
+    char base[] = "/tmp/paludarium-magic-names-XXXXXX";
+    if (!mkdtemp(base)) return 1;
+    char file[96];
+    snprintf(file, sizeof file, "%s/file", base);
+    int fd = open(file, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd < 0) return 2;
+    char own[64], thread[64], dev[64];
+    snprintf(own, sizeof own, "/proc/self/fd/%d/", fd);
+    snprintf(thread, sizeof thread, "/proc/thread-self/fd/%d/", fd);
+    snprintf(dev, sizeof dev, "/dev/fd/%d/", fd);
+    const char *const names[] = {own, thread, dev, "/proc/self/exe/", "/proc/self/cwd/",
+                                 "/proc/self/root/", "/proc/self/ns/net/", "/dev/stdin/",
+                                 "/dev/stdout/"};
+    printf("name mkdir mknod symlink link creat unlink rmdir rename\n");
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+        const char *p = names[i];
+        int m = mln_e(mkdir(p, 0700));
+        int k = mln_e(mknod(p, S_IFIFO | 0600, 0));
+        int s = mln_e(symlink("x", p));
+        int l = mln_e(link(file, p));
+        int c = open(p, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+        int ce = c < 0 ? errno : 0;
+        if (c >= 0) close(c);
+        int u = mln_e(unlink(p));
+        int r = mln_e(rmdir(p));
+        /* /dev/fd's names are procfs's, which a rename here does not yet
+           tell from devtmpfs's: left out. */
+        int rn = strncmp(p, "/dev/fd/", 8) ? mln_e(rename("/proc/self/nonesuch", p)) : -1;
+        printf("%s %d %d %d %d %d %d %d %d\n", i < 3 ? (i == 0 ? "own-fd/" : i == 1 ? "thread-fd/" : "dev-fd/") : p,
+               m, k, s, l, ce, u, r, rn);
+    }
+    close(fd);
+    unlink(file);
+    printf("cleaned=%d\n", rmdir(base) == 0);
+    return 0;
+}
 static int proc_links_case(const char *self) {
     char exe[4096], dir[4096];
     if (!realpath(self, exe)) return 1;
@@ -45862,6 +45904,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-links-ran")) return 7;
     if (!strcmp(mode, "statx-attributes")) return statx_attributes_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
+    if (!strcmp(mode, "magic-link-names")) return magic_link_names_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();

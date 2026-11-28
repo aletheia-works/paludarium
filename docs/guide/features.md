@@ -4454,7 +4454,12 @@ kernel.
   own walk), and so does `execve` (`/proc/self/fd/3/program` runs `program`
   in the directory descriptor 3 holds); a path relative to a descriptor of
   `/proc` or to a working directory there, one whose `..` or symbolic link
-  leads into `/proc`, and a Unix socket's address do not.
+  leads into `/proc`, and a Unix socket's address do not. A link that is the
+  last name is not jumped through by the calls that make, remove or rename
+  that name (`mkdir`, `mknod`, `symlink`, `link`, `unlink`, `rmdir`,
+  `rename` and an `open` with `O_CREAT`), even with a trailing slash. They
+  find the link itself, as Linux's walk to the parent leaves it to them:
+  `mkdir("/proc/self/fd/0/")` is `EEXIST`, and `unlink` of it `ENOTDIR`.
 
 - The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
   `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/version` and the other system files (below), `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only

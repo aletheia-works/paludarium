@@ -523,6 +523,7 @@
     {"name":"proc-links","binary":"process"},
     {"name":"statx-attributes","binary":"process"},
     {"name":"generated-changes","binary":"process"},
+    {"name":"magic-link-names","binary":"process"},
     {"name":"tmpfs-limits","binary":"process"},
     {"name":"shmem-fault-charge","binary":"process"},
     {"name":"shmem-populate","binary":"process"},

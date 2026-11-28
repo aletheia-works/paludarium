@@ -3814,7 +3814,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `openat2` は自身の解決の中で扱います）。`execve` も同じで、`/proc/self/fd/3/program` は
   ディスクリプタ 3 が持つディレクトリの中の `program` を動かします。`/proc` のディスクリプタや
   `/proc` の中の作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
-  Unix ソケットのアドレスは扱いません。
+  Unix ソケットのアドレスは扱いません。最後の名前であるリンクは、その名前を作る、消す、名前を
+  変える呼び出し（`mkdir`、`mknod`、`symlink`、`link`、`unlink`、`rmdir`、`rename`、
+  `O_CREAT` 付きの `open`）では、末尾にスラッシュがあっても飛び越えません。Linux の親までの
+  探索と同じく、呼び出しはリンクそのものを見つけます。`mkdir("/proc/self/fd/0/")` は
+  `EEXIST`、その `unlink` は `ENOTDIR` です。
 
 - `/proc` にあるのは、ほかには `/proc/cpuinfo`（後述）、`/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/version` などほかのシステムのファイル（後述）、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、

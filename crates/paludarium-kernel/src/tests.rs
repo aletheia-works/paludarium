@@ -15704,6 +15704,43 @@ fn the_first_thread_keeps_the_signals_the_host_started_with_ignored() {
     );
 }
 
+/// A magic link that is the last name, a trailing slash after it or not,
+/// is the name the calls that make or remove it find, not the file it
+/// leads to: `EEXIST` to make, `EISDIR` to create with `open`, `ENOTDIR` to
+/// unlink with the slash.
+#[test]
+fn the_name_calls_find_a_last_magic_link_itself() {
+    let mut f = fixture();
+    let file = put(&mut f, 0x80, b"/tmp/file");
+    let fd = f.ret(2, &[file, 0o101, 0o666]);
+    assert!(fd < 1024, "{fd:#x}");
+    let own = format!("/proc/self/fd/{fd}/");
+    for p in [own.as_bytes(), b"/proc/self/exe/", b"/proc/self/cwd/"] {
+        let name = String::from_utf8_lossy(p).into_owned();
+        let at = put(&mut f, 0x100, p);
+        let x = put(&mut f, 0x200, b"x");
+        assert_eq!(
+            f.ret(83, &[at, 0o700]),
+            errno(Errno::EEXIST),
+            "mkdir {name}"
+        );
+        assert_eq!(
+            f.ret(133, &[at, 0o010600, 0]),
+            errno(Errno::EEXIST),
+            "mknod {name}"
+        );
+        assert_eq!(f.ret(88, &[x, at]), errno(Errno::EEXIST), "symlink {name}");
+        assert_eq!(f.ret(86, &[file, at]), errno(Errno::EEXIST), "link {name}");
+        assert_eq!(
+            f.ret(2, &[at, 0o101, 0o600]),
+            errno(Errno::EISDIR),
+            "creat {name}"
+        );
+        assert_eq!(f.ret(87, &[at]), errno(Errno::ENOTDIR), "unlink {name}");
+    }
+    assert_eq!(f.ret(3, &[fd]), 0);
+}
+
 /// The calls that make, remove or rename a name in `/proc` and `/dev` give
 /// Linux's errors in its order: the lookup (`ENOENT` in `/proc`), the
 /// trailing slash, the permission to write the directory (`EACCES` for

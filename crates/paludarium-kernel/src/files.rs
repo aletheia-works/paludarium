@@ -1502,7 +1502,7 @@ fn lookup(
             .map_or(p, |(file, _)| file),
         false => p,
     };
-    generated_directories_on_the_way(c, &p, follow)?;
+    generated_directories_on_the_way(c, &p, true)?;
     let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
     Ok((p, found))
 }
@@ -9639,8 +9639,11 @@ fn generated_stat(
 /// last name follows each one: Linux's walk asks every name it goes on
 /// from to be a directory it can look in. With `slash`, the last name
 /// before a trailing slash counts too, as a call that goes on to the file
-/// asks it to be a directory; a call that makes or removes the last name
-/// leaves that to its own lookup (`EEXIST`, `EISDIR`).
+/// asks it to be a directory (a trailing slash follows a link even without
+/// `follow`); an open that may make the last name leaves that to its own
+/// lookup (`EISDIR`). A name on the way that is not there, or an error
+/// finding it (a task that has ended), is left to the last name's lookup,
+/// which reports it as the walk would.
 fn generated_directories_on_the_way(
     c: &Context<'_>,
     path: &[u8],

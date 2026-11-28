@@ -19211,10 +19211,6 @@ static int grl_inner(const char *self) {
     for (unsigned i = 0; i < 3; i++) printf("exec %s=%d\n", runs[i], gl_exec(self, runs[i], 0));
     return 0;
 }
-/* `execve` through a magic link on the way (`/proc/self/fd/<n>/name`,
- * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
- * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
- * `self/mounts` (`proc_symlink`). */
 /* Each call's errno, or 0, for a path that goes on past a file the kernel
  * makes that is not a directory: a trailing slash or a name after it. */
 static void generated_enotdir_show(const char *p) {
@@ -19239,6 +19235,8 @@ static void generated_enotdir_show(const char *p) {
     int x = GE(getxattr(p, "user.x", b, sizeof b));
     int u = GE(utimensat(AT_FDCWD, p, NULL, 0));
     int ch = GE(chmod(p, 0600));
+    int lc = GE(lchown(p, -1, -1));
+    int un = GE(utimensat(AT_FDCWD, p, NULL, AT_SYMLINK_NOFOLLOW));
     int w = in < 0 ? -1000 : GE(inotify_add_watch(in, p, IN_ALL_EVENTS));
     int md = GE(mkdir(p, 0700));
     int cr = GE(open(p, O_CREAT | O_WRONLY | O_CLOEXEC, 0600));
@@ -19248,8 +19246,8 @@ static void generated_enotdir_show(const char *p) {
     int ex = GE(execve(p, (char *[]){NULL}, (char *[]){NULL}));
 #undef GE
     if (in >= 0) close(in);
-    printf("%s open=%d opath=%d stat=%d lstat=%d access=%d readlink=%d statfs=%d chdir=%d truncate=%d getxattr=%d utimens=%d chmod=%d inotify=%d mkdir=%d creat=%d symlink=%d mknod=%d unlink=%d exec=%d\n",
-           p, o, op, s, l, a, r, fs, cd, t, x, u, ch, w, md, cr, sy, mk, ul, ex);
+    printf("%s open=%d opath=%d stat=%d lstat=%d access=%d readlink=%d statfs=%d chdir=%d truncate=%d getxattr=%d utimens=%d chmod=%d lchown=%d utimens-nofollow=%d inotify=%d mkdir=%d creat=%d symlink=%d mknod=%d unlink=%d exec=%d\n",
+           p, o, op, s, l, a, r, fs, cd, t, x, u, ch, lc, un, w, md, cr, sy, mk, ul, ex);
 }
 static int generated_enotdir_case(void) {
     static const char *const paths[] = {
@@ -19303,6 +19301,10 @@ static int generated_enotdir_case(void) {
     close(dev);
     return 0;
 }
+/* `execve` through a magic link on the way (`/proc/self/fd/<n>/name`,
+ * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
+ * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
+ * `self/mounts` (`proc_symlink`). */
 static int proc_links_case(const char *self) {
     char exe[4096], dir[4096];
     if (!realpath(self, exe)) return 1;

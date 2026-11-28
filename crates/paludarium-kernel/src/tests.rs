@@ -15912,9 +15912,17 @@ fn a_path_past_a_generated_non_directory_is_enotdir() {
             (89, [at, DATA + 0x1000, 256]),
             (80, [at, 0, 0]),
             (137, [at, DATA + 0x1000, 0]),
+            // lchown and utimensat with AT_SYMLINK_NOFOLLOW: a trailing
+            // slash follows the last name all the same.
+            (94, [at, 0xffff_ffff, 0xffff_ffff]),
         ] {
             assert_eq!(f.ret(call, &args), errno(Errno::ENOTDIR), "{call} {name}");
         }
+        assert_eq!(
+            f.ret(280, &[(-100i64) as u64, at, 0, 0x100]),
+            errno(Errno::ENOTDIR),
+            "utimensat {name}"
+        );
     }
     // `mkdir` makes the last name, which its own lookup finds there
     // (`EEXIST`); only a name before it is gone on from.

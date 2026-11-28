@@ -12,7 +12,10 @@
    hash (3, fib_multipath_custom_hash_skb). A connected socket's packets
    carry its random flow hash (sk_set_txhash, skb_set_hash_from_sk), which
    policy 1 takes before all else, so that each such socket's errors take
-   one hop of their own, as after a disconnect, which keeps it. IPv6 is
+   one hop of their own, as after a disconnect, which keeps it, and not
+   the hops their ports take. (Which hops the sockets take is not
+   printed: the differential harness's host gives every socket the same
+   random bytes.) IPv6 is
    off, so that nothing else comes in, and no error is rate limited
    (icmp_ratemask). */
 #define _GNU_SOURCE
@@ -336,13 +339,14 @@ static int from_port(int port) {
 }
 /* The hops of the errors of datagrams from ports 7100 on, `how` sent. A
    connected socket sends three, and its line tells whether each socket's
-   took one hop, and how many sockets took each (as their hash is
-   random). */
+   took one hop, and whether those hops are the ones the ports took when
+   last sent with no connect. */
 static void errors(int how, const char *label) {
     struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons(9)};
     to.sin_addr.s_addr = inet_addr("10.2.0.1");
+    static char sent[PORTS + 1];
     char out[PORTS + 1] = {0};
-    int same = 0, a = 0, c = 0;
+    int same = 0;
     for (int i = 0; i < PORTS; i++) {
         int s = from_port(7100 + i);
         if (how == SEND) {
@@ -359,17 +363,16 @@ static void errors(int how, const char *label) {
             }
             out[i] = first;
             same += first == second && second == third;
-            a += first == 'a';
-            c += first == 'c';
         }
         close(s);
     }
-    if (!label) return;
-    if (how == SEND)
-        printf("%s: %s\n", label, out);
-    else
-        printf("%s: %d of %d the same, %s through vb, %s through vd\n", label, same, PORTS,
-               a == 0 ? "none" : a == PORTS ? "all" : "some", c == 0 ? "none" : c == PORTS ? "all" : "some");
+    if (how == SEND) {
+        memcpy(sent, out, sizeof sent);
+        if (label) printf("%s: %s\n", label, out);
+    } else if (label) {
+        printf("%s: %d of %d the same, %s as their ports' were\n", label, same, PORTS,
+               strcmp(out, sent) ? "not" : "just");
+    }
 }
 /* The connected sockets' hops, where they are not random. */
 static void connected(const char *label) {

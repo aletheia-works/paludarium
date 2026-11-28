@@ -11610,6 +11610,11 @@ static int io_uring_buffers2_case(void) {
     up.nr = 1;
     up.data = (unsigned long)iov;
     uring_show("update-none", ub2_update(&u, &up, sizeof up));
+    /* Linux master's IORING_RSRC_UPDATE_EXTENDED: Linux 7.0 refuses the
+       field (EINVAL) before it looks for buffers, master after (ENXIO). */
+    up.resv = 1 << 1;
+    uring_show("update-none-extended", ub2_update(&u, &up, sizeof up));
+    up.resv = 0;
 
     /* A failed registration posts no tag; a tag on an empty slot fails. */
     iov[0] = (struct iovec){page, 4096};
@@ -12373,6 +12378,70 @@ static int io_uring_restrictions_case(void) {
     uring_show("single-submit", uring_enter(single.fd, 1, 0, 0, NULL, 0));
     uring_show("single-register", ures_register(&single, 9, NULL, 0));
     close(single.fd);
+
+    /* A task's restrictions (descriptor -1), in a child, which keeps them:
+       each ring it sets up after starts with them, and so do its
+       children's. An IORING_OP_FILES_UPDATE of nothing, EINVAL where it is
+       allowed, shows which allow it. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct uring before;
+        if (uring_open(&before, 4)) _exit(85);
+        uring_show("task-unknown", syscall(427, -1, 38, NULL, 0));
+        uring_show("task-probe", syscall(427, -1, 8, NULL, 0));
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) _exit(86);
+        struct {
+            unsigned short flags, nr;
+            unsigned resv[3];
+            struct ures res[2];
+        } task = {0, 2, {0}, {{1, 0, 0, {0}}, {0, 9, 0, {0}}}};
+        uring_show("task-count", syscall(427, -1, 11, &task, 0));
+        uring_show("task-unmapped", syscall(427, -1, 11, (void *)8, 1));
+        task.flags = 1;
+        uring_show("task-flags", syscall(427, -1, 11, &task, 1));
+        task.flags = 0;
+        task.resv[2] = 1;
+        uring_show("task-resv", syscall(427, -1, 11, &task, 1));
+        task.resv[2] = 0;
+        task.res[1].opcode = 9;
+        uring_show("task-unknown-restriction", syscall(427, -1, 11, &task, 1));
+        task.res[1].opcode = 0;
+        uring_show("task", syscall(427, -1, 11, &task, 1));
+        uring_show("task-again", syscall(427, -1, 11, &task, 1));
+        ures_run(&before, 20, 0, "task-before-update");
+        uring_show("task-before-probe", ures_register(&before, 8, NULL, 0));
+        struct uring after;
+        if (uring_open(&after, 4)) _exit(87);
+        ures_run(&after, 0, 0, "task-after-nop");
+        ures_run(&after, 20, 0, "task-after-update");
+        uring_show("task-after-personality", ures_register(&after, 9, NULL, 0));
+        uring_show("task-after-probe", ures_register(&after, 8, NULL, 0));
+        struct uring off;
+        if (uring_open_flags(&off, 4, 1 << 6)) _exit(88);
+        uring_show("task-disabled-restrict", ures_register(&off, 11, list, 4));
+        uring_show("task-disabled-enable", ures_register(&off, 12, NULL, 0));
+        ures_run(&off, 20, 0, "task-disabled-update");
+        uring_show("task-disabled-enable-again", ures_register(&off, 12, NULL, 0));
+        fflush(stdout);
+        pid_t grandchild = fork();
+        if (grandchild == 0) {
+            struct uring inherited;
+            if (uring_open(&inherited, 4)) _exit(89);
+            ures_run(&inherited, 20, 0, "task-child-update");
+            uring_show("task-child-again", syscall(427, -1, 11, &task, 1));
+            fflush(stdout);
+            _exit(0);
+        }
+        int status;
+        waitpid(grandchild, &status, 0);
+        printf("task-child: %d\n", status);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("task: %d\n", status);
     return 0;
 }
 

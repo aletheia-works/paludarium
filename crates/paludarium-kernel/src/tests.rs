@@ -8505,6 +8505,74 @@ mod io_uring {
         assert_eq!(f.ret(427, &[r.fd, 10, 0, 1]), eacces);
     }
 
+    /// `io_uring_register` with descriptor -1.
+    const NO_RING: u64 = u32::MAX as u64;
+
+    /// A task's `IORING_REGISTER_RESTRICTIONS`: a `struct
+    /// io_uring_task_restriction` with `flags`, then `list`.
+    fn restrict_task(f: &mut Fixture, flags: u16, list: &[(u16, u8)]) -> u64 {
+        let at = DATA + 0x200;
+        let mut head = [0; 16];
+        head[..2].copy_from_slice(&flags.to_le_bytes());
+        head[2..4].copy_from_slice(&(list.len() as u16).to_le_bytes());
+        f.mem.write(GuestAddr(at), &head).unwrap();
+        for (i, (op, value)) in list.iter().enumerate() {
+            let mut entry = [0; 16];
+            entry[..2].copy_from_slice(&op.to_le_bytes());
+            entry[2] = *value;
+            f.mem
+                .write(GuestAddr(at + 16 + 16 * i as u64), &entry)
+                .unwrap();
+        }
+        f.ret(427, &[NO_RING, 11, at, 1])
+    }
+
+    #[test]
+    fn a_task_s_restrictions_go_to_each_ring_it_sets_up_after() {
+        let mut f = fixture();
+        let before = ring(&mut f);
+        let (einval, eacces) = (errno(Errno::EINVAL), errno(Errno::EACCES));
+        // Descriptor -1 takes only a task's restrictions, after the opcode.
+        assert_eq!(f.ret(427, &[NO_RING, 38, 0, 0]), einval);
+        assert_eq!(f.ret(427, &[NO_RING, 8, DATA, 1]), einval);
+        // `no_new_privs` or `CAP_SYS_ADMIN`, then one argument, read, with
+        // no flags or reserved bits, then its restrictions.
+        let admin = f.thread.state.credentials.effective;
+        f.thread.state.credentials.effective = 0;
+        assert_eq!(restrict_task(&mut f, 0, &[(1, 0)]), eacces);
+        f.thread.state.credentials.effective = admin;
+        assert_eq!(f.ret(427, &[NO_RING, 11, DATA, 0]), einval);
+        assert_eq!(f.ret(427, &[NO_RING, 11, 8, 1]), errno(Errno::EFAULT));
+        assert_eq!(restrict_task(&mut f, 1, &[(1, 0)]), einval);
+        f.mem.write(GuestAddr(DATA + 0x20c), &[1]).unwrap();
+        assert_eq!(f.ret(427, &[NO_RING, 11, DATA + 0x200, 1]), einval);
+        assert_eq!(restrict_task(&mut f, 0, &[(1, 0), (1, 65)]), einval);
+        assert_eq!(restrict_task(&mut f, 0, &[(9, 0)]), einval);
+        // With `no_new_privs`: NOPs, and registering personalities.
+        f.thread.state.credentials.effective = 0;
+        assert_eq!(f.ret(157, &[38, 1, 0, 0, 0]), 0);
+        assert_eq!(restrict_task(&mut f, 0, &[(1, 0), (0, 9)]), 0);
+        f.thread.state.credentials.effective = admin;
+        assert_eq!(restrict_task(&mut f, 0, &[(1, 0)]), errno(Errno::EPERM));
+        // A ring from before has none.
+        let read = rw(READ, 0, HERE, DATA, 1);
+        assert_eq!(one(&mut f, &before, &nop(1, 0, 0, 0, 0)), 0);
+        assert_eq!(f.ret(427, &[before.fd, 12, 0, 0]), errno(EBADFD));
+        // A new one has them, enabled at once or not.
+        let r = ring(&mut f);
+        assert_eq!(one(&mut f, &r, &nop(1, 0, 0, 0, 0)), 0);
+        assert_eq!(one(&mut f, &r, &read), EACCES);
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);
+        assert_eq!(f.ret(427, &[r.fd, 8, DATA, 1]), eacces);
+        // A disabled one takes any registration but other restrictions
+        // (`EBUSY`), and is held to them once enabled.
+        let d = ring_with(&mut f, R_DISABLED);
+        assert_eq!(restrict(&mut f, &d, &[(1, 22)]), errno(EBUSY));
+        assert_eq!(f.ret(427, &[d.fd, 12, 0, 0]), 0);
+        assert_eq!(one(&mut f, &d, &read), EACCES);
+        assert_eq!(f.ret(427, &[d.fd, 12, 0, 0]), eacces);
+    }
+
     #[test]
     fn a_request_runs_with_its_personality() {
         let mut f = fixture();

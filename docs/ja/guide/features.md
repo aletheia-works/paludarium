@@ -1967,6 +1967,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   要求に許す操作、付けてよいフラグ、付けなければならないフラグで、合わない要求は `EACCES` で
   失敗します。1 つもない制限は何も許しません。
 
+- タスクの制限は、Linux 7.0 の `io_register_restrictions_task` と同じく、記述子 -1 の
+  `IORING_REGISTER_RESTRICTIONS` で付け、スレッドがその後に作るどのリングにも、有効か無効かに
+  かかわらず付きます（無効なリングはもう自分の制限を取りません。`EBUSY`）。新しいスレッドや
+  プロセスはそれを写し、exec は保ちます。すでに持つスレッドは断られ（`EPERM`）、
+  `no_new_privs` か `CAP_SYS_ADMIN` が要ります（`EACCES`）。引数は 1 つで（`EINVAL`）、
+  読む（`EFAULT`）`struct io_uring_task_restriction` にフラグも予約ビットもなく（`EINVAL`）、
+  その後に続く制限はリングのものと同じく読みます。記述子 -1 でほかの登録をすると `EINVAL` です。
+
 - `IORING_REGISTER_PERSONALITY` はスレッドの資格情報を Landlock のドメインごと保ち、1 から
   始まる ID を返します（`xa_alloc_cyclic`）。それを指す要求（なければ `EINVAL`）は、待った後に
   続くときも含めてその資格情報で実行し（`override_creds`）、

@@ -60,6 +60,7 @@ mod fs;
 mod net;
 mod poll;
 mod register;
+pub(crate) use register::Restrictions;
 mod splice;
 mod timeout;
 
@@ -3469,7 +3470,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
             std::sync::OnceLock::new()
         },
         disabled: (flags & SETUP_R_DISABLED != 0).into(),
-        restrictions: Mutex::default(),
+        restrictions: Mutex::new(register::of_task(c)),
         personalities: Mutex::default(),
         submitting: Mutex::default(),
         state: Mutex::default(),
@@ -3861,6 +3862,16 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let opcode = opcode & !REGISTER_USE_REGISTERED_RING;
     if opcode >= REGISTER_LAST {
         return Err(Errno::EINVAL);
+    }
+    // Descriptor -1 names no ring (`io_uring_register_blind`): of what Linux
+    // takes there, only a task's restrictions are here.
+    if a[0] as u32 == u32::MAX {
+        return match opcode {
+            register::REGISTER_RESTRICTIONS => {
+                register::register_task_restrictions(c, a[2], a[3] as u32)
+            }
+            _ => Err(Errno::EINVAL),
+        };
     }
     let file = ring_file(c, a[0], registered)?;
     let ring = downcast(&file)?;

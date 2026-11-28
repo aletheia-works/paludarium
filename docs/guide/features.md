@@ -2274,6 +2274,17 @@ kernel.
   requests, each of which fails with `EACCES` otherwise. None at all allows
   nothing.
 
+- A task's restrictions, `IORING_REGISTER_RESTRICTIONS` with descriptor -1
+  as Linux 7.0's `io_register_restrictions_task` takes them, go to every
+  ring the thread sets up after, enabled or disabled (which then takes no
+  restrictions of its own, `EBUSY`). A new thread or process copies them,
+  and exec keeps them. A thread with them already is refused (`EPERM`), and
+  one needs `no_new_privs` or `CAP_SYS_ADMIN` (`EACCES`). There must be one
+  argument (`EINVAL`), a `struct io_uring_task_restriction` that is read
+  (`EFAULT`) with no flags or reserved bits (`EINVAL`), whose restrictions
+  follow it and are read as a ring's are. Descriptor -1 with another
+  registration is `EINVAL`.
+
 - `IORING_REGISTER_PERSONALITY` keeps the thread's credentials, with its
   Landlock domain, and gives their ID, from 1 on (`xa_alloc_cyclic`). A
   request that names one (`EINVAL` for none) runs with them, again as it

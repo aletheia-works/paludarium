@@ -4605,56 +4605,75 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // `shmem_getattr` gives them as attributes.
     let noop = &mut |_: &mut u32| {};
     // `place` is where the file is, to tell whether it is its mount's root,
-    // and `follow` whether a link there is followed.
-    let mut follow = false;
-    let (s, device, block_size, kept, at, place) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
-        if dir as i32 == -100 {
-            let cwd = c
-                .files
-                .cwd
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            (
-                c.files.fs().metadata(&cwd, true)?,
-                device(c, &cwd),
-                path_block_size(&cwd),
-                c.files.fs().with_attributes(&cwd, true, noop).is_ok(),
-                cwd.clone(),
-                cwd,
-            )
+    // and `tmpfs` whether the file is of tmpfs or devtmpfs: by the
+    // descriptor's own file system for a descriptor, which may have been
+    // renamed or removed since it was opened.
+    let tmpfs = |kind: u64| kind == paludarium_vfs::TMPFS_MAGIC;
+    let (s, device, block_size, kept, at, place, on_tmpfs) =
+        if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            if dir as i32 == -100 {
+                let cwd = c
+                    .files
+                    .cwd
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                (
+                    c.files.fs().metadata(&cwd, true)?,
+                    device(c, &cwd),
+                    path_block_size(&cwd),
+                    c.files.fs().with_attributes(&cwd, true, noop).is_ok(),
+                    cwd.clone(),
+                    cwd.clone(),
+                    tmpfs(path_kind(c, &cwd, true)),
+                )
+            } else {
+                let d = c.files.descriptor(dir)?;
+                let device = descriptor_device(c, &d);
+                let stat = d.file.stat()?;
+                // A named fifo's descriptor is a pipe's to `fstatfs`, so its
+                // device tells what mount it is on.
+                let fifo = stat.mode & 0o170000 == 0o010000 && d.path.first() == Some(&b'/');
+                let on_tmpfs = if fifo {
+                    tmpfs_device(c, device)
+                } else {
+                    descriptor_statfs(c, &d).is_ok_and(|s| tmpfs(s.kind))
+                };
+                (
+                    stat,
+                    device,
+                    descriptor_block_size(c, &d),
+                    d.file.with_attributes(noop).is_ok(),
+                    d.path.clone(),
+                    d.path.clone(),
+                    on_tmpfs,
+                )
+            }
         } else {
-            let d = c.files.descriptor(dir)?;
-            (
-                d.file.stat()?,
-                descriptor_device(c, &d),
-                descriptor_block_size(c, &d),
-                d.file.with_attributes(noop).is_ok(),
-                d.path.clone(),
-                d.path.clone(),
-            )
-        }
-    } else {
-        follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        let (p, _) = lookup(c, dir, raw, follow)?;
-        match generated_stat(c, &p, follow)? {
-            Some((stat, device, block_size)) => (stat, device, block_size, false, Vec::new(), p),
-            None => match c.files.fs().metadata(&p, follow) {
-                Err(e) => {
-                    let (stat, device, block_size, _) = linked_generated(c, &p, follow, e)?;
-                    (stat, device, block_size, false, Vec::new(), p)
+            let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+            let (p, _) = lookup(c, dir, raw, follow)?;
+            let on_tmpfs = tmpfs(path_kind(c, &p, follow));
+            match generated_stat(c, &p, follow)? {
+                Some((stat, device, block_size)) => {
+                    (stat, device, block_size, false, Vec::new(), p, on_tmpfs)
                 }
-                Ok(s) => (
-                    s,
-                    device(c, &p),
-                    path_block_size(&p),
-                    c.files.fs().with_attributes(&p, follow, noop).is_ok(),
-                    p.clone(),
-                    p,
-                ),
-            },
-        }
-    };
+                None => match c.files.fs().metadata(&p, follow) {
+                    Err(e) => {
+                        let (stat, device, block_size, _) = linked_generated(c, &p, follow, e)?;
+                        (stat, device, block_size, false, Vec::new(), p, on_tmpfs)
+                    }
+                    Ok(s) => (
+                        s,
+                        device(c, &p),
+                        path_block_size(&p),
+                        c.files.fs().with_attributes(&p, follow, noop).is_ok(),
+                        p.clone(),
+                        p,
+                        on_tmpfs,
+                    ),
+                },
+            }
+        };
     let mut attributes = 0;
     let mut known = STATX_ATTR_KNOWN;
     // STATX_ATTR_IMMUTABLE, STATX_ATTR_APPEND and STATX_ATTR_NODUMP, which
@@ -4664,7 +4683,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if kept {
         attributes |= u64::from(s.attributes & STATX_ATTR_FLAGS);
     }
-    if kept || path_kind(c, &place, follow) == paludarium_vfs::TMPFS_MAGIC {
+    if kept || on_tmpfs {
         known |= u64::from(STATX_ATTR_FLAGS);
     }
     if mount_root(c, &place, s.mode) {
@@ -4687,6 +4706,14 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     b[144..152].copy_from_slice(&id.to_le_bytes());
     output(c, out, &b)?;
     Ok(0)
+}
+/// Whether `device` is a tmpfs or devtmpfs mount's.
+fn tmpfs_device(c: &Context<'_>, device: u64) -> bool {
+    c.files
+        .fs()
+        .mounts()
+        .iter()
+        .any(|m| m.device == device && matches!(m.kind, "tmpfs" | "devtmpfs"))
 }
 /// Whether the file at `place`, of mode `mode`, is the root of its mount,
 /// as `vfs_statx_path`'s `path_mounted` tells: with `.`, `..` and links on

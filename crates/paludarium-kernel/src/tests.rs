@@ -2978,6 +2978,15 @@ fn statx_gives_the_known_attributes_and_the_mount_root() {
     );
     assert_eq!(f.mem.read_u64(GuestAddr(out + 8)).unwrap(), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(out + 56)).unwrap(), known);
+    // A named fifo opened and then removed is still tmpfs's.
+    f.mem.write(GuestAddr(path), b"/statx-fifo\0").unwrap();
+    assert_eq!(f.ret(133, &[path, 0o10_600, 0]), 0);
+    let fifo = f.ret(2, &[path, 2, 0]);
+    assert!(fifo < 1024, "{fifo}");
+    assert_eq!(f.ret(87, &[path]), 0);
+    f.mem.write(GuestAddr(path), b"\0").unwrap();
+    assert_eq!(f.ret(332, &[fifo, path, 0x1000, 0x7ff, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 56)).unwrap(), tmpfs);
     // A chroot's root is not its mount's root.
     f.mem.write(GuestAddr(path), b"/statx-dir\0").unwrap();
     assert_eq!(f.ret(161, &[path]), 0);

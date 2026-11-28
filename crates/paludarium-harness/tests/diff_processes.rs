@@ -420,6 +420,8 @@ mod linux {
         // Its maps need CAP_BPF.
         bpf_prog_calls => ("bpf-prog-calls", "bpf-prog", root),
         // Its maps need CAP_BPF.
+        bpf_prog_cfg => ("bpf-prog-cfg", "bpf-prog", root),
+        // Its maps need CAP_BPF.
         bpf_prog_classic => ("bpf-prog-classic", "bpf-prog", root),
         // Its maps need CAP_BPF.
         bpf_prog_context => ("bpf-prog-context", "bpf-prog", root),

@@ -129,6 +129,12 @@
    context, in their order. Not printed: the time a run took, and what
    master and the test machines' Linux 7.0 do differently (a short IPv4
    or IPv6 header, IPX, and a packet in pages cut by data_size_out).
+   bpf-prog-cfg: the shape of the jumps, which the verifier checks before
+   any path: jumps to the next instruction, paths that meet, a 64-bit
+   constant jumped onto or over, a function two paths call; and code no
+   path reaches, a jump into a 64-bit constant or past either end, and a
+   jump from a function into the main program, with the first such
+   instruction the log names.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -3644,6 +3650,43 @@ static int case_testrun(void) {
     return 0;
 }
 
+/* bpf-prog-cfg. Not here: a jump back, which Linux takes from a loader
+   with CAP_BPF as a bounded loop and the verifier here refuses. */
+#define JA(off) I(0x05, 0, 0, off, 0)
+#define JEQ32(dst, imm, off) I(0x16, dst, 0, off, imm)
+#define CONST64(dst, v) I(0x18, dst, 0, 0, v), I(0, 0, 0, 0, 0)
+static int case_cfg(void) {
+    /* Programs it takes. */
+    LOAD("a jump to the next insn", MOV(0, 0), JA(0), EXIT());
+    LOAD("both ways to the next insn", MOV(0, 0), JEQ(0, 0, 0), EXIT());
+    LOAD("a 32-bit jump both ways to the next insn", MOV(0, 0), JEQ32(0, 0, 0), EXIT());
+    LOAD("two paths that meet", MOV(0, 0), JEQ(0, 0, 2), MOV(0, 1), JA(1), MOV(0, 2), EXIT());
+    LOAD("two exits", MOV(0, 0), JEQ(0, 0, 1), EXIT(), MOV(0, 1), EXIT());
+    LOAD("a jump onto a 64-bit constant", MOV(0, 0), JEQ(0, 0, 1), MOV(0, 1), CONST64(1, 5),
+         EXIT());
+    LOAD("a jump over a 64-bit constant both paths reach", MOV(0, 0), JEQ(0, 0, 2), CONST64(1, 5),
+         EXIT());
+    LOAD("chained jumps", MOV(0, 0), JA(1), EXIT(), JA(-2));
+    LOAD("a function two paths call", MOV(0, 0), JEQ(0, 0, 2), CALLF(3), JA(1), CALLF(1), EXIT(),
+         MOV(0, 1), EXIT());
+
+    /* Programs it refuses. */
+    LOAD("a jump over an insn", MOV(0, 0), JA(1), MOV(0, 1), EXIT());
+    LOAD("two places no path reaches", MOV(0, 0), JA(1), MOV(0, 1), EXIT(), EXIT());
+    LOAD("a jump into a 64-bit constant", MOV(0, 0), JEQ(0, 0, 1), CONST64(1, 5), EXIT());
+    LOAD("a jump into a 64-bit constant no path reaches", MOV(0, 0), JA(1), CONST64(1, 5),
+         EXIT());
+    LOAD("a 32-bit jump into a 64-bit constant", MOV(0, 0), JEQ32(0, 0, 1), CONST64(1, 5), EXIT());
+    LOAD("a call into a 64-bit constant", CALLF(2), EXIT(), CONST64(0, 5), EXIT());
+    LOAD("code in a function no path reaches", CALLF(1), EXIT(), MOV(0, 0), JA(1), MOV(0, 1),
+         EXIT());
+    LOAD("a jump just past the end", MOV(0, 0), JA(1), EXIT());
+    LOAD("a jump before the start", MOV(0, 0), JEQ(0, 0, -3), EXIT());
+    LOAD("a jump from a function into the main program", CALLF(2), MOV(0, 0), EXIT(), JA(-2),
+         EXIT());
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -3662,5 +3705,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-tcp")) return case_tcp();
     if (!strcmp(mode, "bpf-prog-segments")) return case_segments();
     if (!strcmp(mode, "bpf-prog-testrun")) return case_testrun();
+    if (!strcmp(mode, "bpf-prog-cfg")) return case_cfg();
     return 2;
 }

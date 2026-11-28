@@ -85,6 +85,10 @@ pub(crate) struct PendingSignal {
     pub queued: Option<[u8; 48]>,
     /// The discard generation it was sent in ([`Discards`]).
     pub born: u64,
+    /// It was counted as an arrival as it was sent to its thread
+    /// ([`crate::SignalInbox::send_to`]), so [`queue`] does not count it
+    /// again.
+    pub counted: bool,
 }
 /// The signal a refused segment-register load gives, as Linux's
 /// `exc_general_protection` (SIGSEGV) and `exc_segment_not_present` and
@@ -92,6 +96,7 @@ pub(crate) struct PendingSignal {
 /// vector and error code in the frame's `trapno` and `err`.
 pub(crate) fn segment_fault(trap: u8, error: u16) -> PendingSignal {
     PendingSignal {
+        counted: false,
         target: PendingTarget::Thread,
         number: if trap == 13 {
             paludarium_types::signal::SIGSEGV
@@ -170,6 +175,7 @@ impl Discards {
                 .and_then(|i| self.0.get(i))
                 .is_none_or(|slot| slot.load(Ordering::SeqCst) <= signal.born)
         });
+        refresh_own(state);
     }
 }
 /// `si_pid`, `si_status` and the CPU time (`si_utime`) of a SIGCHLD.
@@ -274,6 +280,7 @@ pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128
 impl PendingSignal {
     pub fn user(number: i32, code: i32) -> Self {
         Self {
+            counted: false,
             target: PendingTarget::Process,
             number,
             code,
@@ -328,8 +335,10 @@ pub(crate) fn queue(process: &mut ThreadState, signal: PendingSignal) {
     if signal.number == 18 {
         process.stopped = false;
         process.pending.retain(|s| !matches!(s.number, 19..=22));
+        refresh_own(process);
     } else if matches!(signal.number, 19..=22) {
         process.pending.retain(|s| s.number != 18);
+        refresh_own(process);
     }
     // Standard signals coalesce; each real-time number retains FIFO order.
     if signal.number < 32
@@ -341,8 +350,37 @@ pub(crate) fn queue(process: &mut ThreadState, signal: PendingSignal) {
         return;
     }
     process.pending.push(signal);
-    if wakes(process, &signal) {
+    if !signal.counted && wakes(process, &signal) {
         process.arrivals = process.arrivals.wrapping_add(1);
+    }
+}
+/// The standard signals pending for `process`'s thread alone, as
+/// [`crate::targets::Tif::queues`] reads them: not one Linux would have
+/// dropped as ignored, which waits here until delivery drops it.
+pub(crate) fn own_set(process: &ThreadState) -> u64 {
+    process
+        .pending
+        .iter()
+        .filter(|s| {
+            s.target == PendingTarget::Thread && (1..32).contains(&s.number) && wakes(process, s)
+        })
+        .fold(0, |set, s| set | 1 << (s.number - 1))
+}
+/// Removes `process`'s pending signal at `index`, as its thread takes it,
+/// and tells its [`crate::targets::Tif`] that it is no longer pending, so
+/// that one sent next is counted as it is sent, not only at the thread's
+/// next drain.
+pub(crate) fn take_pending(process: &mut ThreadState, index: usize) -> PendingSignal {
+    let signal = process.pending.remove(index);
+    refresh_own(process);
+    signal
+}
+/// Tells `process`'s [`crate::targets::Tif`] its own pending standard
+/// signals after some of them went away, so that one of their numbers sent
+/// next is counted as it is sent, not only at the thread's next drain.
+pub(crate) fn refresh_own(process: &ThreadState) {
+    if let Some(tif) = process.seat.tif() {
+        tif.set_own(own_set(process));
     }
 }
 /// Whether Linux would queue `signal` for `process`, and so wake a signal

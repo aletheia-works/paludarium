@@ -458,6 +458,7 @@ mod linux {
                     | "veth-ipv6-kept"
                     | "veth-hash-policy"
                     | "veth-use-neigh"
+                    | "veth-icmp-hop"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-unicast-if"
@@ -472,6 +473,7 @@ mod linux {
                     | "net-dev-counters"
                     | "net-dev-tcp"
                     | "veth-igmp-neighbours"
+                    | "veth-ipv6-solicited-routers"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -738,6 +740,7 @@ mod linux {
         veth_ipv6_kept => ("veth-ipv6-kept","veth-ipv6-kept"),
         veth_hash_policy => ("veth-hash-policy","veth-hash-policy"),
         veth_use_neigh => ("veth-use-neigh","veth-use-neigh"),
+        veth_icmp_hop => ("veth-icmp-hop","veth-icmp-hop"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_unicast_if => ("veth-unicast-if","veth-unicast-if"),
@@ -752,6 +755,7 @@ mod linux {
         net_dev_counters => ("net-dev-counters","net-dev-counters"),
         net_dev_tcp => ("net-dev-tcp","net-dev-tcp"),
         veth_igmp_neighbours => ("veth-igmp-neighbours","veth-igmp-neighbours"),
+        veth_ipv6_solicited_routers => ("veth-ipv6-solicited-routers","veth-ipv6-solicited-routers"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
@@ -1143,6 +1147,7 @@ mod linux {
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
+        processes_sysctl_constants => ("sysctl-constants","process"),
         processes_poll_default => ("poll-default","process"),
         processes_uts_sysctl => ("uts-sysctl","process"),
         processes_uts_sysctl_poll => ("uts-sysctl-poll","process"),

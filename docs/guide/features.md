@@ -2170,7 +2170,23 @@ kernel.
   again once the socket is ready, unless it asked not to (`MSG_DONTWAIT`,
   `IORING_ACCEPT_DONTWAIT`), when it completes with `EAGAIN`.
   `IORING_RECVSEND_POLL_FIRST` and `IORING_ACCEPT_POLL_FIRST` wait first.
-  A send adds `MSG_NOSIGNAL`. With `MSG_WAITALL`, a stream or
+  A send adds `MSG_NOSIGNAL`. With `IORING_SEND_VECTORIZED` it sends the
+  iovecs at its address, as many as its length says, which it reads as it
+  is prepared (`io_net_import_vec`). With `IOSQE_BUFFER_SELECT` it sends
+  from the buffers it selects as it first runs, and keeps them while it
+  waits (`io_buffers_select`): a group it does not find is `ENOENT`, one
+  with none left `ENOBUFS`, and a ring's buffer outside the user half
+  `EFAULT`. A buffer is cut to the length, as Linux master cuts it, its
+  ring entry as it was. Its completion names the first, as a
+  read's does, and so does one that fails. With `IORING_RECVSEND_BUNDLE` a
+  send sends all it has (`MSG_WAITALL`), and one that selects takes as
+  many of a ring's buffers as its length needs, at most 256, leaving one
+  it would cut for the next unless the ring has `IOU_PBUF_RING_INC`; taking
+  the last one there is empties the group. A bundle that
+  sent anything posts with `IORING_CQE_F_MORE` and sends again at once,
+  with no length and new buffers, until it sends nothing, takes its
+  group's last buffers or waited (`io_send_finish`); one that selects none
+  sends nothing the second time. With `MSG_WAITALL`, a stream or
   sequenced-packet socket's send or receive goes on to its whole length
   and gives all it moved; one that fails on the way, as it asked not to
   wait or was cancelled, gives what it moved too (`io_sendrecv_fail`). A
@@ -3198,10 +3214,15 @@ kernel.
     (`ip_route_connect`). A socket's flow hashes its own port, which a UDP
     socket has before its route (`inet_send_prepare`, `inet_dgram_connect`),
     and a connection with none yet a random one (`FLOWI_FLAG_ANY_SPORT`);
-    an answer hashes its own ports. A packet may come in on the device of any hop of
-    the route back to its source (`fib_info_nh_uses_dev`), and its answer
-    goes back by a lookup of its own, through whichever end that takes, or
-    the one its listener is bound to. An output lookup that goes through
+    an answer hashes its own ports. IPv4's port unreachable is looked up
+    with the datagram it tells of (`icmp_route_lookup`), hashed as the
+    packet of an `RTM_GETROUTE` is. Under policy 1, a datagram from a
+    connected socket is hashed instead by the random flow hash that socket
+    gave it (`sk_txhash`, `skb_set_hash_from_sk`). A packet may come in
+    on the device of any hop of the route back to its source
+    (`fib_info_nh_uses_dev`), and its answer goes back by a lookup of its
+    own, through whichever end that takes, or the one its listener is bound
+    to. An output lookup that goes through
     an end leaves from its first primary address, else from the first of
     the other devices' in the order they were made
     (`inet_select_addr`), and names it as `RTA_OIF`,
@@ -3844,13 +3865,18 @@ kernel.
     (`addrconf_dad_work`); and, as the detection of a veth end's only
     link-local address ends, a report again (`ipv6_mc_dad_complete`) and,
     unless the end forwards, a router solicitation to ff02::2
-    (`addrconf_dad_completed`). IGMPv3's report to 224.0.0.22
-    (`IGMPV3_ALL_MCR`) makes its neighbour so too, on `lo` that of 0.0.0.0
-    as every IPv4 one there: as a device up joins a group anew, leaves one
-    for good or changes a filter's sources, and of its groups as it comes
-    up, but for the all-hosts group (`igmp_group_added`,
-    `igmp_group_dropped`, `ip_mc_up`), its carrier or not; a device down
-    has no route to report on (`ENETUNREACH`). An end going down takes its
+    (`addrconf_dad_completed`), from that address with the end's own
+    Ethernet address (`ndisc_send_rs`): a peer that forwards learns of its
+    sender as `ndisc_recv_rs` does, the neighbour of that address made, or
+    changed, stale at the Ethernet address, and no router (`NTF_ROUTER`
+    goes), told of with `RTM_NEWNEIGH`; one that does not takes no
+    notice. IGMPv3's report to 224.0.0.22 (`IGMPV3_ALL_MCR`) makes its
+    neighbour so too, on `lo` that of 0.0.0.0 as every IPv4 one there: as
+    a device up joins a group anew, leaves one for good or changes a
+    filter's sources, and of its groups as it comes up, but for the
+    all-hosts group (`igmp_group_added`, `igmp_group_dropped`,
+    `ip_mc_up`), its carrier or not; a device down has no route to report
+    on (`ENETUNREACH`). An end going down takes its
     neighbours, each told of with `RTM_DELNEIGH` after its
     `RTM_NEWLINK`, IPv4's, then IPv6's; its peer losing its carrier, all
     but the permanent ones (`neigh_carrier_down`); and an end that goes or
@@ -4919,9 +4945,27 @@ kernel.
   (`ptrace`, `process_vm_readv`, `pidfd_getfd`, `/proc/<pid>/mem` and the
   other files that attach), and at 2 `PTRACE_TRACEME` needs a tracer with
   `CAP_SYS_PTRACE` in the caller's user namespace and at 3 is refused
-  (`EPERM`), as `yama_ptrace_traceme`. `/proc/sys/kernel` lists only these,
-  the six below and `yama`, and each directory of `/proc/sys` lists its
-  entries by name, as Linux's tree of them keeps them.
+  (`EPERM`), as `yama_ptrace_traceme`.
+  `/proc/sys/kernel` also has the machine's constants, of mode 0444 and
+  root's, which no one opens to write (`EACCES`): `cap_last_cap` (40, the
+  highest capability `prctl` takes) and `ngroups_max` (65536, the most
+  groups `setgroups` takes), as Linux's `kernel/sysctl.c`; and
+  `seccomp/actions_avail`, the names of the actions
+  `SECCOMP_GET_ACTION_AVAIL` takes, as `kernel/seccomp.c` has it
+  (`actions_logged`, which Linux has beside it, is not made, as nothing is
+  logged). `/proc/sys/kernel/random` has the files of Linux's
+  `drivers/char/random.c`: `poolsize`, `entropy_avail` and
+  `write_wakeup_threshold` 256, the bits of a pool that is ready, as on a
+  booted machine, and `urandom_min_reseed_secs` 60, of which the last two
+  are of mode 0644 and take what root writes whole, to no effect
+  (`proc_do_rointvec`); `boot_id`, a random version 4 UUID the machine draws
+  at its first read and keeps, and `uuid`, a new one at each read
+  (`proc_do_uuid`). A string among these is read from where the file is, as
+  `proc_dostring` reads it, and an `int` only from the start.
+  `/proc/sys/kernel` lists only these, the six below and the directories
+  `random`, `seccomp` and `yama`, and each directory of `/proc/sys` lists
+  its entries by name, directories among files, as Linux's tree of them
+  keeps them.
 
 - `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
   `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`
@@ -5144,18 +5188,19 @@ kernel.
     loopback to an own address, through a veth end to its peer, or once
     for a broadcast or a group whoever takes it, the sender's own copy
     looping back uncounted (`dev_loopback_xmit`); ICMP's port unreachable
-    that answers one, quoting at most what fits in 576 bytes or, of IPv6,
-    1280 (`icmp_send`, `icmp6_send`); an ARP request and its answer
-    (`arp_send`); and each TCP segment, a GSO buffer of several as one
-    (`__tcp_transmit_skb`), with its TCP header: the SYN's and SYN-ACK's
-    options, a reset's to a closed port none (`tcp_v4_send_reset`), the
-    rest the timestamps and their SACK blocks (`tcp_options_write`). What
-    they leave out is in the [limitations](./limitations).
+    that answers one, out through the end its own route takes, quoting at
+    most what fits in 576 bytes or, of IPv6, 1280 (`icmp_send`,
+    `icmp6_send`); an ARP request and its answer (`arp_send`); and each TCP
+    segment, a GSO buffer of several as one (`__tcp_transmit_skb`), with its
+    TCP header: the SYN's and SYN-ACK's options, a reset's to a closed port
+    none (`tcp_v4_send_reset`), the rest the timestamps and their SACK blocks
+    (`tcp_options_write`). What they leave out is in the
+    [limitations](./limitations).
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
     first, with their users, under a line of the device with how many it
     has and the querier `V3`: no IGMP report is heard, and none is sent
-    again on a timer, so no timer runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
-    each IPv6 group of each device with IPv6, the newest first, with its
+    again on a timer, so no timer runs and no device is the reporter.
+    `igmp6` (`igmp6_mc_seq_show`), each IPv6 group of each device with IPv6, the newest first, with its
     users and its flags, `MAF_NOREPORT` for ff02::1 and a group of a scope
     below a link's and `MAF_LOADED` for the rest from when they are joined
     or their device comes up until it goes down, and no timer, as no MLDv1
@@ -6092,9 +6137,10 @@ kernel.
   `lpm_trie.c`: a key is a prefix length (a `u32`) and 1 to 256 bytes of
   data, the most significant first, and `LOOKUP_ELEM` gives the value of
   the longest prefix that holds the key's (`ENOENT` for none, and for a
-  prefix length past the data's bits). Its nodes are Linux's, with
-  intermediate ones where two prefixes part, so `GET_NEXT_KEY` gives the
-  keys in Linux's postorder, more specific prefixes first (from the first
+  prefix length past the data's bits). `GET_NEXT_KEY` gives the keys in
+  Linux's order: of two prefixes where one holds the other, the more
+  specific first, and otherwise the one whose first differing bit is 0
+  (from the first
   for no key, a prefix length past the data's bits, or a key that is no
   element's), each with the bytes past its prefix that its last update
   gave. `UPDATE_ELEM` takes `BPF_ANY`, `BPF_NOEXIST` and `BPF_EXIST`
@@ -6225,19 +6271,9 @@ kernel.
   and no wider than the spill, which the load zero- or sign-extends), a
   load through a scalar ("R%d invalid mem
   access 'scalar'", `EACCES`) and the exit's R0, which may be any value.
-  Of a scalar it knows the bits and the unsigned and signed bounds, of 64
-  and of 32 bits, as Linux 7.0's verifier follows them (`tnum`,
-  `umin_value` to `s32_max_value`): through each ALU operation, the zero or
-  sign extension of a load, and `bpf_get_smp_processor_id`'s result below
-  the CPUs. A copy, a spill and its fill link a scalar to its copy, and to
-  one with a constant added (`BPF_ADD_CONST`). A conditional jump goes one
-  way where the bounds decide it (`is_branch_taken`), and is walked both
-  ways otherwise, each with what holds there (`reg_set_min_max`) in the
-  registers compared and those linked to them (`sync_linked_regs`). A
-  `BPF_AND` or `BPF_OR` of a constant to a register that is -1 or 0 is
-  walked once for each (`maybe_fork_scalars`). It gives up as Linux does
-  after 1,000,000 instructions or 8,192 jumps waiting to be walked
-  (`E2BIG`).
+  A conditional jump whose operands it knows goes one way; any other is
+  walked both ways. It gives up as Linux does after 1,000,000 instructions
+  or 8,192 jumps waiting to be walked (`E2BIG`).
 
 - Programs use maps as Linux's verifier lets them. A `BPF_LD_IMM64` of a
   map's descriptor (`BPF_PSEUDO_MAP_FD`) gives the map, and one of its
@@ -6634,7 +6670,8 @@ kernel.
   forked child's inherited file reads the child's signals. Edge-triggered
   `epoll` gets an edge for each signal queued to the process or any of its
   threads while one of the file's signals is pending for the waiter, as Linux's `signalfd_notify`
-  wakes the file for each: another real-time signal of a number already
+  wakes the file for each, as it is sent, even when another thread has yet
+  to take it in: another real-time signal of a number already
   waiting counts, a standard signal already pending or one ignored and
   unblocked does not; a new mask is an edge too. `signalfd` on a
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);
@@ -6658,6 +6695,11 @@ kernel.
     the newest first.
   - Any close of a descriptor of that open file through that table ends
     its watch, as do asking with no events and the table's end.
+  - The directory's mark stays after a one-shot watch's signal took its
+    last watch off. Any close of a descriptor of the directory, through any
+    table and at a table's end too, then takes the mark off
+    (`dnotify_flush`), which moves the directory's place in `IN_UNMOUNT`'s
+    order.
   - A file that is not a directory gives `ENOTDIR`, an `O_PATH` descriptor
     `EBADF`. Unknown bits are ignored.
   - `/proc/sys/fs/dir-notify-enable`, the machine's (1 at first), is root's

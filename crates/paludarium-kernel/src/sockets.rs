@@ -1504,6 +1504,18 @@ impl MessageHeader {
             control_len,
         }
     }
+    /// A send of the buffers `iov` to the address `name`, if any, and its
+    /// length: an io_uring send of several buffers, which goes as a message.
+    pub(crate) fn of_send(name: Option<(u64, usize)>, iov: Vec<(u64, usize)>) -> Self {
+        Self {
+            name,
+            has_name: name.is_some(),
+            name_at: name.map_or(0, |(at, _)| at),
+            iov,
+            control: 0,
+            control_len: 0,
+        }
+    }
 }
 /// Reads the `msghdr` at `at` (EFAULT): a negative `msg_namelen` with a name
 /// is EINVAL, a longer one counts as `sockaddr_storage`'s 128 bytes, and

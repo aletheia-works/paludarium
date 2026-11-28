@@ -27,6 +27,9 @@ pub struct SignalInbox {
     /// to ([`Self::publish`]); the thread's count when it last did, and how
     /// much it has added in all.
     arrivals: Mutex<Option<Arc<AtomicU64>>>,
+    /// The thread group's actions, which decide whether a signal sent here
+    /// for the thread is ignored ([`Self::send_to`]).
+    actions: Mutex<Option<crate::threads::ActionSlot>>,
     published: AtomicU64,
     contributed: AtomicU64,
     /// Whether the thread is blocked in a wait of the host, which `/proc`
@@ -58,6 +61,7 @@ impl Default for SignalInbox {
             notices: AtomicU64::default(),
             discards: Mutex::default(),
             arrivals: Mutex::default(),
+            actions: Mutex::default(),
             published: AtomicU64::default(),
             contributed: AtomicU64::default(),
             entry: Entry::default(),
@@ -235,6 +239,7 @@ impl SignalInbox {
     /// the overrun its signal now has.
     pub(crate) fn send_timer(&self, signal: signals::PendingSignal) -> Option<(i32, i32)> {
         let timer = signal.timer?;
+        let ignored = self.ignores(signal.number);
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(queued) = queue
             .iter_mut()
@@ -245,6 +250,12 @@ impl SignalInbox {
                 .saturating_add(timer.overrun)
                 .saturating_add(1);
             return Some((timer.id, queued.overrun));
+        }
+        let mut signal = signal;
+        if signal.target == signals::PendingTarget::Thread
+            && let Some(ignored) = ignored
+        {
+            signal.counted = self.count_sent(signal.number, ignored);
         }
         queue.push(signal);
         self.tif.complete(signal.number);
@@ -259,11 +270,17 @@ impl SignalInbox {
     }
     /// Queues `signal`, and wakes the thread `complete_signal` chooses for it,
     /// sent to `sent` if it is for the process.
+    /// A signal for the thread that Linux would queue ([`Tif::queues`])
+    /// counts as an arrival as it is sent, as `signalfd_notify` wakes the
+    /// process's signal files then, not as its thread takes it in later.
     pub(crate) fn send_to(&self, signal: signals::PendingSignal, sent: Sent) -> Result<(), Errno> {
         let number = signal.number;
         if !(1..=64).contains(&number) {
             return Err(Errno::EINVAL);
         }
+        let ignored = (signal.target == signals::PendingTarget::Thread)
+            .then(|| self.ignores(number))
+            .flatten();
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if number < 32
             && queue
@@ -271,6 +288,10 @@ impl SignalInbox {
                 .any(|s| s.number == number && s.target == signal.target)
         {
             return Ok(());
+        }
+        let mut signal = signal;
+        if let Some(ignored) = ignored {
+            signal.counted = self.count_sent(number, ignored);
         }
         queue.push(signal);
         match signal.target {
@@ -378,6 +399,46 @@ impl SignalInbox {
         *self.discards.lock().unwrap_or_else(PoisonError::into_inner) = Some(discards);
         *self.arrivals.lock().unwrap_or_else(PoisonError::into_inner) = Some(arrivals);
     }
+    /// Follows the thread group's actions, as they are now and after an
+    /// `execve` gives the group its own.
+    pub(crate) fn follow_actions(&self, actions: crate::threads::ActionSlot) {
+        *self.actions.lock().unwrap_or_else(PoisonError::into_inner) = Some(actions);
+    }
+    /// Whether the thread group's action ignores signal `number` (`SIG_IGN`,
+    /// or `SIG_DFL` for one ignored by default), as `sig_task_ignored` reads
+    /// it; `None` for an inbox of no group. Read before the queue's lock is
+    /// taken, which no action's lock is held around.
+    fn ignores(&self, number: i32) -> Option<bool> {
+        let slot = self
+            .actions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        let actions = Arc::clone(&slot.lock().unwrap_or_else(PoisonError::into_inner));
+        let action = actions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&number)
+            .copied()
+            .unwrap_or_default();
+        Some(
+            action.handler == signals::SIG_IGN
+                || action.handler == 0 && matches!(number, 17 | 18 | 23 | 28),
+        )
+    }
+    /// Counts signal `number`, sent for this inbox's thread, as an arrival
+    /// for every thread of the group if Linux would queue it; whether it did.
+    /// Under the queue's lock, which a drain sets the thread's own pending
+    /// signals under ([`Tif::set_own`]).
+    fn count_sent(&self, number: i32, ignored: bool) -> bool {
+        if !self.tif.queues(number, ignored) {
+            return false;
+        }
+        if let Some(count) = &*self.arrivals.lock().unwrap_or_else(PoisonError::into_inner) {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        true
+    }
     /// Adds the signals this inbox's thread made pending since it last did
     /// to the group's count, whether a drain took them in or the kernel
     /// queued them for the thread itself.
@@ -423,7 +484,9 @@ impl SignalInbox {
             .filter(|&(at, s)| {
                 let same =
                     |p: &signals::PendingSignal| p.number == s.number && p.target == s.target;
-                (s.number >= 32 || !(pending.iter().any(same) || queue[..at].iter().any(same)))
+                !s.counted
+                    && (s.number >= 32
+                        || !(pending.iter().any(same) || queue[..at].iter().any(same)))
                     && signals::wakes(process, s)
             })
             .count();
@@ -469,6 +532,7 @@ impl SignalInbox {
                 true
             }
         });
+        self.tif.set_own(signals::own_set(process));
         self.publish(process);
         // Sender stores while holding this same mutex, preventing a lost wake.
         // A process signal still queued keeps it until it is dispatched.
@@ -524,6 +588,130 @@ mod signals_time_tests {
         one.publish(&state);
         assert_eq!(two.others_arrivals(), 3);
         assert_eq!(one.others_arrivals(), 0);
+    }
+
+    /// A signal sent for another thread counts for the group's signal files
+    /// as it is sent, when Linux would queue it, and not again as that
+    /// thread takes it in: not one ignored and unblocked, nor a standard one
+    /// already pending for it.
+    #[test]
+    fn a_signal_for_another_thread_counts_as_it_is_sent() {
+        let count = Arc::<AtomicU64>::default();
+        let actions = crate::threads::ActionSlot::default();
+        let [one, two] = [SignalInbox::default(), SignalInbox::default()];
+        for inbox in [&one, &two] {
+            inbox.attach(Arc::default(), Arc::clone(&count));
+            inbox.follow_actions(Arc::clone(&actions));
+        }
+        let mut state = ThreadState::default();
+        // Until its first drain, its own pending signals are not known.
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 0);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 1);
+        two.send_thread(40, 0).unwrap();
+        two.send_thread(12, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 3);
+        let (_, coming) = two.queued_set(&state);
+        assert_eq!(coming, 0);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 3);
+        // SIGUSR2 is pending for it already, and SIGURG is ignored.
+        two.send_thread(12, 0).unwrap();
+        two.send_thread(23, 0).unwrap();
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 3);
+        // A blocked or ignored by its action, it is queued.
+        two.tif().set_blocked(1 << 22);
+        two.send_thread(23, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 4);
+        actions.lock().unwrap().lock().unwrap().insert(
+            41,
+            crate::SignalAction {
+                handler: signals::SIG_IGN,
+                ..Default::default()
+            },
+        );
+        // The thread's own copy, which a thread syncs with the group's.
+        state.signal_actions.insert(
+            41,
+            crate::SignalAction {
+                handler: signals::SIG_IGN,
+                ..Default::default()
+            },
+        );
+        two.send_thread(41, 0).unwrap();
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 4);
+    }
+
+    /// A standard signal its thread has taken, by delivery or a wait, is no
+    /// longer pending for it: one sent next counts as it is sent, before
+    /// the thread's next drain.
+    #[test]
+    fn a_signal_taken_without_a_drain_is_pending_no_more() {
+        let count = Arc::<AtomicU64>::default();
+        let actions = crate::threads::ActionSlot::default();
+        let [one, two] = [SignalInbox::default(), SignalInbox::default()];
+        for inbox in [&one, &two] {
+            inbox.attach(Arc::default(), Arc::clone(&count));
+            inbox.follow_actions(Arc::clone(&actions));
+        }
+        let mut state = ThreadState::default();
+        state.seat.take(two.tif(), 0);
+        two.send_thread(10, 0).unwrap();
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 1);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 1);
+        two.drain(&mut state);
+        let index = signals::lowest_in(&state.pending, 1 << 9).unwrap();
+        assert_eq!(signals::take_pending(&mut state, index).number, 10);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 2);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 2);
+    }
+
+    /// Nor is one that a discard took away (`flush_sigqueue_mask`), or that
+    /// SIGCONT, or a stop signal, took away as it was queued.
+    #[test]
+    fn a_discarded_signal_is_pending_no_more() {
+        let count = Arc::<AtomicU64>::default();
+        let actions = crate::threads::ActionSlot::default();
+        let [one, two] = [SignalInbox::default(), SignalInbox::default()];
+        for inbox in [&one, &two] {
+            inbox.attach(Arc::default(), Arc::clone(&count));
+            inbox.follow_actions(Arc::clone(&actions));
+        }
+        let mut state = ThreadState::default();
+        state.seat.take(two.tif(), 0);
+        two.send_thread(10, 0).unwrap();
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 1);
+        // The caller's own discard.
+        let discards = signals::Discards::default();
+        discards.mark(10);
+        discards.apply(&mut state);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 2);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 2);
+        // Another thread's, which it drops at its next drain.
+        discards.mark(10);
+        two.tif().forget_own(10);
+        two.send_thread(10, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 3);
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 3);
+        assert_eq!(state.pending.len(), 1);
+        // SIGCONT takes a pending SIGTSTP away as it is queued.
+        two.send_thread(20, 0).unwrap();
+        two.drain(&mut state);
+        assert_eq!(one.others_arrivals(), 4);
+        signals::queue(&mut state, signals::PendingSignal::thread(18, 0));
+        two.send_thread(20, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 5);
     }
 
     #[test]

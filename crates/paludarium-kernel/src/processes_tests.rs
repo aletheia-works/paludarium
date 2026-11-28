@@ -5579,6 +5579,62 @@ mod shm {
         );
     }
 
+    /// The constants of `/proc/sys/kernel`: `cap_last_cap` and
+    /// `ngroups_max` (0444), seccomp's `actions_avail`, and `random`'s
+    /// files, whose `boot_id` stays and whose 0644 ints take a write whole
+    /// and keep their value (`proc_do_rointvec`).
+    #[test]
+    fn kernel_constants_show_linux_s_values() {
+        let (mut k, mut t, m) = setup();
+        let read = |k: &mut Kernel, t: &mut Thread, name: &str| {
+            read_proc(k, t, &m, &format!("/proc/sys/kernel/{name}"))
+        };
+        assert_eq!(read(&mut k, &mut t, "cap_last_cap"), "40\n");
+        assert_eq!(read(&mut k, &mut t, "ngroups_max"), "65536\n");
+        assert_eq!(
+            read(&mut k, &mut t, "seccomp/actions_avail"),
+            "kill_process kill_thread trap errno user_notif trace log allow\n"
+        );
+        for (name, value) in [
+            ("poolsize", "256\n"),
+            ("entropy_avail", "256\n"),
+            ("write_wakeup_threshold", "256\n"),
+            ("urandom_min_reseed_secs", "60\n"),
+        ] {
+            assert_eq!(read(&mut k, &mut t, &format!("random/{name}")), value);
+        }
+        let boot = read(&mut k, &mut t, "random/boot_id");
+        let uuid = read(&mut k, &mut t, "random/uuid");
+        for id in [&boot, &uuid] {
+            let groups: Vec<usize> = id.trim_end().split('-').map(str::len).collect();
+            assert_eq!(groups, [8, 4, 4, 4, 12], "{id}");
+            assert!(id.ends_with('\n'));
+            assert_eq!(id.as_bytes()[14], b'4', "{id}");
+            assert!(b"89ab".contains(&id.as_bytes()[19]), "{id}");
+        }
+        assert_eq!(read(&mut k, &mut t, "random/boot_id"), boot);
+        // Root may not open a 0444 one to write.
+        for name in ["cap_last_cap", "random/uuid", "seccomp/actions_avail"] {
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, name, b"1"),
+                e(Errno::EACCES)
+            );
+        }
+        // A 0644 one takes anything whole, and stays.
+        let name = "random/write_wakeup_threshold";
+        assert_eq!(write_kernel(&mut k, &mut t, &m, name, b"junk 7"), 6);
+        assert_eq!(read(&mut k, &mut t, name), "256\n");
+        // Not root: not to write.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, name, b"1"),
+            e(Errno::EACCES)
+        );
+    }
+
     #[test]
     fn attachments_share_memory_and_count_as_their_mappings() {
         let (mut k, mut t, m) = setup();

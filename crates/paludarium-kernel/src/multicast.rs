@@ -967,9 +967,18 @@ impl Network {
         if sends.is_empty() {
             return;
         }
-        let mut addresses = self.addresses();
-        for (index, to, at) in sends {
-            addresses.send6(index, to, at);
+        let mut solicits = Vec::new();
+        {
+            let mut addresses = self.addresses();
+            for (index, to, at) in sends {
+                addresses.send6(index, to, at);
+                if to == ROUTERS6[0] {
+                    solicits.push((index, at));
+                }
+            }
+        }
+        for (index, at) in solicits {
+            self.routers_solicited(index, at);
         }
     }
     /// Whether the device `index` is up (`IFF_UP`).

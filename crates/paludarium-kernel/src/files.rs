@@ -715,20 +715,19 @@ impl Files {
     /// release itself so that two tasks ending together cannot both miss it.
     /// That last task also gets the table's number, whose record locks then
     /// go (`locks_remove_posix` of each file `close_files` closes).
-    pub(crate) fn release_descriptors(&mut self) -> (Option<u64>, Vec<Arc<dyn FileHandle>>) {
+    pub(crate) fn release_descriptors(&mut self) -> (Option<u64>, Vec<Descriptor>) {
         let fds = std::mem::replace(&mut self.fds, Arc::new(Mutex::new(BTreeMap::new())));
         let table = std::mem::replace(&mut self.table, Arc::new(Table::new()));
         self.reserved = Arc::default();
         Arc::into_inner(fds).map_or_else(
             || (None, Vec::new()),
             |fds| {
-                let files = fds
+                let descriptors = fds
                     .into_inner()
                     .unwrap_or_else(PoisonError::into_inner)
                     .into_values()
-                    .map(|descriptor| descriptor.file)
                     .collect();
-                (Some(table.0), files)
+                (Some(table.0), descriptors)
             },
         )
     }

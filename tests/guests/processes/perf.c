@@ -1816,6 +1816,18 @@ static void see_throttled(const uint64_t *record, void *with) {
     t->records++;
 }
 
+/* Whether the group leader's buffer got a THROTTLE record of the leader,
+   from a member's throttling, and where the reader left off. */
+struct leader_records {
+    uint64_t id, tail;
+    int throttled;
+};
+
+static void see_leader_throttled(const uint64_t *record, void *with) {
+    struct leader_records *l = with;
+    if ((uint32_t)record[0] == RECORD_THROTTLE && record[2] == l->id) l->throttled = 1;
+}
+
 /* Throttling, with kernel.perf_event_max_sample_rate at 1: one interrupt
    of an event a tick throttles it. Only the harness runs this case on
    Linux, and only where it is allowed to change the sysctl (CI); the case
@@ -1866,13 +1878,15 @@ static int case_throttle(void) {
     }
     /* A member's throttling stops its group (perf_event_throttle_group):
        a cpu-clock leader that counts and a member that counts leave out
-       the rest of each tick after the sampling member's second interrupt,
-       which a cpu-clock outside the group counts. The sampler runs every
-       10 us, the least a cpu-clock's timer takes, and the group's counts
-       are measured against the outside clock's: a thread that other work
-       on its CPU preempts is unthrottled each time it runs again
-       (event_sched_in), so that with 100 us and the group's own running
-       time a busy machine showed no stop. */
+       the rest of each tick after the sampling member's interrupt, which
+       a cpu-clock outside the group counts, and the leader's buffer gets
+       a THROTTLE record of the leader. The sampler runs every 10 us, the
+       least a cpu-clock's timer takes, and the group's counts are
+       measured against the outside clock's. A thread that other work on
+       its CPU preempts is unthrottled each time it runs again
+       (event_sched_in), so that a busy machine showed no stop in 20 ms
+       of it: Linux gets up to 100 tries of 20 ms, 2 ms apart, until one
+       shows both clocks stopped. */
     struct attr counting = software(0);
     counting.read_format = FORMAT_RUNNING;
     counting.flags |= DISABLED;
@@ -1884,25 +1898,42 @@ static int case_throttle(void) {
     sampling.sample_period = 10000;
     sampling.sample_type = SAMPLE_TID;
     int sampler = (int)open_event(&sampling, 0, -1, leader, 0);
-    int grouped = leader >= 0 && alone >= 0 && member >= 0 && sampler >= 0;
+    void *leader_page = NULL;
+    int grouped = leader >= 0 && alone >= 0 && member >= 0 && sampler >= 0 &&
+                  map_event(leader, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &leader_page) == 0;
     struct {
         uint64_t value, running;
-    } of[3] = {{0, 0}, {0, 0}, {0, 0}};
-    if (grouped) {
+    } of[3] = {{0, 0}, {0, 0}, {0, 0}}, was[3] = {{0, 0}, {0, 0}, {0, 0}};
+    struct leader_records l = {0};
+    int leader_stopped = 0, member_stopped = 0, alone_all = 0;
+    if (grouped) ioctl(leader, IOC_ID, &l.id);
+    for (int tries = 0; grouped && tries < 100 && !(leader_stopped && member_stopped); tries++) {
+        if (tries) usleep(2000);
         ioctl(leader, IOC_ENABLE, 0);
         ioctl(alone, IOC_ENABLE, 0);
         spin_cpu(20000000L);
         ioctl(alone, IOC_DISABLE, 0);
         ioctl(leader, IOC_DISABLE, 0);
         int fds[3] = {leader, member, alone};
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 3; i++) {
+            was[i] = of[i];
             if (read(fds[i], &of[i], sizeof of[i]) != sizeof of[i]) grouped = 0;
+        }
+        uint64_t value[3], running[3];
+        for (int i = 0; i < 3; i++) {
+            value[i] = of[i].value - was[i].value;
+            running[i] = of[i].running - was[i].running;
+        }
+        leader_stopped = value[0] * 2 < value[2];
+        member_stopped = value[1] * 2 < value[2];
+        alone_all = value[2] * 10 >= running[2] * 9;
+        each_record(leader_page, &l.tail, see_leader_throttled, &l);
     }
     say("restored %d", write_sysctl(RATE, saved));
     say("mapped %d", mapped);
     say("group: opened %d leader stopped %d member stopped %d alone counts all %d", grouped,
-        of[0].value * 2 < of[2].value, of[1].value * 2 < of[2].value,
-        of[2].value * 10 >= of[2].running * 9);
+        leader_stopped, member_stopped, alone_all);
+    say("group: leader's THROTTLE record %d", l.throttled);
     if (!mapped) return 1;
     uint64_t tail = 0;
     each_record(page, &tail, see_throttled, &t);

@@ -36,7 +36,6 @@ mod bpf_interp;
 mod bpf_prog;
 #[cfg(test)]
 mod bpf_prog_tests;
-mod bpf_scalar;
 mod bpf_test_run;
 #[cfg(test)]
 mod bpf_tests;
@@ -1559,6 +1558,7 @@ impl Kernel {
             signals::queue(
                 &mut thread.state,
                 signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGBUS,
                     code: 2,
@@ -1862,7 +1862,7 @@ impl Kernel {
         }
         let mut delivered = false;
         while let Some(index) = signals::next_pending(&thread.state, false) {
-            let mut signal = thread.state.pending.remove(index);
+            let mut signal = signals::take_pending(&mut thread.state, index);
             // A traced thread reports each signal but SIGKILL and one whose
             // action is `SA_IMMUTABLE` to its tracer first, which may cancel
             // or change it (`ptrace_signal`).
@@ -2246,6 +2246,7 @@ impl Kernel {
                 thread.cpu.rip = rip;
                 Self::signalled_fault(thread, addr.0, present);
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGSEGV,
                     code: if mapped { 2 } else { 1 },
@@ -2269,6 +2270,7 @@ impl Kernel {
             ExitReason::InvalidOpcode { rip, .. } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGILL,
                     code: 2,
@@ -2287,6 +2289,7 @@ impl Kernel {
             ExitReason::ArithmeticFault { rip } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGFPE,
                     code: 1,
@@ -2317,6 +2320,7 @@ impl Kernel {
                 thread.cpu.rip = rip;
                 Self::signalled_fault(thread, addr.0, present);
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGBUS,
                     code: if poison { signals::BUS_MCEERR_AR } else { 2 },
@@ -2338,6 +2342,7 @@ impl Kernel {
             ExitReason::FloatingPointFault { rip, code } | ExitReason::MathFault { rip, code } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGFPE,
                     code: i32::from(code),
@@ -2366,6 +2371,7 @@ impl Kernel {
                 // DR6 as a tracer reads it: the step (`virtual_dr6`).
                 thread.state.ptrace.debug.dr6 = ptrace::DR_STEP;
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGTRAP,
                     code: 2,
@@ -2389,6 +2395,7 @@ impl Kernel {
                 thread.state.ptrace.debug.dr6 =
                     u64::from(hits) | if step { ptrace::DR_STEP } else { 0 };
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGTRAP,
                     code: if step { 2 } else { 4 },
@@ -2409,6 +2416,7 @@ impl Kernel {
             ExitReason::Breakpoint { rip } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGTRAP,
                     code: signals::SI_KERNEL,
@@ -2431,6 +2439,7 @@ impl Kernel {
             ExitReason::GeneralProtection { rip } | ExitReason::Halt { rip } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {
+                    counted: false,
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGSEGV,
                     code: 128,

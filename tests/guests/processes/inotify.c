@@ -1820,6 +1820,46 @@ static int case_unmount(void) {
     close(dirfd);
     drain(three, "order");
     drain(four, "order other");
+    /* A one-shot watch's signal leaves dnotify's mark with no watch; any
+       close of a file of the directory then takes it off (`dnotify_flush`),
+       here the end of a child's table that holds a file of its own of it.
+       With the mark gone, a later watch makes the directory's connector
+       anew, so it is the newest. */
+    printf("tmpfs=%ld\n", e(mount("none", at("m"), "tmpfs", 0, NULL)));
+    touch(at("m/p"));
+    touch(at("m/q"));
+    mkdir(at("m/e"), 0755);
+    int go[2];
+    if (pipe(go)) return 1;
+    pid_t holder = fork();
+    if (holder == 0) {
+        char c;
+        close(go[1]);
+        if (read(go[0], &c, 1) != 1) _exit(1);
+        int own = open(at("m/e"), O_RDONLY | O_DIRECTORY);
+        _exit(own < 0);
+    }
+    close(go[0]);
+    dn_block();
+    int five = inotify_init1(IN_NONBLOCK);
+    long wp = e(inotify_add_watch(five, at("m/p"), IN_MODIFY));
+    int asked = open(at("m/e"), O_RDONLY | O_DIRECTORY);
+    dn_name(asked, "e");
+    fcntl(asked, F_SETSIG, DN_SIG);
+    long shot = e(fcntl(asked, F_NOTIFY, DN_CREATE));
+    long wq = e(inotify_add_watch(five, at("m/q"), IN_MODIFY));
+    touch(at("m/e/new"));
+    dn_drain("one-shot");
+    int status = -1;
+    if (write(go[1], "x", 1) != 1) return 1;
+    waitpid(holder, &status, 0);
+    close(go[1]);
+    long we = e(inotify_add_watch(five, at("m/e"), IN_MODIFY));
+    printf("again p=%ld notify=%ld q=%ld e=%ld holder=%d\n", wp, shot, wq, we, status);
+    printf("detach=%ld\n", e(umount2(at("m"), MNT_DETACH)));
+    close(asked);
+    drain(five, "again");
+    close(five);
     if (fan >= 0) close(fan);
     close(three);
     close(four);

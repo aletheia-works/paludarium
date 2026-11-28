@@ -1185,7 +1185,11 @@ verified.
 - **userfaultfd, in part**: missing pages, write protection and the minor
   faults of shmem are registered. Registered mappings of one `userfaultfd`
   that meet are one range of `UFFD_EVENT_REMOVE`, as when Linux's VMAs
-  merge, though Linux keeps apart VMAs whose other flags differ.
+  merge, though Linux keeps apart VMAs whose other flags differ; the
+  checks before the event look at the range's first mapping, so that
+  `MADV_REMOVE` of such a range whose later mapping is no shared file
+  tells of all of it and fails as it drops that mapping, where Linux
+  tells of the first VMA alone.
   Of shmem's files a memfd and a file of a tmpfs mount (one a guest
   mounted, or `/dev/shm`) are registered, but for write protection alone
   with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a file of the

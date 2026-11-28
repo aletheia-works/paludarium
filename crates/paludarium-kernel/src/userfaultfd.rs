@@ -1552,16 +1552,6 @@ pub(crate) fn remove(
     check: &mut crate::syscalls::Part<'_>,
     drop: &mut crate::syscalls::Part<'_>,
 ) -> Result<(), Errno> {
-    let mut parts: Vec<(Arc<Userfaultfd>, u64, u64)> =
-        registered(&c.mem.view(), start, end, FEATURE_EVENT_REMOVE)
-            .into_iter()
-            .flat_map(|(context, parts)| {
-                parts
-                    .into_iter()
-                    .map(move |(from, to)| (Arc::clone(&context), from, to))
-            })
-            .collect();
-    parts.sort_by_key(|&(_, from, _)| from);
     let mut hole = false;
     let mut step = |result: Result<(), Errno>| match result {
         Err(Errno::ENOMEM) => {
@@ -1571,7 +1561,10 @@ pub(crate) fn remove(
         result => result,
     };
     let mut at = start;
-    for (context, from, to) in parts {
+    // The next part is looked for afresh after each wait, as Linux looks
+    // the VMA up again once `userfaultfd_remove` has dropped the lock:
+    // another thread may have changed the range meanwhile.
+    while let Some((context, from, to)) = next_removal(c, at, end) {
         if from > at {
             step(drop(at, from))?;
         }
@@ -1586,6 +1579,24 @@ pub(crate) fn remove(
         step(drop(at, end))?;
     }
     if hole { Err(Errno::ENOMEM) } else { Ok(()) }
+}
+
+/// The first part of `[start, end)` a context with
+/// `UFFD_FEATURE_EVENT_REMOVE` registered, and that context; none once
+/// the range is empty.
+fn next_removal(c: &Context<'_>, start: u64, end: u64) -> Option<(Arc<Userfaultfd>, u64, u64)> {
+    if start >= end {
+        return None;
+    }
+    registered(&c.mem.view(), start, end, FEATURE_EVENT_REMOVE)
+        .into_iter()
+        .filter_map(|(context, parts)| {
+            parts
+                .into_iter()
+                .find(|&(from, to)| from < to)
+                .map(|(from, to)| (context, from, to))
+        })
+        .min_by_key(|&(_, from, _)| from)
 }
 
 /// The contexts with `UFFD_FEATURE_EVENT_REMAP` of the mapping at `addr`

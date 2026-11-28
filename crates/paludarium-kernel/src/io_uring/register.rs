@@ -90,9 +90,11 @@ impl Ring {
     }
 
     /// Whether the ring's restrictions allow a registration
-    /// (`__io_uring_register`), which they do of a disabled ring.
+    /// (`__io_uring_register`), which they do of a disabled ring, unless it
+    /// has them from its task (Linux master's 6da8f402e362, which the test
+    /// runners' kernel has).
     pub(super) fn allows_registration(&self, opcode: u64) -> bool {
-        self.disabled()
+        self.disabled() && !self.inherited
             || self
                 .restrictions()
                 .register
@@ -207,6 +209,13 @@ pub(super) fn register_task_restrictions(
     let restrictions = parse(c, arg.wrapping_add(16), entries)?;
     c.process.io_uring_restrictions = Some(Arc::new(restrictions));
     Ok(0)
+}
+
+impl Restrictions {
+    /// Whether they say which registrations are allowed.
+    pub(super) fn restricts_registrations(&self) -> bool {
+        self.register.is_some()
+    }
 }
 
 /// The restrictions a ring the thread sets up starts with: its task's, if

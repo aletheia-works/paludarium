@@ -1968,8 +1968,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   失敗します。1 つもない制限は何も許しません。
 
 - タスクの制限は、Linux 7.0 の `io_register_restrictions_task` と同じく、記述子 -1 の
-  `IORING_REGISTER_RESTRICTIONS` で付け、スレッドがその後に作るどのリングにも、有効か無効かに
-  かかわらず付きます（無効なリングはもう自分の制限を取りません。`EBUSY`）。新しいスレッドや
+  `IORING_REGISTER_RESTRICTIONS` で付け、スレッドがその後に作るどのリングにも付きます。無効な
+  リングも、テストを走らせるカーネルにある Linux master の 6da8f402e362 と同じく、すぐにそれに
+  従います。自分の制限は取らず、許された登録だけを取る（`EACCES`）ので、有効にするには
+  `IORING_REGISTER_ENABLE_RINGS` が許されていなければなりません。新しいスレッドや
   プロセスはそれを写し、exec は保ちます。すでに持つスレッドは断られ（`EPERM`）、
   `no_new_privs` か `CAP_SYS_ADMIN` が要ります（`EACCES`）。引数は 1 つで（`EINVAL`）、
   読む（`EFAULT`）`struct io_uring_task_restriction` にフラグも予約ビットもなく（`EINVAL`）、

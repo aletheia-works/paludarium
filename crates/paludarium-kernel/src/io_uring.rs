@@ -352,6 +352,9 @@ pub(crate) struct Ring {
     /// `IORING_SETUP_R_DISABLED`, until it is enabled.
     disabled: std::sync::atomic::AtomicBool,
     restrictions: Mutex<register::Restrictions>,
+    /// Its registrations are restricted by its task's restrictions
+    /// (`IO_RING_F_RESTRICT_INHERITED`), which hold while it is disabled.
+    inherited: bool,
     personalities: Mutex<register::Personalities>,
     /// Held across a submission, as Linux's `uring_lock`: threads that
     /// submit at once take entries one after another, never the same ones.
@@ -3471,6 +3474,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
         },
         disabled: (flags & SETUP_R_DISABLED != 0).into(),
         restrictions: Mutex::new(register::of_task(c)),
+        inherited: register::of_task(c).restricts_registrations(),
         personalities: Mutex::default(),
         submitting: Mutex::default(),
         state: Mutex::default(),

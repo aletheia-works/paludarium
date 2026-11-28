@@ -699,7 +699,10 @@ verified.
   give `EINVAL`). Without a ring (descriptor -1), only a task's
   `IORING_REGISTER_RESTRICTIONS` is there: `IORING_REGISTER_SEND_MSG_RING`,
   `_QUERY` and `_BPF_FILTER` give `EINVAL`, and a task's restrictions have
-  no BPF filters.
+  no BPF filters. Those restrictions do not limit the registrations without
+  a ring, as on Linux 7.0 and the test runners' kernel; Linux master
+  refuses the ones they do not allow there (`EACCES`, 4a93427e99a8). This
+  follows master once the runners' kernel does.
   `IORING_REGISTER_BUFFERS_UPDATE` reads each slot's `iovec`
   before its tag and refuses `IORING_RSRC_UPDATE_EXTENDED`, as Linux 7.0,
   the kernel the differential tests run on, does; Linux master reads the

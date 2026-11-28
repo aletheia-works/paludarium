@@ -2276,8 +2276,11 @@ kernel.
 
 - A task's restrictions, `IORING_REGISTER_RESTRICTIONS` with descriptor -1
   as Linux 7.0's `io_register_restrictions_task` takes them, go to every
-  ring the thread sets up after, enabled or disabled (which then takes no
-  restrictions of its own, `EBUSY`). A new thread or process copies them,
+  ring the thread sets up after. A disabled ring is held to them at once,
+  as Linux master is since 6da8f402e362, which the test runners' kernel
+  has: it takes no restrictions of its own, and only the registrations they
+  allow (`EACCES`), so enabling it needs `IORING_REGISTER_ENABLE_RINGS`
+  among them. A new thread or process copies them,
   and exec keeps them. A thread with them already is refused (`EPERM`), and
   one needs `no_new_privs` or `CAP_SYS_ADMIN` (`EACCES`). There must be one
   argument (`EINVAL`), a `struct io_uring_task_restriction` that is read

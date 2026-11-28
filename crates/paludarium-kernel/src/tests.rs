@@ -8566,13 +8566,13 @@ mod io_uring {
         assert_eq!(one(&mut f, &r, &read), EACCES);
         assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);
         assert_eq!(f.ret(427, &[r.fd, 8, DATA, 1]), eacces);
-        // A disabled one takes any registration but other restrictions
-        // (`EBUSY`), and is held to them once enabled.
+        // A disabled one is held to them at once, as Linux master is since
+        // 6da8f402e362: no restrictions of its own, and no enabling here.
         let d = ring_with(&mut f, R_DISABLED);
-        assert_eq!(restrict(&mut f, &d, &[(1, 22)]), errno(EBUSY));
-        assert_eq!(f.ret(427, &[d.fd, 12, 0, 0]), 0);
-        assert_eq!(one(&mut f, &d, &read), EACCES);
+        assert_eq!(restrict(&mut f, &d, &[(1, 22)]), eacces);
         assert_eq!(f.ret(427, &[d.fd, 12, 0, 0]), eacces);
+        assert_eq!(f.ret(427, &[d.fd, 9, 0, 0]), 1);
+        assert_eq!(f.ret(426, &[d.fd, 0, 0, 0]), errno(EBADFD));
     }
 
     #[test]

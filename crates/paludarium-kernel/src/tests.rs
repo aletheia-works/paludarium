@@ -15876,6 +15876,82 @@ fn a_recursive_bind_of_dev_is_made_over_its_locked_shm() {
     assert_eq!(f.ret(3, &[fd]), 0);
 }
 
+/// A path that goes on past a file the kernel generates that is not a
+/// directory, by a trailing slash or a name after it, is `ENOTDIR` for
+/// every call that looks it up, as Linux's walk finds; a directory, or a
+/// link to one, is gone on in.
+#[test]
+fn a_path_past_a_generated_non_directory_is_enotdir() {
+    let mut f = fixture();
+    for p in [
+        &b"/proc/self/status/"[..],
+        b"/proc/self/status/x",
+        b"/proc/thread-self/status/",
+        b"/proc/self/mountinfo/",
+        b"/proc/self/mounts/x",
+        b"/proc/mounts/",
+        b"/proc/self/net/dev/",
+        b"/proc/net/dev/x",
+        b"/proc/self/fdinfo/0/",
+        b"/proc/self/fd/0/",
+        b"/proc/self/ns/net/",
+        b"/proc/sys/kernel/ostype/",
+        b"/proc/uptime/x",
+        b"/dev/null/",
+        b"/dev/null/x",
+        b"/dev/stdin/",
+        b"/dev/fd/0/x",
+    ] {
+        let at = put(&mut f, 0, p);
+        let name = String::from_utf8_lossy(p);
+        for (call, args) in [
+            (4, [at, DATA + 0x1000, 0]),
+            (6, [at, DATA + 0x1000, 0]),
+            (2, [at, 0, 0]),
+            (21, [at, 0, 0]),
+            (89, [at, DATA + 0x1000, 256]),
+            (80, [at, 0, 0]),
+            (137, [at, DATA + 0x1000, 0]),
+        ] {
+            assert_eq!(f.ret(call, &args), errno(Errno::ENOTDIR), "{call} {name}");
+        }
+    }
+    // `mkdir` makes the last name, which its own lookup finds there
+    // (`EEXIST`); only a name before it is gone on from.
+    for (p, expected) in [
+        (&b"/proc/self/status/"[..], Errno::EEXIST),
+        (b"/proc/mounts/", Errno::EEXIST),
+        (b"/dev/null/", Errno::EEXIST),
+        (b"/proc/self/status/x", Errno::ENOTDIR),
+        (b"/dev/null/x", Errno::ENOTDIR),
+        (b"/proc/uptime/x", Errno::ENOTDIR),
+    ] {
+        let at = put(&mut f, 0, p);
+        assert_eq!(
+            f.ret(83, &[at, 0o700]),
+            errno(expected),
+            "{}",
+            String::from_utf8_lossy(p)
+        );
+    }
+    for p in [
+        &b"/proc/self/"[..],
+        b"/proc/self/fd/",
+        b"/proc/self/net/",
+        b"/proc/self/root/",
+        b"/proc/sysvipc/",
+        b"/dev/pts/",
+    ] {
+        let at = put(&mut f, 0, p);
+        assert_eq!(
+            f.ret(4, &[at, DATA + 0x1000]),
+            0,
+            "{}",
+            String::from_utf8_lossy(p)
+        );
+    }
+}
+
 /// `readlink` of a file the kernel generates that is no link is `EINVAL`,
 /// `/proc` itself and its own files too, and of one not there `ENOENT`.
 #[test]

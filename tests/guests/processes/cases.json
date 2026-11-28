@@ -521,6 +521,7 @@
     {"name":"generated-rooted-links","binary":"process"},
     {"name":"proc-links","binary":"process"},
     {"name":"statx-attributes","binary":"process"},
+    {"name":"generated-enotdir","binary":"process"},
     {"name":"generated-changes","binary":"process"},
     {"name":"tmpfs-limits","binary":"process"},
     {"name":"shmem-fault-charge","binary":"process"},

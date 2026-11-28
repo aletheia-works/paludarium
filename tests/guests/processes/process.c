@@ -19215,6 +19215,94 @@ static int grl_inner(const char *self) {
  * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
  * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
  * `self/mounts` (`proc_symlink`). */
+/* Each call's errno, or 0, for a path that goes on past a file the kernel
+ * makes that is not a directory: a trailing slash or a name after it. */
+static void generated_enotdir_show(const char *p) {
+    struct stat st;
+    struct statfs sf;
+    char b[16];
+    int in = inotify_init1(IN_CLOEXEC);
+#define GE(e) ((e) < 0 ? -errno : 0)
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    int o = GE(fd);
+    if (fd >= 0) close(fd);
+    fd = open(p, O_PATH | O_CLOEXEC);
+    int op = GE(fd);
+    if (fd >= 0) close(fd);
+    int s = GE(stat(p, &st));
+    int l = GE(lstat(p, &st));
+    int a = GE(access(p, F_OK));
+    int r = GE(readlink(p, b, sizeof b));
+    int fs = GE(statfs(p, &sf));
+    int cd = GE(chdir(p));
+    int t = GE(truncate(p, 0));
+    int x = GE(getxattr(p, "user.x", b, sizeof b));
+    int u = GE(utimensat(AT_FDCWD, p, NULL, 0));
+    int ch = GE(chmod(p, 0600));
+    int w = in < 0 ? -1000 : GE(inotify_add_watch(in, p, IN_ALL_EVENTS));
+    int md = GE(mkdir(p, 0700));
+    int cr = GE(open(p, O_CREAT | O_WRONLY | O_CLOEXEC, 0600));
+    int sy = GE(symlink("x", p));
+    int mk = GE(mknod(p, S_IFIFO | 0600, 0));
+    int ul = GE(unlink(p));
+    int ex = GE(execve(p, (char *[]){NULL}, (char *[]){NULL}));
+#undef GE
+    if (in >= 0) close(in);
+    printf("%s open=%d opath=%d stat=%d lstat=%d access=%d readlink=%d statfs=%d chdir=%d truncate=%d getxattr=%d utimens=%d chmod=%d inotify=%d mkdir=%d creat=%d symlink=%d mknod=%d unlink=%d exec=%d\n",
+           p, o, op, s, l, a, r, fs, cd, t, x, u, ch, w, md, cr, sy, mk, ul, ex);
+}
+static int generated_enotdir_case(void) {
+    static const char *const paths[] = {
+        "/proc/self/status/", "/proc/self/status/x", "/proc/thread-self/status/",
+        "/proc/self/stat/", "/proc/self/cmdline/", "/proc/self/comm/",
+        "/proc/self/environ/x", "/proc/self/maps/", "/proc/self/limits/",
+        "/proc/self/mountinfo/", "/proc/self/mounts/", "/proc/self/mounts/x",
+        "/proc/mounts/", "/proc/mounts/x", "/proc/self/net/dev/", "/proc/net/dev/",
+        "/proc/self/net/dev/x", "/proc/self/fdinfo/0/", "/proc/self/fd/0/x",
+        "/proc/self/exe/x", "/proc/self/ns/net/x", "/proc/uptime/", "/proc/uptime/x",
+        "/proc/sys/kernel/ostype/", "/proc/sys/kernel/ostype/x", "/proc/sysvipc/msg/",
+        "/dev/null/", "/dev/null/x", "/dev/zero/", "/dev/full/", "/dev/random/",
+        "/dev/urandom/x", "/dev/ptmx/", "/dev/pts/ptmx/", "/dev/stdin/x", "/dev/fd/0/x",
+        NULL,
+    };
+    for (int i = 0; paths[i]; i++) generated_enotdir_show(paths[i]);
+    /* Directories, and links to them, are gone on in. */
+    static const char *const dirs[] = {
+        "/proc/self/", "/proc/self/fd/", "/proc/self/net/", "/proc/self/root/",
+        "/proc/self/cwd/", "/proc/sysvipc/", "/dev/pts/", "/dev/fd/", NULL,
+    };
+    for (int i = 0; dirs[i]; i++) {
+        struct stat st;
+        printf("%s stat=%d\n", dirs[i], stat(dirs[i], &st) < 0 ? -errno : 0);
+    }
+    /* From a descriptor and from the working directory. */
+    int self = open("/proc/self", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int dev = open("/dev", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (self < 0 || dev < 0) return 1;
+    struct stat st;
+    int fd = openat(self, "status/", O_RDONLY | O_CLOEXEC);
+    printf("at self status/ open=%d stat=%d status/x=%d; dev null/ open=%d null/x=%d\n",
+           fd < 0 ? -errno : 0,
+           fstatat(self, "status/", &st, 0) < 0 ? -errno : 0,
+           fstatat(self, "status/x", &st, 0) < 0 ? -errno : 0,
+           openat(dev, "null/", O_RDONLY | O_CLOEXEC) < 0 ? -errno : 0,
+           fstatat(dev, "null/x", &st, 0) < 0 ? -errno : 0);
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) return 2;
+    if (fchdir(self) < 0) return 3;
+    printf("in self status/=%d mounts/=%d exe/=%d\n",
+           stat("status/", &st) < 0 ? -errno : 0,
+           stat("mounts/", &st) < 0 ? -errno : 0,
+           stat("exe/", &st) < 0 ? -errno : 0);
+    if (fchdir(dev) < 0) return 4;
+    printf("in dev null/=%d zero/x=%d\n",
+           stat("null/", &st) < 0 ? -errno : 0,
+           stat("zero/x", &st) < 0 ? -errno : 0);
+    if (chdir(cwd) < 0) return 5;
+    close(self);
+    close(dev);
+    return 0;
+}
 static int proc_links_case(const char *self) {
     char exe[4096], dir[4096];
     if (!realpath(self, exe)) return 1;
@@ -45861,6 +45949,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-links")) return proc_links_case(self);
     if (!strcmp(mode, "proc-links-ran")) return 7;
     if (!strcmp(mode, "statx-attributes")) return statx_attributes_case();
+    if (!strcmp(mode, "generated-enotdir")) return generated_enotdir_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

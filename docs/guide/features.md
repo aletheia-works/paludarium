@@ -4563,6 +4563,14 @@ kernel.
   points in the root's directory: `rmdir` and `rename` of them are
   `EBUSY`, `unlink` `EISDIR` and the calls that make them `EEXIST`.
 
+- A path that goes on past a file of `/proc` or `/dev` that is not a
+  directory, with a trailing slash or a name after it (`/proc/self/status/`,
+  `/proc/mounts/x`, `/dev/null/`, `/dev/stdin/x`), is `ENOTDIR` for every
+  call that looks it up, as Linux's walk finds. The links on the way are
+  followed, so a link to a directory is gone on in. The calls that make or
+  remove the last name only check the names before it, and their own
+  errors above come after that.
+
 - `/proc` lists the files above, and nothing the filesystem has there (with
   `--mount /:/`, none of the host's own entries), and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another

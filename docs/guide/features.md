@@ -6212,19 +6212,9 @@ kernel.
   and no wider than the spill, which the load zero- or sign-extends), a
   load through a scalar ("R%d invalid mem
   access 'scalar'", `EACCES`) and the exit's R0, which may be any value.
-  Of a scalar it knows the bits and the unsigned and signed bounds, of 64
-  and of 32 bits, as Linux 7.0's verifier follows them (`tnum`,
-  `umin_value` to `s32_max_value`): through each ALU operation, the zero or
-  sign extension of a load, and `bpf_get_smp_processor_id`'s result below
-  the CPUs. A copy, a spill and its fill link a scalar to its copy, and to
-  one with a constant added (`BPF_ADD_CONST`). A conditional jump goes one
-  way where the bounds decide it (`is_branch_taken`), and is walked both
-  ways otherwise, each with what holds there (`reg_set_min_max`) in the
-  registers compared and those linked to them (`sync_linked_regs`). A
-  `BPF_AND` or `BPF_OR` of a constant to a register that is -1 or 0 is
-  walked once for each (`maybe_fork_scalars`). It gives up as Linux does
-  after 1,000,000 instructions or 8,192 jumps waiting to be walked
-  (`E2BIG`).
+  A conditional jump whose operands it knows goes one way; any other is
+  walked both ways. It gives up as Linux does after 1,000,000 instructions
+  or 8,192 jumps waiting to be walked (`E2BIG`).
 
 - Programs use maps as Linux's verifier lets them. A `BPF_LD_IMM64` of a
   map's descriptor (`BPF_PSEUDO_MAP_FD`) gives the map, and one of its

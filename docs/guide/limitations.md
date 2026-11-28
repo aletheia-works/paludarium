@@ -506,11 +506,8 @@ verified.
   [Features](./features) lists (`bpf_tail_call`, `bpf_perf_event_output`,
   `bpf_trace_printk`, the ring buffer, spin locks and the rest), the map
   helpers of maps of maps, queues, stacks and bloom filters, a helper's
-  size whose value the verifier does not know, a comparison whose
-  registers are linked to more than 6 (Linux follows the 6 it finds
-  live; which are live is not followed here), a register whose bounds
-  disagree with its known bits (where Linux writes a line of a bug in
-  itself), kfuncs, the context's socket
+  size whose value the verifier does not know, `bpf_get_netns_cookie` of
+  a scalar it does not know is 0, kfuncs, the context's socket
   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
   `fd_array` and maps made with `excl_prog_hash`, `BPF_LD_IMM64` of BTF
   IDs and of functions (and so callbacks), `may_goto`, indirect jumps, a
@@ -522,15 +519,10 @@ verified.
   frames deep ("the call stack of 9 frames is too deep", `E2BIG`), not
   before the walk as master does ("recursive call from %s() to %s()",
   `EINVAL`): the differential tests compare the line with that kernel,
-  and master's check comes here once it has it. A scalar's bits and
-  bounds follow Linux 7.0's; master follows them otherwise (ranges that
-  wrap around, and steps), and where the two decide a jump, an access or
-  a size differently, it does not refuse yet: it may take a program master
-  refuses, or refuse one master takes. `bpf_get_smp_processor_id`'s result
-  is below the CPUs the emulator gives the guest, as its maps count them,
-  which may be fewer than the machine's `nr_cpu_ids` that Linux bounds it
-  by. It prunes no states, so a program
-  with many branches may reach the limits sooner. A
+  and master's check comes here once it has it. A scalar is a value the
+  verifier knows or nothing at all, where Linux keeps its bounds, so it
+  walks both ways of a jump Linux knows goes one way, and it prunes no
+  states, so a program with many branches may reach the limits sooner. A
   lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
   the immediate 0, or with a value's or a map's pointer it equals, tells,
   or an array's key is one the stack holds

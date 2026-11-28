@@ -1,8 +1,8 @@
 /* BPF programs, compared with Linux: socket filters that the verifier
    loads or refuses, from instructions written out here (no libbpf, no
    BTF).
-   bpf-prog-verify: programs of registers, jumps and the stack, with
-   one helper and one context field at most. For each, the result of
+   bpf-prog-verify: programs of registers, jumps and the stack, without
+   helpers or the context's fields. For each, the result of
    BPF_PROG_LOAD (a descriptor, or the error) and the line of the log
    that says why it was refused (the last before "processed ... insns");
    for a program loaded, its fdinfo's type, tag (a hash of the
@@ -10,14 +10,10 @@
    a read of the stack gives, which a jump on it shows: zeros stored, a
    spill read from its start no wider than it, narrowed or sign-extended
    by the load, and an atomic's old value, which it knows, and reads it
-   does not know the value of. What it knows of the bounds of a value of
-   bpf_get_prandom_u32 or of the context's len, which a jump on it shows:
-   after each ALU operation, a jump either way, 32-bit jumps, copies (and
-   a constant added to one) and spills, which a jump on another register
-   bounds, sign extension, a byte swap, a bit test, and a register
-   compared with itself. Then the log's arguments: a buffer too small
-   (ENOSPC), one that cannot be written (EFAULT), and the checks before
-   the verifier, which log nothing.
+   does not know the value of. Then
+   the log's arguments: a buffer too small (ENOSPC), one that cannot be
+   written (EFAULT), and the checks before the verifier, which log
+   nothing.
    bpf-prog-maps: programs that use maps: the map and its value by
    descriptor in BPF_LD_IMM64, bpf_map_lookup_elem, bpf_map_update_elem
    and bpf_map_delete_elem with keys and values on the stack or in a
@@ -409,56 +405,6 @@ static int case_verify(void) {
     READS("after an atomic", 5, WIDE, MOV(2, 0), I(0xc3, 10, 2, -8, 0), LDX_W(0, 10, -8));
 #undef WIDE
 #undef READS
-
-    /* What the verifier knows of a scalar's bounds, as Linux 7.0 follows
-       them: a jump the bounds decide goes one way, so a program loads only
-       where the read through R0 on the other way is never walked. RAND is
-       bpf_get_prandom_u32, any 64-bit value; ONLY continues where `reg
-       <code> k` holds and exits elsewhere. TAKEN reads on the fall-through,
-       NOT_TAKEN on the target. */
-#define RAND CALL(7)
-#define ONLY(code, reg, k) I(code, reg, 0, 1, k), EXIT()
-#define TAKEN(name, code, reg, k, ...) LOAD(name, __VA_ARGS__, I(code, reg, 0, 1, k), LDX_DW(1, 0, 0), EXIT())
-#define NOT_TAKEN(name, code, reg, k, ...) \
-    LOAD(name, __VA_ARGS__, I(code, reg, 0, 2, k), MOV(0, 0), EXIT(), LDX_DW(1, 0, 0), EXIT())
-    TAKEN("unknown", 0xb5, 0, 9, RAND);
-    TAKEN("and", 0xb5, 0, 0xff, RAND, I(0x57, 0, 0, 0, 0xff));
-    TAKEN("and, one below", 0xb5, 0, 0xfe, RAND, I(0x57, 0, 0, 0, 0xff));
-    TAKEN("a 32-bit load", 0x15, 0, 0, LDX_W(0, 1, 0), I(0x77, 0, 0, 0, 32));
-    TAKEN("a right shift", 0xa5, 0, 16, RAND, I(0x77, 0, 0, 0, 60));
-    NOT_TAKEN("a multiplication", 0x25, 0, 21, RAND, I(0x57, 0, 0, 0, 7), I(0x27, 0, 0, 0, 3));
-    NOT_TAKEN("an addition", 0xa5, 0, 10, RAND, I(0x57, 0, 0, 0, 7), ADD(0, 10));
-    TAKEN("a subtraction, signed", 0xd5, 0, 6, RAND, I(0x57, 0, 0, 0, 7), I(0x17, 0, 0, 0, 1));
-    TAKEN("a subtraction, unsigned", 0xb5, 0, 6, RAND, I(0x57, 0, 0, 0, 7), I(0x17, 0, 0, 0, 1));
-    TAKEN("a division", 0xb5, 0, 12, RAND, I(0x57, 0, 0, 0, 0x7f), I(0x37, 0, 0, 0, 10));
-    TAKEN("a modulo", 0xa5, 0, 10, RAND, I(0x97, 0, 0, 0, 10));
-    TAKEN("a signed modulo", 0x75, 0, -9, RAND, I(0x97, 0, 0, 1, 10));
-    NOT_TAKEN("an or", 0xa5, 0, 0x10, RAND, I(0x47, 0, 0, 0, 0x10));
-    TAKEN("a negation", 0xd5, 0, 0, RAND, I(0x57, 0, 0, 0, 7), I(0x87, 0, 0, 0, 0));
-    TAKEN("a sign", 0xd5, 0, 0, RAND, I(0xc7, 0, 0, 0, 63));
-    NOT_TAKEN("and of a sign, each way", 0x15, 0, 1, RAND, I(0xc7, 0, 0, 0, 63), I(0x57, 0, 0, 0, 5));
-    TAKEN("a jump's bounds", 0xb5, 0, 9, RAND, ONLY(0xb5, 0, 9));
-    TAKEN("not equal at the edge", 0x15, 0, 1, RAND, I(0x57, 0, 0, 0, 1), ONLY(0x55, 0, 0));
-    TAKEN("a 32-bit jump", 0xb6, 0, 9, RAND, ONLY(0xb6, 0, 9));
-    TAKEN("a 32-bit jump, then 64 bits", 0xb5, 0, 9, RAND, ONLY(0xb6, 0, 9));
-    TAKEN("the low half of a bound", 0xb6, 0, 0xffff, RAND, ONLY(0xb5, 0, 0xffff));
-    TAKEN("a register's bound", 0xa5, 0, 10, RAND, I(0x57, 0, 0, 0, 15), MOV(1, 10), I(0xad, 0, 1, 1, 0),
-          EXIT());
-    TAKEN("a copy", 0xb5, 1, 9, RAND, MOV_REG(1, 0), ONLY(0xb5, 0, 9));
-    TAKEN("a copy plus a constant", 0xb5, 1, 10, RAND, MOV_REG(1, 0), ADD(1, 1), ONLY(0xb5, 0, 9));
-    TAKEN("a copy plus a constant, one below", 0xb5, 1, 9, RAND, MOV_REG(1, 0), ADD(1, 1), ONLY(0xb5, 0, 9));
-    TAKEN("a copy multiplied", 0xb5, 1, 9, RAND, MOV_REG(1, 0), I(0x27, 1, 0, 0, 1), ONLY(0xb5, 0, 9));
-    TAKEN("a spill", 0xb5, 1, 9, RAND, STX_DW(10, 0, -8), ONLY(0xb5, 0, 9), LDX_DW(1, 10, -8));
-    TAKEN("a narrow spill", 0xb5, 1, 0xff, RAND, I(0x57, 0, 0, 0, 0xff), STX_W(10, 0, -8), LDX_W(1, 10, -8));
-    TAKEN("a sign extension", 0x75, 1, -128, RAND, I(0x57, 0, 0, 0, 0xff), I(0xbf, 1, 0, 8, 0));
-    TAKEN("a sign extension, one above", 0x75, 1, -127, RAND, I(0x57, 0, 0, 0, 0xff), I(0xbf, 1, 0, 8, 0));
-    NOT_TAKEN("a bit test", 0x45, 0, 1, RAND, I(0x57, 0, 0, 0, 6));
-    NOT_TAKEN("a byte swap", 0x25, 0, 0xff00, RAND, I(0x57, 0, 0, 0, 0xff), I(0xdc, 0, 0, 0, 16));
-    LOAD("a register with itself", RAND, I(0x2d, 0, 0, 2, 0), MOV(0, 0), EXIT(), LDX_DW(1, 0, 0), EXIT());
-#undef NOT_TAKEN
-#undef TAKEN
-#undef ONLY
-#undef RAND
 
     static const struct insn ret0[] = {MOV(0, 0), EXIT()};
     struct prog_attr p = attr(ret0, 2);

@@ -386,8 +386,6 @@ pub(crate) fn load(c: &mut Context<'_>, attr: &[u8], at: u64, size: u32) -> Resu
         test_reg_invariants: prog_flags & flag::TEST_REG_INVARIANTS != 0,
         fd_array: word(attr, 120) != 0,
         rnd_hi32: prog_flags & flag::TEST_RND_HI32 != 0,
-        // num_possible_cpus, as the maps count them.
-        cpus: c.host.cpu_count().clamp(1, 8192) as u32,
     };
     let (verified, maps) = verify(c, attr, &log, &insns, options, at, size)?;
     let program = c.processes.bpf_progs.publish(|id| Program {

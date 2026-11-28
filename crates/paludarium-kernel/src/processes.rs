@@ -2134,7 +2134,7 @@ impl Processes {
     /// The processes (and, for a thread owner, the thread) `owner` names:
     /// a thread, a process (or the process of one of its threads), or a
     /// process group.
-    fn owned_by(entries: &BTreeMap<u32, Entry>, owner: FileOwner) -> Vec<(u32, Option<u32>)> {
+    fn owned_by(entries: &BTreeMap<u32, Entry>, owner: &FileOwner) -> Vec<(u32, Option<u32>)> {
         let id = owner.id;
         entries
             .iter()
@@ -2150,14 +2150,14 @@ impl Processes {
     }
     /// Whether anything is there in the role `owner` names it in: a thread,
     /// a process or a member of a group (Linux's `pid_task`).
-    pub(crate) fn owner_present(&self, owner: FileOwner) -> bool {
+    pub(crate) fn owner_present(&self, owner: &FileOwner) -> bool {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         !Self::owned_by(&entries, owner).is_empty()
     }
     /// Whether `owner`'s ID is in use, as Linux's `f_setown` and
     /// `SCM_CREDENTIALS` find it with `find_vpid` (ESRCH otherwise): a
     /// thread, or a process, group or session, whatever kind of owner it is.
-    pub(crate) fn owner_exists(&self, owner: FileOwner) -> bool {
+    pub(crate) fn owner_exists(&self, owner: &FileOwner) -> bool {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let id = owner.id;
         !Self::owned_by(&entries, owner).is_empty()
@@ -2165,22 +2165,31 @@ impl Processes {
                 .iter()
                 .any(|(&pid, entry)| pid == id || entry.pgid == id || entry.sid == id)
     }
-    fn send_owner(&self, owner: FileOwner, signal: signals::PendingSignal) {
+    /// Sends `signal` to each process (or thread) `owner` names that the
+    /// one who named the owner may reach ([`crate::fasync::Setter`]), as
+    /// the IDs of the thread it goes to, a process's first one, stand.
+    fn send_owner(&self, owner: &FileOwner, signal: signals::PendingSignal) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         for (pid, thread) in Self::owned_by(&entries, owner) {
-            let _ = self.send(&mut entries, pid, thread, signal);
+            let reached = entries.get(&pid).is_some_and(|entry| {
+                let target = entry.group.task_ids(pid, thread.unwrap_or(pid));
+                owner.setter.reaches(pid, &target)
+            });
+            if reached {
+                let _ = self.send(&mut entries, pid, thread, signal);
+            }
         }
     }
     /// Sends SIGURG from the kernel to `owner`, as a socket's out-of-band
     /// byte does.
-    pub(crate) fn send_urgent(&self, owner: FileOwner) {
+    pub(crate) fn send_urgent(&self, owner: &FileOwner) {
         self.send_owner(owner, Self::from_kernel(23));
     }
     /// Sends `owner` the signal of an `O_ASYNC` file, registered through
     /// descriptor `fd`, as Linux's `send_sigio`: SIGIO from the kernel, or
     /// with `F_SETSIG` that signal with `si_code`, `si_band` and `si_fd`. A
     /// `Priority` change sends only the latter, SIGURG telling the rest.
-    pub(crate) fn send_io(&self, owner: FileOwner, fd: i32, reason: Reason) {
+    pub(crate) fn send_io(&self, owner: &FileOwner, fd: i32, reason: Reason) {
         if owner.id == 0 {
             return;
         }
@@ -2213,7 +2222,7 @@ impl Processes {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .at(file)
-            .map_or_else(FileOwner::default, |owner| *owner)
+            .map_or_else(FileOwner::default, |owner| owner.clone())
     }
     /// Makes `owner` the owner of the open description at address `file`,
     /// if it has had one.

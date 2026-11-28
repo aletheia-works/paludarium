@@ -27,11 +27,56 @@ pub(crate) enum OwnerKind {
 }
 
 /// The owner of an open file and its `F_SETSIG` signal; an ID of 0 is none.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FileOwner {
     pub kind: OwnerKind,
     pub id: u32,
     pub signal: i32,
+    /// Who made it the owner, which decides whom its signals reach.
+    pub setter: Setter,
+}
+
+/// What a file's signals carry of whoever last named its owner: their real
+/// and effective user IDs (kernel IDs), their Landlock domain and their
+/// process. Naming no owner, or changing only the signal, keeps it. With
+/// none of this kept, as for an owner no call named, root's IDs and no
+/// domain stand, which reach everything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Setter {
+    uid: u32,
+    euid: u32,
+    landlock: crate::landlock::Landlock,
+    process: u32,
+}
+impl Setter {
+    /// The calling thread, as it names an owner.
+    pub(crate) fn of(c: &Context<'_>) -> Self {
+        let credentials = &c.process.credentials;
+        Self {
+            uid: credentials.uid,
+            euid: credentials.euid,
+            landlock: credentials.landlock.clone(),
+            process: c.process.pid,
+        }
+    }
+    /// Whether the file's signal may reach the thread of `target`'s IDs in
+    /// process `pid`. Root's effective ID reaches any; otherwise one of the
+    /// kept IDs must be the target's real or saved one. Then a domain the
+    /// setter had that scopes signals keeps them inside it, though never
+    /// from the setter's own process.
+    pub(crate) fn reaches(&self, pid: u32, target: &crate::credentials::TaskIds) -> bool {
+        let by_ids = self.euid == 0
+            || [target.uid, target.suid]
+                .iter()
+                .any(|&id| id == self.uid || id == self.euid);
+        by_ids
+            && (pid == self.process
+                || !crate::landlock::scoped(
+                    &self.landlock,
+                    &target.landlock,
+                    crate::landlock::SCOPE_SIGNAL,
+                ))
+    }
 }
 
 /// Why a file signals: the `si_code` (`POLL_IN`, ...) of an `F_SETSIG`
@@ -77,7 +122,7 @@ pub(crate) struct Notice {
 impl Notice {
     pub(crate) fn send(self) {
         if let Some(processes) = self.to.processes.upgrade() {
-            processes.send_io(self.owner, self.to.fd, self.reason);
+            processes.send_io(&self.owner, self.to.fd, self.reason);
         }
     }
 }
@@ -147,12 +192,20 @@ fn take_owner(
     id: u32,
 ) -> Result<u64, Errno> {
     let id = if id == 0 { 0 } else { c.named(id) };
+    let current = owner(c, file);
+    // Naming no owner keeps who named the last one.
+    let setter = if id == 0 {
+        current.setter.clone()
+    } else {
+        Setter::of(c)
+    };
     let owner = FileOwner {
         kind,
         id,
-        ..owner(c, file)
+        setter,
+        ..current
     };
-    if id != 0 && !c.processes.owner_exists(owner) {
+    if id != 0 && !c.processes.owner_exists(&owner) {
         return Err(Errno(3));
     }
     set_owner(c, file, owner);
@@ -251,7 +304,7 @@ pub(crate) fn fcntl(
             who => take_owner(c, file, OwnerKind::Process, who as u32),
         },
         9 => {
-            let id = shown_id(c, current) as i32;
+            let id = shown_id(c, &current) as i32;
             let id = if current.kind == OwnerKind::Group {
                 -id
             } else {
@@ -295,7 +348,7 @@ pub(crate) fn fcntl(
         }
         16 => {
             let kind = current.kind as i32;
-            let id = shown_id(c, current);
+            let id = shown_id(c, &current);
             let bytes = [kind.to_le_bytes(), id.to_le_bytes()].concat();
             c.mem
                 .write(GuestAddr(arg), &bytes)
@@ -311,7 +364,7 @@ pub(crate) fn fcntl(
 /// a task has it in the owner's role (`pid_task`), such as a group's ID
 /// when no process is in that group, and as the caller's PID namespace
 /// numbers it (`pid_vnr`).
-fn shown_id(c: &Context<'_>, owner: FileOwner) -> u32 {
+fn shown_id(c: &Context<'_>, owner: &FileOwner) -> u32 {
     if owner.id != 0 && c.processes.owner_present(owner) {
         c.pid_space().number(owner.id)
     } else {
@@ -333,7 +386,7 @@ impl Owners {
         self.0
             .iter()
             .find(|(entry, _)| Self::same(entry, file))
-            .map(|&(_, owner)| owner)
+            .map(|(_, owner)| owner.clone())
             .unwrap_or_default()
     }
     /// The owner of the description at address `file`, while it is open.
@@ -357,6 +410,74 @@ impl Owners {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::TaskIds;
+    use crate::landlock::{SCOPE_SIGNAL, scoping};
+
+    /// A thread of real, effective and saved user IDs `ids`, in `landlock`.
+    fn thread([uid, euid, suid]: [u32; 3], landlock: &crate::landlock::Landlock) -> TaskIds {
+        TaskIds {
+            uid,
+            euid,
+            suid,
+            landlock: landlock.clone(),
+            ..TaskIds::default()
+        }
+    }
+
+    #[test]
+    fn a_setters_ids_reach_a_real_or_saved_id() {
+        let none = crate::landlock::Landlock::default();
+        let setter = |uid, euid| Setter {
+            uid,
+            euid,
+            landlock: none.clone(),
+            process: 1,
+        };
+        let target = thread([2000, 1000, 3000], &none);
+        // Either kept ID, as the target's real or saved one.
+        assert!(setter(2000, 1000).reaches(5, &target));
+        assert!(setter(1000, 2000).reaches(5, &target));
+        assert!(setter(3000, 1000).reaches(5, &target));
+        assert!(setter(1000, 3000).reaches(5, &target));
+        // The target's effective ID does not count.
+        assert!(!setter(1000, 1000).reaches(5, &target));
+        // Root's effective ID reaches anyone; its real one alone does not.
+        assert!(setter(1000, 0).reaches(5, &target));
+        assert!(!setter(0, 1000).reaches(5, &target));
+        // Nothing kept is root's, which reaches anyone.
+        assert!(Setter::default().reaches(5, &target));
+    }
+
+    #[test]
+    fn a_setters_scoped_domain_keeps_its_signals_inside_but_for_its_process() {
+        let none = crate::landlock::Landlock::default();
+        let domain = scoping(&[SCOPE_SIGNAL], &[1]);
+        let inner = scoping(&[SCOPE_SIGNAL, 0], &[1, 2]);
+        let setter = Setter {
+            uid: 0,
+            euid: 0,
+            landlock: domain.clone(),
+            process: 4,
+        };
+        assert!(!setter.reaches(5, &thread([0; 3], &none)));
+        assert!(setter.reaches(5, &thread([0; 3], &domain)));
+        assert!(setter.reaches(5, &thread([0; 3], &inner)));
+        // Its own process, whatever its domain is now.
+        assert!(setter.reaches(4, &thread([0; 3], &none)));
+        // A domain that scopes no signal does not keep them in.
+        let unscoped = Setter {
+            landlock: scoping(&[0], &[3]),
+            ..setter.clone()
+        };
+        assert!(unscoped.reaches(5, &thread([0; 3], &none)));
+        // The IDs still count in its own process.
+        let other = Setter {
+            uid: 1000,
+            euid: 1000,
+            ..setter
+        };
+        assert!(!other.reaches(4, &thread([2000; 3], &none)));
+    }
     #[test]
     fn owners_drop_the_files_closed_since() {
         let mut owners = Owners::default();
@@ -368,9 +489,9 @@ mod tests {
         let owner = FileOwner {
             kind: OwnerKind::Process,
             id: 7,
-            signal: 0,
+            ..FileOwner::default()
         };
-        owners.set(&first, owner);
+        owners.set(&first, owner.clone());
         assert_eq!(owners.get(&first), owner);
         let address = Arc::as_ptr(&first).cast::<()>().addr();
         owners.at(address).unwrap().id = 8;

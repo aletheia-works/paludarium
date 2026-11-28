@@ -170,6 +170,20 @@ pub(crate) fn scoped(client: &Landlock, server: &Landlock, scope: u64) -> bool {
         })
 }
 
+/// A domain whose layers scope `scopes` and belong to `hierarchies`, for
+/// tests.
+#[cfg(test)]
+pub(crate) fn scoping(scopes: &[u64], hierarchies: &[u64]) -> Landlock {
+    Landlock(Some(Arc::new(Domain {
+        layers: vec![0; scopes.len()],
+        net: vec![0; scopes.len()],
+        scopes: scopes.to_vec(),
+        hierarchies: hierarchies.to_vec(),
+        rules: BTreeMap::new(),
+        ports: BTreeMap::new(),
+    })))
+}
+
 /// `domain_scope_le`, Landlock's ptrace check: `tracer` may act on `tracee`
 /// when the tracer has no domain or the tracee's descends from it.
 pub(crate) fn may_trace(tracer: &Landlock, tracee: &Landlock) -> bool {
@@ -955,18 +969,6 @@ mod tests {
         // A right only directories have does not count for a file.
         assert!(may_refer(&parent(0), &child(0), &parent(MAKE_DIR), false));
         assert!(!may_refer(&parent(0), &child(0), &parent(MAKE_DIR), true));
-    }
-
-    /// A domain whose layers scope `scopes` and belong to `hierarchies`.
-    fn scoping(scopes: &[u64], hierarchies: &[u64]) -> Landlock {
-        Landlock(Some(Arc::new(Domain {
-            layers: vec![0; scopes.len()],
-            net: vec![0; scopes.len()],
-            scopes: scopes.to_vec(),
-            hierarchies: hierarchies.to_vec(),
-            rules: BTreeMap::new(),
-            ports: BTreeMap::new(),
-        })))
     }
 
     #[test]

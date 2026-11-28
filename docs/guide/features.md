@@ -836,6 +836,17 @@ kernel.
   signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_ERR`,
   `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set
   through as `si_fd`.
+
+  Naming an owner keeps who named it, as `sigio_perm` checks: `F_SETOWN`,
+  `F_SETOWN_EX`, and dnotify, a lease or a terminal's `O_ASYNC` making the
+  caller the owner of a file that has none. The file's signals, and a
+  socket's `SIGURG`, reach a process (or the thread `F_OWNER_TID` names)
+  only when the effective user ID kept is root's, or either kept user ID is
+  that process's real or saved one. Who makes the file signal does not count,
+  nor does a later `F_SETSIG`. A Landlock domain of the one who named the
+  owner, if it scopes signals, keeps them from processes outside it, though
+  never from that one's own process; a domain entered after naming the owner
+  does not count.
   - **Pipes.** Every write signals the reader as it ends, even one that
     finds the pipe full, and also before each wait. Every read signals the
     writer as it ends, with data or not. The close of either end signals

@@ -1198,7 +1198,7 @@ impl Instance {
     }
     /// `F_GETOWN`: who its signals go to.
     pub(crate) fn file_owner(&self) -> FileOwner {
-        self.signalling().0
+        self.signalling().0.clone()
     }
     /// `F_SETOWN` and `F_SETSIG`.
     pub(crate) fn set_file_owner(&self, owner: FileOwner) {
@@ -1229,7 +1229,7 @@ impl Instance {
         let (owner, signal) = self.signalling().clone();
         if let Some(signal) = signal {
             for _ in 0..queued {
-                signal(owner);
+                signal(owner.clone());
             }
         }
     }

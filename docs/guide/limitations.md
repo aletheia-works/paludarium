@@ -1093,8 +1093,7 @@ verified.
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the
   kernel, where Linux waits until they all have. Signals to them meet it at
-  once, and `/proc` shows it after each one's next system call. `SIGIO` and
-  `SIGURG` from `F_SETOWN` are not scoped, as `F_SETOWN` records no sender. A
+  once, and `/proc` shows it after each one's next system call. A
   rename's Landlock check comes after its permission checks, where Linux's
   comes before them, which shows only when both refuse. A rule on a file under
   `/proc` does not count for `execve`. An open checks the file its path
@@ -1108,9 +1107,7 @@ verified.
   thread's new filter only after its next system call.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
-  files but nowhere else yet. `F_SETOWN` records no sender's credentials, so
-  `SIGIO` and `SIGURG` reach their owner whoever set it, where Linux's
-  `sigio_perm` checks.
+  files but nowhere else yet.
   Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`

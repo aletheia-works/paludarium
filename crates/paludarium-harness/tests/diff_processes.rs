@@ -178,7 +178,7 @@ mod linux {
             let program = dir.join(binary);
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
-            // The credentials, permissions, setuid, signal-permissions,
+            // The credentials, permissions, setuid, signal-permissions, sigio-owner,
             // limit-permissions, peer-credentials, core-credentials,
             // set-id-writes, socket-owners, capabilities, file-capabilities and script-exec cases
             // change IDs as root, pty-vhangup needs root's capabilities and
@@ -250,6 +250,7 @@ mod linux {
                     | "permissions"
                     | "setuid"
                     | "signal-permissions"
+                    | "sigio-owner"
                     | "limit-permissions"
                     | "peer-credentials"
                     | "core-credentials"
@@ -1179,6 +1180,7 @@ mod linux {
         processes_exec_pending => ("exec-pending","exec-pending"),
         processes_pdeath_thread => ("pdeath-thread","pdeath-thread"),
         processes_sa_immutable => ("sa-immutable","sa-immutable"),
+        processes_sigio_owner => ("sigio-owner","sigio-owner"),
         processes_cpu_itimer => ("cpu-itimer","process"),
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),

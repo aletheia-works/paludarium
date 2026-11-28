@@ -1190,11 +1190,13 @@ verified.
   by another process, or through another mapping of the file, does not find
   its waiters.
 - **userfaultfd, in part**: missing pages, write protection and the minor
-  faults of shmem are registered. A discard tells of all its ranges
-  before it drops the pages of any, where Linux tells and drops VMA by VMA,
-  and registered mappings of one `userfaultfd` that meet are one range of
-  `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of
-  its whole range once its first mapping passes the checks.
+  faults of shmem are registered. Registered mappings of one `userfaultfd`
+  that meet are one range of `UFFD_EVENT_REMOVE`, as when Linux's VMAs
+  merge, though Linux keeps apart VMAs whose other flags differ; the
+  checks before the event look at the range's first mapping, so that
+  `MADV_REMOVE` of such a range whose later mapping is no shared file
+  tells of all of it and fails as it drops that mapping, where Linux
+  tells of the first VMA alone.
   Of shmem's files a memfd and a file of a tmpfs mount (one a guest
   mounted, or `/dev/shm`) are registered, but for write protection alone
   with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a file of the
@@ -1290,8 +1292,9 @@ verified.
   `addrconf_rs_timer`), so a neighbour of one that is deleted is not made
   again by those; and a
   change of a group's sources sends none (`ip6_mc_add_src`,
-  `ip6_mc_del_src`). IGMP's reports make no neighbour of the group they
-  go to. Traffic through
+  `ip6_mc_del_src`). IGMPv3's report makes its neighbour at once, where
+  Linux's goes from its timer a tick on (`igmp_ifc_start_timer`), and is
+  not sent again (`igmp_ifc_timer_expire`). Traffic through
   an end moves no counters; a namespace forwards nothing
   on to another. A multicast group is one of the guest's namespaces alone:
   the first has no device to the host's network, so no route to one, and

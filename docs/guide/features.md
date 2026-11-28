@@ -1432,7 +1432,11 @@ kernel.
   where it went and its length; `UFFD_FEATURE_EVENT_REMOVE` tells the
   ranges `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`, `MADV_FREE` and
   `MADV_REMOVE` (and `process_madvise` of the caller's own memory) are
-  about to drop, mapping by mapping (`UFFD_EVENT_REMOVE`), and
+  about to drop, mapping by mapping (`UFFD_EVENT_REMOVE`), as Linux's
+  `madvise_walk_vmas` goes: a mapping's event is read after the mappings
+  before it lost their pages and before its own go, and one that fails
+  its checks (a sealed one's, `MADV_REMOVE`'s of no shared file) ends the
+  discard with no event, and
   `UFFD_FEATURE_EVENT_UNMAP` the whole range `munmap`, `brk`, a `MAP_FIXED`
   `mmap` and `mremap` unmapped (`UFFD_EVENT_UNMAP`), once to each
   `userfaultfd` that registered some of it; `mremap` tells of the range
@@ -3840,7 +3844,13 @@ kernel.
     (`addrconf_dad_work`); and, as the detection of a veth end's only
     link-local address ends, a report again (`ipv6_mc_dad_complete`) and,
     unless the end forwards, a router solicitation to ff02::2
-    (`addrconf_dad_completed`). An end going down takes its
+    (`addrconf_dad_completed`). IGMPv3's report to 224.0.0.22
+    (`IGMPV3_ALL_MCR`) makes its neighbour so too, on `lo` that of 0.0.0.0
+    as every IPv4 one there: as a device up joins a group anew, leaves one
+    for good or changes a filter's sources, and of its groups as it comes
+    up, but for the all-hosts group (`igmp_group_added`,
+    `igmp_group_dropped`, `ip_mc_up`), its carrier or not; a device down
+    has no route to report on (`ENETUNREACH`). An end going down takes its
     neighbours, each told of with `RTM_DELNEIGH` after its
     `RTM_NEWLINK`, IPv4's, then IPv6's; its peer losing its carrier, all
     but the permanent ones (`neigh_carrier_down`); and an end that goes or
@@ -5143,8 +5153,8 @@ kernel.
     they leave out is in the [limitations](./limitations).
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
     first, with their users, under a line of the device with how many it
-    has and the querier `V3`: no IGMP report is sent or heard, so no timer
-    runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
+    has and the querier `V3`: no IGMP report is heard, and none is sent
+    again on a timer, so no timer runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
     each IPv6 group of each device with IPv6, the newest first, with its
     users and its flags, `MAF_NOREPORT` for ff02::1 and a group of a scope
     below a link's and `MAF_LOADED` for the rest from when they are joined
@@ -7062,7 +7072,9 @@ kernel.
     a writable one's pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a
     lock not on fault; a `fork`ed child's VMAs each get their own), else, for
     a file mapping, whole for the file-backed private bit, else only its first
-    page for the ELF headers bit when it starts an ELF file; a shared mapping
+    page for the ELF headers bit when it maps the file from its start and the
+    file has an execute bit when the core is written, or else starts with
+    the ELF magic (an ELF library need not be executable); a shared mapping
     is there whole for the anonymous shared bit when no name links its file
     (an anonymous one, a memfd, a file unlinked since), else for the
     file-backed shared bit. Of the program's own image, the stack and a

@@ -1197,6 +1197,10 @@ pub struct CoreState {
     pub linked: bool,
     /// Where in its file a file mapping starts.
     pub file_offset: Option<u64>,
+    /// The file of a file mapping has an execute bit in its mode now
+    /// ([`PageSource::executable`]): a core then holds its first page for
+    /// the ELF headers bit without looking for the ELF magic.
+    pub executable: bool,
 }
 
 /// The file a mapping maps ([`AddressSpace::mapped_file`]).
@@ -2591,6 +2595,11 @@ pub trait PageSource: Send + Sync {
     /// that none does (Linux's `i_nlink`), as of a memfd.
     fn linked(&self) -> bool {
         true
+    }
+    /// Whether the file's mode has an execute bit now (Linux's
+    /// `i_mode & 0111`), as a core asks of a private mapping's first page.
+    fn executable(&self) -> bool {
+        false
     }
     /// The file's path, as a core's `NT_FILE` note names it (Linux's
     /// `file_path`), or `None` if it has none to give.
@@ -5529,9 +5538,9 @@ impl AddressSpaceData {
 
     /// The core dump's view of the Linux VMA at `addr`: written when any
     /// mapping of it is, as Linux gives a merged VMA the `anon_vma` of the
-    /// one that had it. [`CoreState::linked`] is left false: the file of a
-    /// shared mapping there, returned with it, tells that once the lock is
-    /// released.
+    /// one that had it. [`CoreState::linked`] and [`CoreState::executable`]
+    /// are left false: the file mapped there, returned with it, tells them
+    /// once the lock is released.
     fn core_state(&self, addr: u64) -> (CoreState, Option<Arc<dyn PageSource>>) {
         let written = self.region_at(addr).is_some_and(|(first, last)| {
             self.mappings
@@ -5545,12 +5554,9 @@ impl AddressSpaceData {
             shared,
             linked: false,
             file_offset: file.map(|(_, offset)| offset),
+            executable: false,
         };
-        (
-            state,
-            file.filter(|_| shared)
-                .map(|(source, _)| Arc::clone(source)),
-        )
+        (state, file.map(|(source, _)| Arc::clone(source)))
     }
 
     /// The file of the mapping at `addr` and the offset of `addr` in it:
@@ -9891,7 +9897,8 @@ impl AddressSpace {
         let (state, file) = self.locked().core_state(addr.0);
         // Asked with the lock released: the file's own state may take time.
         CoreState {
-            linked: file.is_some_and(|source| source.linked()),
+            linked: state.shared && file.as_ref().is_some_and(|source| source.linked()),
+            executable: file.is_some_and(|source| source.executable()),
             ..state
         }
     }

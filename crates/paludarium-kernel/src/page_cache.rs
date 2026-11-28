@@ -813,6 +813,9 @@ impl paludarium_mmu::PageSource for FilePages {
     fn linked(&self) -> bool {
         self.file.stat().map_or(true, |stat| stat.links > 0)
     }
+    fn executable(&self) -> bool {
+        self.file.stat().is_ok_and(|stat| stat.mode & 0o111 != 0)
+    }
     /// Where its file is now, marked ` (deleted)` once the name it had is
     /// removed or nothing links it, as Linux's `d_path` marks an unlinked
     /// dentry.

@@ -1991,6 +1991,59 @@ static void *unmap_page(void *at) {
     return NULL;
 }
 
+/* Whether the page at `at` is present in /proc/self/pagemap. */
+static int present(void *at) {
+    int f = open("/proc/self/pagemap", O_RDONLY);
+    uint64_t e = 0;
+    pread(f, &e, sizeof e, (off_t)((uintptr_t)at / PAGE * sizeof e));
+    close(f);
+    return (int)(e >> 63 & 1);
+}
+
+/* The REMOVE events of a discard, and which of its three pages were
+   still there while each waited to be read: the discard waits for the
+   read (userfaultfd_event_wait_completion), so that is before it goes
+   on, and the pages are looked at then. The file does not block, as poll
+   gives POLLERR at once for one that does. */
+struct removals {
+    int fd;
+    char *base;
+    struct uffd_msg msg[2];
+    int there[2][3];
+};
+
+static void *read_removals(void *with) {
+    struct removals *r = with;
+    for (int i = 0; i < 2; i++) {
+        struct pollfd waiting = {r->fd, POLLIN, 0};
+        if (poll(&waiting, 1, 5000) != 1) break;
+        for (int page = 0; page < 3; page++) r->there[i][page] = present(r->base + page * PAGE);
+        if (read(r->fd, &r->msg[i], sizeof r->msg[i]) != sizeof r->msg[i]) break;
+    }
+    return NULL;
+}
+
+/* A discard goes VMA by VMA (madvise_walk_vmas): each registered VMA's
+   REMOVE is read before its pages go, after the VMAs before it lost
+   theirs, an unregistered one's among them. */
+static void remove_order(void) {
+    int fd = ready(O_NONBLOCK, UFFD_FEATURE_EVENT_REMOVE);
+    char *base = anon(3 * PAGE);
+    for (int page = 0; page < 3; page++) base[page * PAGE] = 'r';
+    printf("register first: %s\n", err(reg(fd, base, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    printf("register last: %s\n", err(reg(fd, base + 2 * PAGE, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    struct removals r = {.fd = fd, .base = base};
+    pthread_t reader;
+    pthread_create(&reader, NULL, read_removals, &r);
+    printf("dontneed three VMAs: %s\n", err(madvise(base, 3 * PAGE, MADV_DONTNEED)));
+    pthread_join(reader, NULL);
+    for (int i = 0; i < 2; i++)
+        printf("remove [%ld, %ld): pages there %d%d%d\n", (long)(r.msg[i].flags - (uintptr_t)base),
+               (long)(r.msg[i].address - (uintptr_t)base), r.there[i][0], r.there[i][1], r.there[i][2]);
+    printf("after: %d%d%d\n", present(base), present(base + PAGE), present(base + 2 * PAGE));
+    close(fd);
+}
+
 static int case_events(void) {
     uint64_t all = UFFD_FEATURE_EVENT_FORK | UFFD_FEATURE_EVENT_REMAP | UFFD_FEATURE_EVENT_REMOVE |
                    UFFD_FEATURE_EVENT_UNMAP;
@@ -2075,6 +2128,7 @@ static int case_events(void) {
            (long)(msg.address - (uintptr_t)area));
     pthread_join(unmapper, NULL);
     printf("zeropage after: %s\n", err(zeropage(waiting, area + PAGE, PAGE, 0, NULL)));
+    remove_order();
     return 0;
 }
 

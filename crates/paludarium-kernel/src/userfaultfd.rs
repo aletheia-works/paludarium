@@ -1537,29 +1537,66 @@ pub(crate) fn unmap(mem: &MemoryView, start: u64, end: u64, events: &mut Events)
     }
 }
 
-/// The `UFFD_EVENT_REMOVE` that a discard of `[start, end)` of `mem`
-/// gives, mapping by mapping, before it drops the pages
-/// (`userfaultfd_remove`): each context with `UFFD_FEATURE_EVENT_REMOVE`
-/// that registered some of the range is told of its parts and read before
-/// the discard goes on.
-pub(crate) fn remove(c: &mut Context<'_>, start: u64, end: u64) {
-    let mut events = Events::default();
-    for (context, parts) in registered(&c.mem.view(), start, end, FEATURE_EVENT_REMOVE) {
-        for (from, to) in parts {
-            events.push(
-                Arc::clone(&context),
-                event_message(EVENT_REMOVE, &[from, to]),
-                None,
-            );
+/// A discard of `[start, end)` of the caller's memory, VMA by VMA as
+/// Linux's `madvise_walk_vmas` goes: `drop` drops the pages of a part,
+/// and before the part a context with `UFFD_FEATURE_EVENT_REMOVE`
+/// registered (its registered mappings that meet are one part, as Linux's
+/// VMAs merge) is dropped, `check` looks at it and its `UFFD_EVENT_REMOVE`
+/// is read (`userfaultfd_remove`). So the parts before it have lost their
+/// pages, and the parts after it not yet. An error ends the walk, but for
+/// `ENOMEM`, of a hole, which the walk gives once it is done.
+pub(crate) fn remove(
+    c: &mut Context<'_>,
+    start: u64,
+    end: u64,
+    check: &mut crate::syscalls::Part<'_>,
+    drop: &mut crate::syscalls::Part<'_>,
+) -> Result<(), Errno> {
+    let mut hole = false;
+    let mut step = |result: Result<(), Errno>| match result {
+        Err(Errno::ENOMEM) => {
+            hole = true;
+            Ok(())
         }
+        result => result,
+    };
+    let mut at = start;
+    // The next part is looked for afresh after each wait, as Linux looks
+    // the VMA up again once `userfaultfd_remove` has dropped the lock:
+    // another thread may have changed the range meanwhile.
+    while let Some((context, from, to)) = next_removal(c, at, end) {
+        if from > at {
+            step(drop(at, from))?;
+        }
+        check(from, to)?;
+        let mut events = Events::default();
+        events.push(context, event_message(EVENT_REMOVE, &[from, to]), None);
+        events.deliver(c);
+        step(drop(from, to))?;
+        at = to;
     }
-    // In the order of the ranges, whose start is the message's first word.
-    events.0.sort_by_key(|(_, m, _)| {
-        let mut word = [0; 8];
-        word.copy_from_slice(&m[8..16]);
-        u64::from_le_bytes(word)
-    });
-    events.deliver(c);
+    if at < end {
+        step(drop(at, end))?;
+    }
+    if hole { Err(Errno::ENOMEM) } else { Ok(()) }
+}
+
+/// The first part of `[start, end)` a context with
+/// `UFFD_FEATURE_EVENT_REMOVE` registered, and that context; none once
+/// the range is empty.
+fn next_removal(c: &Context<'_>, start: u64, end: u64) -> Option<(Arc<Userfaultfd>, u64, u64)> {
+    if start >= end {
+        return None;
+    }
+    registered(&c.mem.view(), start, end, FEATURE_EVENT_REMOVE)
+        .into_iter()
+        .filter_map(|(context, parts)| {
+            parts
+                .into_iter()
+                .find(|&(from, to)| from < to)
+                .map(|(from, to)| (context, from, to))
+        })
+        .min_by_key(|&(_, from, _)| from)
 }
 
 /// The contexts with `UFFD_FEATURE_EVENT_REMAP` of the mapping at `addr`

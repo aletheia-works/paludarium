@@ -23098,7 +23098,10 @@ static int status_space_case(const char *self, char **argv) {
    a thread's directory has no such file. A core holds each mapping as its
    bit says: a written private anonymous one (bit 0), a shared anonymous
    one (1), a private file mapping (2), a shared one of a named file (3),
-   and of a private mapping of an ELF file, only the first page (4). */
+   and of a private mapping of an ELF file, only the first page (4). That
+   page is taken for an executable file without looking for the ELF magic,
+   by the file's mode when the core is written: exec-data is no ELF file,
+   and gets its execute bits after it was mapped. */
 static char cf_text[64];
 static const char *cf_read(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -23164,21 +23167,24 @@ static int core_filter_case(const char *self, char **argv) {
     if (fd < 0 || write(fd, fill, sizeof fill) != (long)sizeof fill) return 82;
     int exe = open(self, O_RDONLY);
     if (exe < 0) return 83;
+    int text = open("text", O_CREAT | O_RDWR, 0644);
+    if (text < 0 || write(text, fill, sizeof fill) != (long)sizeof fill) return 87;
     char *base = mmap(NULL, 32 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) return 84;
-    const char *names[] = {"anon-written", "shared-anon", "file-private", "file-shared", "elf"};
-    enum { N = 5 };
+    const char *names[] = {"anon-written", "shared-anon", "file-private", "file-shared", "elf", "exec-data"};
+    enum { N = 6 };
     char *at[N];
     for (int i = 0; i < N; i++) {
-        int file = i == 2 || i == 3 ? fd : i == 4 ? exe : -1;
+        int file = i == 2 || i == 3 ? fd : i == 4 ? exe : i == 5 ? text : -1;
         int flags = MAP_FIXED | (i == 1 || i == 3 ? MAP_SHARED : MAP_PRIVATE) | (file < 0 ? MAP_ANONYMOUS : 0);
-        at[i] = mmap(base + (1 + 4 * i) * page, 2 * page, i == 4 ? PROT_READ : PROT_READ | PROT_WRITE,
+        at[i] = mmap(base + (1 + 4 * i) * page, 2 * page, i >= 4 ? PROT_READ : PROT_READ | PROT_WRITE,
                      flags, file, 0);
         if (at[i] != base + (1 + 4 * i) * page) return 85;
     }
     at[0][0] = 1;
     at[1][0] = 1;
     at[3][0] = 'x';
+    if (fchmod(text, 0755)) return 88;
     const char *filters[] = {"0", "1", "2", "4", "8", "0x10", "0x33"};
     for (int f = 0; f < 7; f++) {
         unlink("core");
@@ -23222,6 +23228,7 @@ static int core_filter_case(const char *self, char **argv) {
     }
     unlink("core");
     unlink("data");
+    unlink("text");
     if (chdir("/") || rmdir(dir)) return 86;
     return 0;
 }

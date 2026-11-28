@@ -16,6 +16,8 @@ const ENODEV: Errno = Errno(19);
 /// `IGMP_ALL_HOSTS`, the group every device is in while it is up
 /// (`ip_mc_up`).
 pub(crate) const ALL_HOSTS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 1);
+/// `IGMPV3_ALL_MCR`, the group IGMPv3's reports go to.
+pub(crate) const REPORTS4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 22);
 /// The most memberships a socket has (`net.ipv4.igmp_max_memberships`).
 const MAX_MEMBERSHIPS: usize = 20;
 
@@ -626,31 +628,62 @@ impl Network {
     /// The device `index` joins `group` at `now`, kept for netlink to tell
     /// of as it does it anew ([`Network::groups_told4`]).
     fn join_group4(&self, index: i32, group: Ipv4Addr, mode: Mode, now: u64) {
-        let mut devices = self.devices();
-        if let Some((groups, links, told)) = devices.groups4_of(index)
-            && groups.join(group, mode, now, links)
-        {
-            told.push(Told4 {
-                index,
-                group,
-                joined: true,
-                created: now,
-            });
+        let new = {
+            let mut devices = self.devices();
+            let Some((groups, links, told)) = devices.groups4_of(index) else {
+                return;
+            };
+            let new = groups.join(group, mode, now, links);
+            if new {
+                told.push(Told4 {
+                    index,
+                    group,
+                    joined: true,
+                    created: now,
+                });
+            }
+            new
+        };
+        if new && group != ALL_HOSTS {
+            self.report4(index, now);
+        }
+    }
+    /// The device `index` reports its groups at `now`, as IGMPv3 does of
+    /// any change (`igmp_ifc_event`, then `igmpv3_send_cr` from its timer,
+    /// here at once): to [`REPORTS4`], whose neighbour that makes
+    /// ([`crate::interface::Addresses::send4`]), while the device is up,
+    /// with its carrier or without, as the report's route needs
+    /// (`ip_route_output_ports`, `ENETUNREACH` down). Its repeats
+    /// (`mr_ifc_count`) send nothing more of what is kept here.
+    fn report4(&self, index: i32, now: u64) {
+        if self.up6(index) {
+            self.addresses().send4(index, REPORTS4, now);
         }
     }
     /// The device `index` leaves `group` once, as a membership of `filter`
     /// does, kept for netlink to tell of as it leaves it for good.
-    fn leave_group4(&self, index: i32, group: Ipv4Addr, filter: &Filter<Ipv4Addr>) {
-        let mut devices = self.devices();
-        if let Some((groups, links, told)) = devices.groups4_of(index)
-            && let Some(created) = groups.leave(group, filter, links)
-        {
-            told.push(Told4 {
-                index,
-                group,
-                joined: false,
-                created,
-            });
+    fn leave_group4(&self, index: i32, group: Ipv4Addr, filter: &Filter<Ipv4Addr>, now: u64) {
+        let gone = {
+            let mut devices = self.devices();
+            match devices.groups4_of(index) {
+                Some((groups, links, told)) => match groups.leave(group, filter, links) {
+                    Some(created) => {
+                        told.push(Told4 {
+                            index,
+                            group,
+                            joined: false,
+                            created,
+                        });
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            }
+        };
+        // `igmp_group_dropped` reports it left.
+        if gone && group != ALL_HOSTS {
+            self.report4(index, now);
         }
     }
     /// The veth end `index` comes up at `now` (`ip_mc_up`): it joins the
@@ -661,11 +694,18 @@ impl Network {
         if up {
             self.join_group4(index, ALL_HOSTS, Mode::Exclude, now);
         }
-        if let Some((groups, links, _)) = self.devices().groups4_of(index) {
-            groups.load(up, links);
+        let reports = match self.devices().groups4_of(index) {
+            Some((groups, links, _)) => {
+                groups.load(up, links);
+                groups.listed().any(|(group, ..)| group != ALL_HOSTS)
+            }
+            None => false,
+        };
+        if up && reports {
+            self.report4(index, now);
         }
         if !up {
-            self.leave_group4(index, ALL_HOSTS, &Filter::new(Mode::Exclude));
+            self.leave_group4(index, ALL_HOSTS, &Filter::new(Mode::Exclude), now);
         }
     }
     /// What the IPv4 groups' changes since the last call were, in their
@@ -678,7 +718,7 @@ impl Network {
         if join {
             self.join_group4(index, group, Mode::Exclude, now);
         } else {
-            self.leave_group4(index, group, &Filter::new(Mode::Exclude));
+            self.leave_group4(index, group, &Filter::new(Mode::Exclude), now);
         }
     }
     /// A socket of `memberships` joins the group `asked`, with a filter of
@@ -740,14 +780,14 @@ impl Network {
             })
             .ok_or(EADDRNOTAVAIL)?;
         let left = memberships.remove(at);
-        self.leave_group4(left.at.index, left.at.group, &left.filter);
+        self.leave_group4(left.at.index, left.at.group, &left.filter, now.unwrap_or(0));
         Ok(())
     }
     /// A socket of `memberships` that goes leaves them all
     /// (`ip_mc_drop_socket`).
-    pub(crate) fn drop4(&self, memberships: &[Member4]) {
+    pub(crate) fn drop4(&self, memberships: &[Member4], now: u64) {
         for m in memberships {
-            self.leave_group4(m.at.index, m.at.group, &m.filter);
+            self.leave_group4(m.at.index, m.at.group, &m.filter, now);
         }
     }
     /// A socket of `memberships` adds `source` to the filter of the one
@@ -775,6 +815,8 @@ impl Network {
         if ends {
             return self.leave4(memberships, Membership { index, ..asked }, now);
         }
+        // `ip_mc_add_src`, `ip_mc_del_src`.
+        self.report4(index, now.unwrap_or(0));
         Ok(())
     }
     /// A socket of `memberships` gives the one `asked` the filter of `mode`
@@ -801,6 +843,7 @@ impl Network {
         let at = member4(memberships, group, index).ok_or(Errno::EINVAL)?;
         let filter = &mut memberships[at].filter;
         self.with_groups4(index, |groups| filter.set(groups, group, mode, sources));
+        self.report4(index, now.unwrap_or(0));
         Ok(())
     }
     /// The filter of the one of `memberships` that is `asked`
@@ -1570,7 +1613,7 @@ mod tests {
             network.join4(&mut mine, asked(1), Mode::Exclude, None),
             Err(ENOBUFS)
         );
-        network.drop4(&mine);
+        network.drop4(&mine, 0);
         assert!(!network.in_group4(1, LO, Ipv4Addr::new(239, 0, 0, 0)));
     }
 
@@ -1788,7 +1831,7 @@ mod tests {
         assert_eq!(listed(&network), [(GROUP, 2, 5), (ALL_HOSTS, 1, 0)]);
         network.leave4(&mut mine, asked(1), now).unwrap();
         assert_eq!(network.groups_told4(), []);
-        network.drop4(&theirs);
+        network.drop4(&theirs, 0);
         let left = Told4 {
             joined: false,
             ..joined

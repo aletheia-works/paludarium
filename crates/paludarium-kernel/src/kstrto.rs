@@ -1,5 +1,6 @@
 //! The kernel's number parsers of `lib/kstrtox.c`, as the files of
-//! `/proc/<pid>` read what is written to them: the whole string, which ends
+//! `/proc/<pid>` read what is written to them and the tmpfs and BPF file
+//! systems read their mount options: the whole string, which ends
 //! at its first NUL, in the base given or, for base 0, the one its prefix
 //! gives (`0x` for 16, `0` for 8, else 10), with one newline allowed at its
 //! end; `EINVAL` for anything else and `ERANGE` for a number past the type.
@@ -126,6 +127,23 @@ mod tests {
         assert_eq!(ull(b"99999999999999999999x", 0), Err(Errno::ERANGE));
         assert_eq!(ll(b"-9223372036854775808", 0), Ok(i64::MIN));
         assert_eq!(ll(b"-9223372036854775809", 0), Err(Errno::ERANGE));
+    }
+
+    #[test]
+    fn a_base_given_reads_only_its_digits() {
+        // Octal, as `mode=` takes it.
+        assert_eq!(uint(b"0750", 8), Ok(0o750));
+        assert_eq!(uint(b"+17\n", 8), Ok(0o17));
+        assert_eq!(uint(b"8", 8), Err(Errno::EINVAL));
+        assert_eq!(uint(b"", 8), Err(Errno::EINVAL));
+        // Base 16 takes a `0x` prefix too.
+        assert_eq!(uint(b"0x10", 16), Ok(16));
+        assert_eq!(uint(b"10", 16), Ok(16));
+        assert_eq!(ull(b"017\n", 0), Ok(15));
+        assert_eq!(ull(b"12x", 0), Err(Errno::EINVAL));
+        assert_eq!(ull(b"0x10000000000000000", 0), Err(Errno::ERANGE));
+        // Past 64 bits in a base given is ERANGE before a digit of no base.
+        assert_eq!(ull(b"7777777777777777777777779", 8), Err(Errno::ERANGE));
     }
 
     #[test]

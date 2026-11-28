@@ -206,52 +206,57 @@ fn comm_from(
 /// `PERF_RECORD_MISC_SWITCH_OUT` and one without it, to the enabled events
 /// with `context_switch` of the CPU and those that count the thread, as
 /// `perf_event_task_sched_out` and `perf_event_task_sched_in` write them.
-/// Both are written as it runs again: each out on CPU `slept_on`, where it
-/// slept, and each in there too but the last, on the CPU `who` is on now,
-/// which another thread's `sched_setaffinity` may have moved it to. A
-/// thread that `started` was switched in for its first run, which comes
-/// first, alone: inherited events take that of a new thread or child. An event of a CPU takes
-/// `SWITCH_CPU_WIDE`, which gives the thread that ran instead, here the
-/// idle task (0): no other guest thread takes the CPU from a sleeping one.
-/// A sleeping thread is not runnable, so no switch is a preemption
-/// (`PERF_RECORD_MISC_SWITCH_OUT_PREEMPT`).
+/// Both are written as it runs again, the `sleeps` given as runs of the
+/// CPU each was on and their number: each out on the CPU of its sleep and
+/// each in on that of the next, the last on the CPU `who` is on now, as
+/// another thread's `sched_setaffinity` may have moved it while it slept.
+/// A thread that `started` was switched in for its first run, which comes
+/// first, alone: inherited events take that of a new thread or child. An
+/// event of a CPU takes `SWITCH_CPU_WIDE`, which gives the thread that ran
+/// instead, here the idle task (0): no other guest thread takes the CPU
+/// from a sleeping one. A sleeping thread is not runnable, so no switch is
+/// a preemption (`PERF_RECORD_MISC_SWITCH_OUT_PREEMPT`).
 pub(crate) fn switched(
     events: &Events,
     group: &ThreadGroup,
     who: &Who,
-    slept_on: u32,
-    (started, sleeps): (bool, u64),
+    started: bool,
+    sleeps: &[(u32, u64)],
 ) {
-    if !started && sleeps == 0 || !switches(events) {
+    if !started && sleeps.is_empty() || !switches(events) {
         return;
     }
     let wants = |attr: &super::Attr| attr.flag(bit::CONTEXT_SWITCH);
-    let there = Who {
-        cpu: slept_on,
-        ..*who
-    };
-    let here = receivers(events, group, who.tid, who, wants);
-    let before = if slept_on == who.cpu {
-        here.clone()
-    } else {
-        receivers(events, group, who.tid, &there, wants)
-    };
-    let first = started.then_some((0, false));
-    let pairs = (0..sleeps).flat_map(|n| [(MISC_SWITCH_OUT, true), (0, n + 1 < sleeps)]);
-    for (misc, slept_there) in first.into_iter().chain(pairs) {
-        let (takers, writer) = if slept_there {
-            (&before, &there)
-        } else {
-            (&here, who)
+    // The receivers of each CPU, looked up once.
+    let mut of_cpu: Vec<(u32, Vec<Arc<Event>>)> = Vec::new();
+    let mut write = |misc: u16, cpu: u32| {
+        let writer = Who { cpu, ..*who };
+        let at = match of_cpu.iter().position(|(on, _)| *on == cpu) {
+            Some(at) => at,
+            None => {
+                of_cpu.push((cpu, receivers(events, group, who.tid, &writer, wants)));
+                of_cpu.len() - 1
+            }
         };
-        for event in takers {
+        for event in &of_cpu[at].1 {
             if matches!(event.target, super::Target::Cpu) {
                 let idle = event.pid_tid_of(0, 0);
-                event.side_band(RECORD_SWITCH_CPU_WIDE, misc, &idle, writer);
+                event.side_band(RECORD_SWITCH_CPU_WIDE, misc, &idle, &writer);
             } else {
-                event.side_band(RECORD_SWITCH, misc, &[], writer);
+                event.side_band(RECORD_SWITCH, misc, &[], &writer);
             }
         }
+    };
+    if started {
+        write(0, who.cpu);
+    }
+    let mut each = sleeps
+        .iter()
+        .flat_map(|&(cpu, n)| std::iter::repeat_n(cpu, usize::try_from(n).unwrap_or(usize::MAX)))
+        .peekable();
+    while let Some(cpu) = each.next() {
+        write(MISC_SWITCH_OUT, cpu);
+        write(0, each.peek().copied().unwrap_or(who.cpu));
     }
 }
 

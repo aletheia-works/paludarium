@@ -1047,7 +1047,43 @@ fn a_call_drops_the_sleeps_it_took_as_it_returns() {
     let host = Arc::clone(&env.k.host);
     crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
     assert!(!paludarium_host::switches::pending());
-    assert_eq!(env.t.state.cpu.slept, 1);
+    assert_eq!(env.t.state.cpu.slept, [(0, 1)]);
     let _ = env.k.checkpoint(&mut env.t, &env.m);
-    assert_eq!(env.t.state.cpu.slept, 0);
+    assert!(env.t.state.cpu.slept.is_empty());
+}
+
+/// Two sleeps of one call, the call reading a clock after each, and a move
+/// by another thread's `sched_setaffinity` during the second: both are
+/// switched out on the CPU the thread slept on, the first in there too and
+/// the second in on the new one. Sleeps are taken to be on the CPU of the
+/// last account, as their counts are ([`Usage::switched_on`]), which a
+/// move during the sleep, the long part of the call, gives.
+#[test]
+fn two_sleeps_of_a_call_are_switched_where_each_was() {
+    const ATTR_CONTEXT_SWITCH: u64 = 1 << 26;
+    let mut env = Env::new();
+    let tid = env.call(GETTID, [0; 6]) as u32;
+    env.pin();
+    let (on_0, first) = env.open_side_band(-1, 0, ATTR_CONTEXT_SWITCH).unwrap();
+    let (on_1, second) = env.open_side_band(-1, 1, ATTR_CONTEXT_SWITCH).unwrap();
+    env.ioctl(on_0, IOC_ENABLE);
+    env.ioctl(on_1, IOC_ENABLE);
+    let _ = paludarium_host::switches::take();
+    let host = Arc::clone(&env.k.host);
+    paludarium_host::switches::sleep(&mut false);
+    crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
+    paludarium_host::switches::sleep(&mut false);
+    env.k.group.set_affinity(tid, vec![2]);
+    crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
+    // A third sleep, now that the thread runs on CPU 1.
+    paludarium_host::switches::sleep(&mut false);
+    crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
+    assert_eq!(env.t.state.cpu.slept, [(0, 2), (1, 1)]);
+    let _ = env.k.checkpoint(&mut env.t, &env.m);
+    for page in [first, second] {
+        let mut outs = Vec::new();
+        env.each_record(page, |_, record| outs.push(record[0] >> 32 & 1 << 13 != 0));
+        env.say(format!("{outs:?}"));
+    }
+    check(&env.lines, &["[true, false, true]", "[false, true, false]"]);
 }

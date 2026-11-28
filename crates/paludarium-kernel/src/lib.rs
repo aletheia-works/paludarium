@@ -235,10 +235,10 @@ pub(crate) struct CpuAccount {
     /// looked ([`Kernel::scheduled_in`]).
     resumed: bool,
     /// The times it has slept since then, each a switch out and back in
-    /// for the events with `context_switch` ([`perf::switched`]), and the
-    /// CPU it slept on.
-    slept: u64,
-    slept_on: u32,
+    /// for the events with `context_switch` ([`perf::switched`]), as runs
+    /// of the CPU each was on and their number: another thread's
+    /// `sched_setaffinity` may move it between two sleeps of one call.
+    slept: Vec<(u32, u64)>,
     /// Whether perf has seen it run: a new thread's first run is a switch
     /// in alone.
     ran: bool,
@@ -954,8 +954,11 @@ pub(crate) fn account_cpu(
     let switches = paludarium_host::switches::take();
     if switches != 0 {
         account.resumed = true;
-        account.slept = account.slept.saturating_add(switches);
-        account.slept_on = account.on.map_or(0, |(cpu, _)| cpu);
+        let cpu = account.on.map_or(0, |(cpu, _)| cpu);
+        match account.slept.last_mut() {
+            Some((on, n)) if *on == cpu => *n = n.saturating_add(switches),
+            _ => account.slept.push((cpu, switches)),
+        }
         usage.switches.fetch_add(switches, Ordering::SeqCst);
         // Its sleeps since its last account were on the CPU it was on
         // then, though another thread's `sched_setaffinity` moved its
@@ -1804,7 +1807,7 @@ impl Kernel {
         // switch records show it: its sleeps are taken now, and so are
         // those the call took itself as it read a clock, so that an event
         // opened or enabled after them takes none of them.
-        let slept = paludarium_host::switches::pending() || thread.state.cpu.slept != 0;
+        let slept = paludarium_host::switches::pending() || !thread.state.cpu.slept.is_empty();
         if self.group.cpu_timers_armed() || sampling || slept {
             account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
             self.scheduled_in(thread);
@@ -2532,19 +2535,18 @@ impl Kernel {
         }
         let sleeps = std::mem::take(&mut thread.state.cpu.slept);
         let started = !std::mem::replace(&mut thread.state.cpu.ran, true);
-        if (started || sleeps != 0) && perf::switches(&self.processes.perf_events) {
+        if (started || !sleeps.is_empty()) && perf::switches(&self.processes.perf_events) {
             let who = perf::Who {
                 pid: thread.state.pid,
                 tid: thread.tid,
                 cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
             };
-            let slept_on = thread.state.cpu.slept_on;
             perf::switched(
                 &self.processes.perf_events,
                 &self.group,
                 &who,
-                slept_on,
-                (started, sleeps),
+                started,
+                &sleeps,
             );
         }
     }

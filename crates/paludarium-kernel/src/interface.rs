@@ -4544,7 +4544,7 @@ impl Addresses {
             dport: flow.dport,
             label: flow.label,
             packet: false,
-            l4_hash: 0,
+            socket_hash: 0,
         };
         let hash = i64::from(self.multipath_seed.hash6(self.multipath6, src, ip, keys));
         let mut weight = 0u64;

@@ -44,7 +44,7 @@ pub(crate) trait Signaller: Send + Sync {
 }
 impl Signaller for Processes {
     fn signal_owner(&self, file: &Arc<dyn FileHandle>, fd: i32) {
-        self.send_io(self.file_owner(file), fd, Reason::Message);
+        self.send_io(&self.file_owner(file), fd, Reason::Message);
     }
 }
 
@@ -290,6 +290,7 @@ pub(crate) fn fcntl(c: &Context<'_>, d: &Descriptor, fd: u64, arg: u32) -> Resul
             crate::fasync::FileOwner {
                 kind: OwnerKind::Process,
                 id: c.process.pid,
+                setter: crate::fasync::Setter::of(c),
                 ..owner
             },
         );

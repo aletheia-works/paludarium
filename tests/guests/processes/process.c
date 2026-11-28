@@ -9677,9 +9677,9 @@ static unsigned char *ut_entry(unsigned char opcode, int fd, long offset, const 
     return sqe;
 }
 
-/* Submits the entry pushed last and prints its result and flags. */
-static void ut_run(const char *label) {
-    long r = uring_enter(ut.fd, 1, 1, 1, NULL, 0);
+/* Prints the result of an io_uring_enter, then the completions' results
+   and flags. */
+static void ut_show(const char *label, long r) {
     unsigned head = *u32p(ut.rings, 8);
     unsigned tail = __atomic_load_n(u32p(ut.rings, 12), __ATOMIC_ACQUIRE);
     printf("%s: enter=%ld", label, r);
@@ -9693,6 +9693,18 @@ static void ut_run(const char *label) {
     }
     printf("\n");
     __atomic_store_n(u32p(ut.rings, 8), head, __ATOMIC_RELEASE);
+}
+
+/* Submits the entry pushed last and prints its result and flags. */
+static void ut_run(const char *label) { ut_show(label, uring_enter(ut.fd, 1, 1, 1, NULL, 0)); }
+
+/* A NOP that looks for registered file `slot` (IORING_NOP_FILE and
+   IORING_NOP_FIXED_FILE): EBADF for an empty slot. */
+static void ut_slot(const char *label, int slot) {
+    unsigned char *sqe = ut_entry(0, slot, 0, NULL, 0);
+    unsigned flags = 1 << 1 | 1 << 2;
+    memcpy(sqe + 28, &flags, 4);
+    ut_run(label);
 }
 
 static void ut_events(int ifd, const char *label) {
@@ -9913,6 +9925,174 @@ static int io_uring_transfers_case(void) {
     sqe = ut_entry(4, ffd, 0, page, 1);
     sqe[1] = 1 << 5;
     ut_run("fixed-select");
+    /* READV_FIXED and WRITEV_FIXED, Linux 6.15's: the vector is read as the
+       entry is, then each of its buffers must be in the registered one. */
+    struct iovec pieces[2];
+    memcpy(page + 256, "vec", 3);
+    memcpy(page + 512, "tor", 3);
+    pieces[0] = (struct iovec){page + 256, 3};
+    pieces[1] = (struct iovec){page + 512, 3};
+    ut_entry(61, ffd, 0, pieces, 2);
+    ut_run("writev-fixed");
+    pieces[0] = (struct iovec){page + 1024, 2};
+    pieces[1] = (struct iovec){page + 1100, 8};
+    ut_entry(60, ffd, 1, pieces, 2);
+    ut_run("readv-fixed");
+    printf("readv-fixed: %.2s %.3s\n", page + 1024, page + 1100);
+    ut_entry(60, ffd, 0, pieces, 0);
+    ut_run("readv-fixed-none");
+    ut_entry(60, ffd, 0, pieces, 1025);
+    ut_run("readv-fixed-too-many");
+    ut_entry(60, ffd, 0, pieces, (1 << 18) + 1);
+    ut_run("readv-fixed-huge");
+    ut_entry(60, ffd, 0, (void *)(1UL << 63), 1);
+    ut_run("readv-fixed-vector-fault");
+    pieces[0] = (struct iovec){page, (size_t)-1};
+    ut_entry(60, 999, 0, pieces, 1);
+    ut_run("readv-fixed-negative-first");
+    pieces[0] = (struct iovec){page, 1};
+    ut_entry(60, 999, 0, pieces, 1);
+    ut_run("readv-fixed-badf");
+    struct {
+        const char *label;
+        struct iovec v[2];
+        unsigned count;
+        unsigned short index;
+    } apart[] = {
+        {"writev-fixed-empty-slot", {{page, 1}}, 1, 1},
+        {"writev-fixed-no-slot", {{page, 1}}, 1, 2},
+        {"writev-fixed-before", {{page, 1}, {page - 1, 1}}, 2, 0},
+        {"writev-fixed-past-end", {{page + 4095, 2}}, 1, 0},
+        {"writev-fixed-zero", {{page, 1}, {page + 4, 0}}, 2, 0},
+        {"writev-fixed-too-long", {{page, 1UL << 20}}, 1, 0},
+        {"writev-fixed-many-pages", {{page, 1UL << 31}}, 1, 0},
+        {"writev-fixed-many-pages-two", {{page, 1UL << 29}, {page, 1UL << 29}}, 2, 0},
+        {"writev-fixed-pages-overflow", {{page, 1UL << 43}}, 1, 0},
+        {"writev-fixed-pages-empty-slot", {{page, 1UL << 43}}, 1, 1},
+    };
+    for (unsigned i = 0; i < sizeof apart / sizeof *apart; i++) {
+        sqe = ut_entry(61, ffd, 0, apart[i].v, apart[i].count);
+        memcpy(sqe + 40, &apart[i].index, 2);
+        ut_run(apart[i].label);
+    }
+    sqe = ut_entry(60, ffd, 0, pieces, 1);
+    sqe[1] = 1 << 5;
+    ut_run("readv-fixed-select");
+    /* EPOLL_WAIT, Linux 6.15's: the entry's checks, the file's, then
+       ep_check_params; with no event ready it waits for one. */
+    int ep = epoll_create1(0), pp[2];
+    if (ep < 0 || pipe(pp)) return 88;
+    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 7}, evs[4];
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, pp[0], &ev)) return 89;
+    ut_entry(59, ep, 1, evs, 1);
+    ut_run("epoll-wait-off");
+    sqe = ut_entry(59, ep, 0, evs, 1);
+    sqe[40] = 1;
+    ut_run("epoll-wait-index");
+    sqe = ut_entry(59, ep, 0, evs, 1);
+    sqe[28] = 1;
+    ut_run("epoll-wait-flags");
+    sqe = ut_entry(59, ep, 0, evs, 1);
+    sqe[2] = 1;
+    ut_run("epoll-wait-ioprio");
+    ut_entry(59, 999, 0, evs, 0);
+    ut_run("epoll-wait-badf");
+    ut_entry(59, ep, 0, evs, 0);
+    ut_run("epoll-wait-none");
+    ut_entry(59, ep, 0, evs, -1U);
+    ut_run("epoll-wait-negative");
+    ut_entry(59, ep, 0, evs, INT_MAX / 12 + 1);
+    ut_run("epoll-wait-too-many");
+    ut_entry(59, ep, 0, (void *)(1UL << 63), 1);
+    ut_run("epoll-wait-fault");
+    ut_entry(59, pp[0], 0, evs, 1);
+    ut_run("epoll-wait-not-epoll");
+    ut_entry(59, ep, 0, evs, 4);
+    ut_show("epoll-wait-waits", uring_enter(ut.fd, 1, 0, 0, NULL, 0));
+    if (write(pp[1], "x", 1) != 1) return 90;
+    ut_show("epoll-wait-woken", uring_enter(ut.fd, 0, 1, 1, NULL, 0));
+    printf("epoll-wait-event: %#x %llu\n", evs[0].events, (unsigned long long)evs[0].data.u64);
+    ut_entry(59, ep, 0, evs, 4);
+    ut_run("epoll-wait-ready");
+    ut_entry(59, ep, 0, page + 2 * 4096, 1);
+    ut_run("epoll-wait-unmapped");
+    close(ep);
+    close(pp[0]);
+    close(pp[1]);
+    /* PIPE, Linux 6.16's: two descriptors, or two registered slots. */
+    int pf[2] = {-2, -2};
+    unsigned pipe_flags = O_WRONLY;
+    ut_entry(62, 1, 0, pf, 0);
+    ut_run("pipe-fd");
+    ut_entry(62, 0, 1, pf, 0);
+    ut_run("pipe-off");
+    sqe = ut_entry(62, 0, 0, pf, 0);
+    sqe[48] = 1;
+    ut_run("pipe-addr3");
+    sqe = ut_entry(62, 0, 0, pf, 0);
+    memcpy(sqe + 28, &pipe_flags, 4);
+    ut_run("pipe-flags");
+    pipe_flags = O_CLOEXEC | O_NONBLOCK;
+    sqe = ut_entry(62, 0, 0, pf, 0);
+    memcpy(sqe + 28, &pipe_flags, 4);
+    ut_run("pipe-op");
+    char pb[4];
+    ssize_t wrote = write(pf[1], "ab", 2), got_now = read(pf[0], pb, sizeof pb);
+    ssize_t got_again = read(pf[0], pb, sizeof pb);
+    printf("pipe-ends: next=%d cloexec=%d nonblock=%d write=%zd read=%zd again=%zd\n",
+           pf[1] - pf[0], fcntl(pf[0], F_GETFD), !!(fcntl(pf[1], F_GETFL) & O_NONBLOCK), wrote,
+           got_now, got_again);
+    close(pf[0]);
+    close(pf[1]);
+    pipe_flags = O_DIRECT;
+    sqe = ut_entry(62, 0, 0, pf, 0);
+    memcpy(sqe + 28, &pipe_flags, 4);
+    ut_run("pipe-packets");
+    wrote = write(pf[1], "ab", 2);
+    ssize_t wrote_more = write(pf[1], "cde", 3);
+    got_now = read(pf[0], pb, sizeof pb);
+    printf("pipe-packets: %zd %zd %zd\n", wrote, wrote_more, got_now);
+    close(pf[0]);
+    close(pf[1]);
+    int lowest = dup(0);
+    close(lowest);
+    ut_entry(62, 0, 0, page + 2 * 4096, 0);
+    ut_run("pipe-fault");
+    int again = dup(0);
+    printf("pipe-fault-free: %d\n", again == lowest);
+    close(again);
+    sqe = ut_entry(62, 0, 0, pf, 0);
+    unsigned pipe_slot = 1;
+    memcpy(sqe + 44, &pipe_slot, 4);
+    ut_run("pipe-no-files");
+    int sparse[4] = {-1, -1, -1, -1};
+    uring_show("pipe-register-files", syscall(427, ut.fd, 2, sparse, 4));
+    struct {
+        const char *label;
+        unsigned flags, slot;
+        void *at;
+    } slots[] = {
+        {"pipe-slot-cloexec", O_CLOEXEC, 2, pf},
+        {"pipe-slot", 0, 2, pf},
+        {"pipe-slot-last", 0, 4, pf},
+        {"pipe-slot-alloc", 0, -1U, pf},
+        {"pipe-slot-alloc-full", 0, -1U, pf},
+        {"pipe-slot-fault", 0, 1, page + 2 * 4096},
+    };
+    for (unsigned i = 0; i < sizeof slots / sizeof *slots; i++) {
+        pf[0] = pf[1] = -2;
+        sqe = ut_entry(62, 0, 0, slots[i].at, 0);
+        memcpy(sqe + 28, &slots[i].flags, 4);
+        memcpy(sqe + 44, &slots[i].slot, 4);
+        ut_run(slots[i].label);
+        printf("%s: %d %d\n", slots[i].label, pf[0], pf[1]);
+    }
+    for (int slot = 0; slot < 4; slot++) {
+        char label[16];
+        snprintf(label, sizeof label, "pipe-slot-%d", slot);
+        ut_slot(label, slot);
+    }
+    uring_show("pipe-unregister-files", syscall(427, ut.fd, 3, NULL, 0));
     uring_show("unregister-arg", syscall(427, ut.fd, 1, bufs, 0));
     uring_show("unregister-count", syscall(427, ut.fd, 1, NULL, 1));
     uring_show("unregister", syscall(427, ut.fd, 1, NULL, 0));
@@ -9928,7 +10108,7 @@ static int io_uring_transfers_case(void) {
     memset(probe, 0, sizeof probe);
     syscall(427, ut.fd, 8, probe, 64);
     printf("probe:");
-    const int ops[] = {1, 2, 3, 4, 5, 22, 23};
+    const int ops[] = {1, 2, 3, 4, 5, 22, 23, 59, 60, 61, 62};
     for (unsigned i = 0; i < sizeof ops / sizeof *ops; i++)
         printf(" %d=%d", ops[i], probe[16 + 8 * ops[i] + 2] & 1);
     printf("\n");
@@ -19244,6 +19424,96 @@ static int named_fifo_statfs_case(void) {
         if (fd >= 0) close(fd);
         if (pathfd >= 0) close(pathfd);
     }
+    return 0;
+}
+/* Each call's errno, or 0, for a path that goes on past a file the kernel
+ * makes that is not a directory: a trailing slash or a name after it. */
+static void generated_enotdir_show(const char *p) {
+    struct stat st;
+    struct statfs sf;
+    char b[16];
+    int in = inotify_init1(IN_CLOEXEC);
+#define GE(e) ((e) < 0 ? -errno : 0)
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    int o = GE(fd);
+    if (fd >= 0) close(fd);
+    fd = open(p, O_PATH | O_CLOEXEC);
+    int op = GE(fd);
+    if (fd >= 0) close(fd);
+    int s = GE(stat(p, &st));
+    int l = GE(lstat(p, &st));
+    int a = GE(access(p, F_OK));
+    int r = GE(readlink(p, b, sizeof b));
+    int fs = GE(statfs(p, &sf));
+    int cd = GE(chdir(p));
+    int t = GE(truncate(p, 0));
+    int x = GE(getxattr(p, "user.x", b, sizeof b));
+    int u = GE(utimensat(AT_FDCWD, p, NULL, 0));
+    int ch = GE(chmod(p, 0600));
+    int lc = GE(lchown(p, -1, -1));
+    int un = GE(utimensat(AT_FDCWD, p, NULL, AT_SYMLINK_NOFOLLOW));
+    int w = in < 0 ? -1000 : GE(inotify_add_watch(in, p, IN_ALL_EVENTS));
+    int md = GE(mkdir(p, 0700));
+    int cr = GE(open(p, O_CREAT | O_WRONLY | O_CLOEXEC, 0600));
+    int sy = GE(symlink("x", p));
+    int mk = GE(mknod(p, S_IFIFO | 0600, 0));
+    int ul = GE(unlink(p));
+    int ex = GE(execve(p, (char *[]){NULL}, (char *[]){NULL}));
+#undef GE
+    if (in >= 0) close(in);
+    printf("%s open=%d opath=%d stat=%d lstat=%d access=%d readlink=%d statfs=%d chdir=%d truncate=%d getxattr=%d utimens=%d chmod=%d lchown=%d utimens-nofollow=%d inotify=%d mkdir=%d creat=%d symlink=%d mknod=%d unlink=%d exec=%d\n",
+           p, o, op, s, l, a, r, fs, cd, t, x, u, ch, lc, un, w, md, cr, sy, mk, ul, ex);
+}
+static int generated_enotdir_case(void) {
+    static const char *const paths[] = {
+        "/proc/self/status/", "/proc/self/status/x", "/proc/thread-self/status/",
+        "/proc/self/stat/", "/proc/self/cmdline/", "/proc/self/comm/",
+        "/proc/self/environ/x", "/proc/self/maps/", "/proc/self/limits/",
+        "/proc/self/mountinfo/", "/proc/self/mounts/", "/proc/self/mounts/x",
+        "/proc/mounts/", "/proc/mounts/x", "/proc/self/net/dev/", "/proc/net/dev/",
+        "/proc/self/net/dev/x", "/proc/self/fdinfo/0/", "/proc/self/fd/0/x",
+        "/proc/self/exe/x", "/proc/self/ns/net/x", "/proc/uptime/", "/proc/uptime/x",
+        "/proc/sys/kernel/ostype/", "/proc/sys/kernel/ostype/x", "/proc/sysvipc/msg/",
+        "/dev/null/", "/dev/null/x", "/dev/zero/", "/dev/full/", "/dev/random/",
+        "/dev/urandom/x", "/dev/ptmx/", "/dev/pts/ptmx/", "/dev/stdin/x", "/dev/fd/0/x",
+        NULL,
+    };
+    for (int i = 0; paths[i]; i++) generated_enotdir_show(paths[i]);
+    /* Directories, and links to them, are gone on in. */
+    static const char *const dirs[] = {
+        "/proc/self/", "/proc/self/fd/", "/proc/self/net/", "/proc/self/root/",
+        "/proc/self/cwd/", "/proc/sysvipc/", "/dev/pts/", "/dev/fd/", NULL,
+    };
+    for (int i = 0; dirs[i]; i++) {
+        struct stat st;
+        printf("%s stat=%d\n", dirs[i], stat(dirs[i], &st) < 0 ? -errno : 0);
+    }
+    /* From a descriptor and from the working directory. */
+    int self = open("/proc/self", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int dev = open("/dev", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (self < 0 || dev < 0) return 1;
+    struct stat st;
+    int fd = openat(self, "status/", O_RDONLY | O_CLOEXEC);
+    printf("at self status/ open=%d stat=%d status/x=%d; dev null/ open=%d null/x=%d\n",
+           fd < 0 ? -errno : 0,
+           fstatat(self, "status/", &st, 0) < 0 ? -errno : 0,
+           fstatat(self, "status/x", &st, 0) < 0 ? -errno : 0,
+           openat(dev, "null/", O_RDONLY | O_CLOEXEC) < 0 ? -errno : 0,
+           fstatat(dev, "null/x", &st, 0) < 0 ? -errno : 0);
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) return 2;
+    if (fchdir(self) < 0) return 3;
+    printf("in self status/=%d mounts/=%d exe/=%d\n",
+           stat("status/", &st) < 0 ? -errno : 0,
+           stat("mounts/", &st) < 0 ? -errno : 0,
+           stat("exe/", &st) < 0 ? -errno : 0);
+    if (fchdir(dev) < 0) return 4;
+    printf("in dev null/=%d zero/x=%d\n",
+           stat("null/", &st) < 0 ? -errno : 0,
+           stat("zero/x", &st) < 0 ? -errno : 0);
+    if (chdir(cwd) < 0) return 5;
+    close(self);
+    close(dev);
     return 0;
 }
 /* `execve` through a magic link on the way (`/proc/self/fd/<n>/name`,
@@ -45958,6 +46228,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-links")) return proc_links_case(self);
     if (!strcmp(mode, "proc-links-ran")) return 7;
     if (!strcmp(mode, "statx-attributes")) return statx_attributes_case();
+    if (!strcmp(mode, "generated-enotdir")) return generated_enotdir_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

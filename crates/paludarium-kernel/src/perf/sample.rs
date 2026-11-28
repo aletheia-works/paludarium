@@ -965,10 +965,10 @@ impl Event {
             ins = ins.min(1);
         }
         for _ in 0..ins {
-            processes.send_io(owner, fasync.to.fd, Reason::In);
+            processes.send_io(&owner, fasync.to.fd, Reason::In);
         }
         if hung_up && (owner.signal != 0 || ins == 0) {
-            processes.send_io(owner, fasync.to.fd, Reason::HangUp);
+            processes.send_io(&owner, fasync.to.fd, Reason::HangUp);
         }
     }
     /// `send_sig_perf`: SIGTRAP of `TRAP_PERF` for the thread, with

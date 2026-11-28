@@ -178,7 +178,7 @@ mod linux {
             let program = dir.join(binary);
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
-            // The credentials, permissions, setuid, signal-permissions,
+            // The credentials, permissions, setuid, signal-permissions, sigio-owner,
             // limit-permissions, peer-credentials, core-credentials,
             // set-id-writes, socket-owners, capabilities, file-capabilities and script-exec cases
             // change IDs as root, pty-vhangup needs root's capabilities and
@@ -250,6 +250,7 @@ mod linux {
                     | "permissions"
                     | "setuid"
                     | "signal-permissions"
+                    | "sigio-owner"
                     | "limit-permissions"
                     | "peer-credentials"
                     | "core-credentials"
@@ -358,6 +359,7 @@ mod linux {
                     | "perf-clock-samples"
                     | "perf-fault-signals"
                     | "perf-side-band-exec"
+                    | "perf-side-band-namespaces"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -857,6 +859,7 @@ mod linux {
         perf_clock_samples => ("perf-clock-samples","perf"),
         perf_fault_signals => ("perf-fault-signals","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
+        perf_side_band_namespaces => ("perf-side-band-namespaces","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -1187,6 +1190,8 @@ mod linux {
         processes_exec_pending => ("exec-pending","exec-pending"),
         processes_pdeath_thread => ("pdeath-thread","pdeath-thread"),
         processes_sa_immutable => ("sa-immutable","sa-immutable"),
+        processes_vsyscall_immutable => ("vsyscall-immutable","sa-immutable"),
+        processes_sigio_owner => ("sigio-owner","sigio-owner"),
         processes_cpu_itimer => ("cpu-itimer","process"),
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),
@@ -1210,6 +1215,7 @@ mod linux {
         processes_generated_rooted_links => ("generated-rooted-links","process"),
         processes_proc_links => ("proc-links","process"),
         processes_statx_attributes => ("statx-attributes","process"),
+        processes_generated_enotdir => ("generated-enotdir","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),

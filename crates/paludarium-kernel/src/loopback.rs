@@ -398,9 +398,9 @@ impl Link {
         self.arm(&mut flows);
         heard
     }
-    /// Sets when the connection's timers are next to be run, and tells of a
-    /// request that has opened or been dropped.
-    /// And counts what each side sent on its devices ([`Way`]).
+    /// Counts what each side has sent on its devices ([`Way`]), sets when
+    /// the connection's timers are next to be run, and tells of a request
+    /// that has opened or been dropped.
     fn arm(&self, flows: &mut Flows) {
         let sent = flows.take_sent();
         for (way, lens) in self.ways.iter().zip(sent) {

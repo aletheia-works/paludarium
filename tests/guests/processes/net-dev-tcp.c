@@ -5,7 +5,8 @@
    the timestamps (tcp_options_write), and its data. The process makes a
    network namespace, A, and connects through its loopback, of IPv4 and
    of IPv6: the handshake, a write the peer acknowledges, and each side's
-   end; and a connection to a closed port, which a reset refuses. Then,
+   end; a connection to a closed port, which a reset refuses; and one the
+   client resets as it closes, whose reset has the timestamps. Then,
    with IPv6 off in A and in another namespace, B, a pair, va (1000,
    10.0.0.1/24) in A and vb (1001, 10.0.0.2/24) in B, carries the same,
    after the ARP request and answer. What is waited for is polled: the
@@ -279,6 +280,23 @@ static void tcp(int fd, int family, const char *ip, int port, int l, const char 
     printf("connect to a closed port=%ld\n", result(connect(r, (void *)&to, size)));
     close(r);
     snprintf(text, sizeof text, "%s, refused", label);
+    counters(fd, text);
+    /* A connection the client resets, closing with a linger time of 0
+       (tcp_send_active_reset): its reset carries the timestamps. */
+    if (family == AF_INET)
+        ((struct sockaddr_in *)&to)->sin_port = htons((unsigned short)port);
+    else
+        ((struct sockaddr_in6 *)&to)->sin6_port = htons((unsigned short)port);
+    c = socket(family, SOCK_STREAM, 0);
+    printf("connect again=%ld", result(connect(c, (void *)&to, size)));
+    x = accept(l, NULL, NULL);
+    printf(" accept=%d settled=%d", x >= 0, settle(c, 0));
+    struct linger hard = {.l_onoff = 1, .l_linger = 0};
+    setsockopt(c, SOL_SOCKET, SO_LINGER, &hard, sizeof hard);
+    close(c);
+    printf(" reset=%d\n", settle(x, TCP_CLOSE));
+    close(x);
+    snprintf(text, sizeof text, "%s, reset", label);
     counters(fd, text);
 }
 static int listener(int family, const char *ip, int port) {

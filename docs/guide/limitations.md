@@ -137,7 +137,10 @@ verified.
   closed port, where Linux limits how many go (`icmp_ratelimit`,
   `icmp_msgs_per_sec`, and per peer through a veth pair).
   A SYN that a listener's full queue drops, or that nothing answers, is
-  not counted, nor are the packets of IPv6 that the kernel sends of
+  not counted, nor are its retries; a connection's own retransmissions,
+  the SYN-ACK's sent again among them, are, as is its handshake once
+  the listener has answered, whether or not the request is dropped
+  later. Nor are the packets of IPv6 that the kernel sends of
   itself (neighbour discovery, MLD reports, router solicitations and
   duplicate address detection), nor ARP's probes of a neighbour whose
   entry ages, nor what goes to the host (a TCP connection to a port no

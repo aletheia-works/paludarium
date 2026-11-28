@@ -547,7 +547,7 @@ fn ofd_cloexec_is_per_descriptor() {
 fn ofd_clone_shared_table() {
     let mut f = Fixture::new();
     let fd = f.event(1);
-    let child = f.kernel.files.for_clone(true, false);
+    let child = f.kernel.files.for_clone(true, false).unwrap();
     assert!(Arc::ptr_eq(
         &f.kernel.files.descriptor(fd).unwrap().file,
         &child.descriptor(fd).unwrap().file
@@ -559,7 +559,7 @@ fn ofd_clone_shared_table() {
 fn ofd_clone_copied_table_keeps_description() {
     let mut f = Fixture::new();
     let fd = f.event(1);
-    let child = f.kernel.files.for_clone(false, false);
+    let child = f.kernel.files.for_clone(false, false).unwrap();
     f.ret(3, [fd, 0, 0, 0, 0, 0]);
     let mut bytes = [0; 8];
     assert_eq!(child.descriptor(fd).unwrap().file.read(&mut bytes), Ok(8));

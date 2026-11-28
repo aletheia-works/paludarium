@@ -358,6 +358,7 @@ mod linux {
                     | "perf-clock-samples"
                     | "perf-fault-signals"
                     | "perf-side-band-exec"
+                    | "perf-side-band-namespaces"
                     | "perf-side-band-switch"
                     | "bpf-calls"
                     | "bpf-elements"
@@ -387,6 +388,7 @@ mod linux {
                     | "bpf-prog-tcp"
                     | "bpf-prog-segments"
                     | "bpf-prog-testrun"
+                    | "bpf-prog-cfg"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -459,6 +461,7 @@ mod linux {
                     | "veth-ipv6-kept"
                     | "veth-hash-policy"
                     | "veth-use-neigh"
+                    | "veth-icmp-hop"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-unicast-if"
@@ -471,6 +474,7 @@ mod linux {
                     | "veth-ipv6-anycast"
                     | "veth-dev-mcast"
                     | "net-dev-counters"
+                    | "net-dev-tcp"
                     | "veth-igmp-neighbours"
                     | "veth-ipv6-solicited-routers"
                     | "veth-ipv6-accept"
@@ -739,6 +743,7 @@ mod linux {
         veth_ipv6_kept => ("veth-ipv6-kept","veth-ipv6-kept"),
         veth_hash_policy => ("veth-hash-policy","veth-hash-policy"),
         veth_use_neigh => ("veth-use-neigh","veth-use-neigh"),
+        veth_icmp_hop => ("veth-icmp-hop","veth-icmp-hop"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_unicast_if => ("veth-unicast-if","veth-unicast-if"),
@@ -751,6 +756,7 @@ mod linux {
         veth_ipv6_anycast => ("veth-ipv6-anycast","veth-ipv6-anycast"),
         veth_dev_mcast => ("veth-dev-mcast","veth-dev-mcast"),
         net_dev_counters => ("net-dev-counters","net-dev-counters"),
+        net_dev_tcp => ("net-dev-tcp","net-dev-tcp"),
         veth_igmp_neighbours => ("veth-igmp-neighbours","veth-igmp-neighbours"),
         veth_ipv6_solicited_routers => ("veth-ipv6-solicited-routers","veth-ipv6-solicited-routers"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
@@ -853,6 +859,7 @@ mod linux {
         perf_clock_samples => ("perf-clock-samples","perf"),
         perf_fault_signals => ("perf-fault-signals","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
+        perf_side_band_namespaces => ("perf-side-band-namespaces","perf"),
         perf_side_band_switch => ("perf-side-band-switch","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
@@ -882,6 +889,7 @@ mod linux {
         bpf_prog_tcp => ("bpf-prog-tcp","bpf-prog"),
         bpf_prog_segments => ("bpf-prog-segments","bpf-prog"),
         bpf_prog_testrun => ("bpf-prog-testrun","bpf-prog"),
+        bpf_prog_cfg => ("bpf-prog-cfg","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         dnotify_calls => ("dnotify-calls","inotify"),
         dnotify_switch => ("dnotify-switch","inotify"),
@@ -1146,6 +1154,7 @@ mod linux {
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
         processes_sysctl_constants => ("sysctl-constants","process"),
+        processes_sysctl_limits => ("sysctl-limits","process"),
         processes_poll_default => ("poll-default","process"),
         processes_uts_sysctl => ("uts-sysctl","process"),
         processes_uts_sysctl_poll => ("uts-sysctl-poll","process"),
@@ -1204,6 +1213,7 @@ mod linux {
         processes_generated_name_errors => ("generated-name-errors","process"),
         processes_generated_rooted_links => ("generated-rooted-links","process"),
         processes_proc_links => ("proc-links","process"),
+        processes_statx_attributes => ("statx-attributes","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),

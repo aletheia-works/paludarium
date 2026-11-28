@@ -19275,6 +19275,73 @@ static int proc_links_case(const char *self) {
     if (fb >= 0) close(fb);
     return 0;
 }
+/* statx's stx_attributes and stx_attributes_mask, as vfs_getattr_nosec,
+   shmem_getattr and vfs_statx_path give them: the mask every file has
+   (STATX_ATTR_AUTOMOUNT, STATX_ATTR_MOUNT_ROOT and STATX_ATTR_DAX), tmpfs's
+   and devtmpfs's flags besides, and STATX_ATTR_MOUNT_ROOT on a mount's root
+   however its path names it, never on a link or a descriptor of an internal
+   mount. */
+static void statx_attributes_show(const char *name, int dir, const char *path, int flags) {
+    struct statx sx;
+    memset(&sx, 0, sizeof sx);
+    int r = (int)syscall(SYS_statx, dir, path, flags, 0x7ff, &sx);
+    printf("%s r=%d attributes=%#llx mask=%#llx\n", name, r < 0 ? -errno : r,
+           (unsigned long long)sx.stx_attributes, (unsigned long long)sx.stx_attributes_mask);
+}
+static int statx_attributes_case(void) {
+    const char *paths[] = {"/proc", "/proc/self", "/proc/self/status", "/proc/self/task",
+                           "/proc/self/fd", "/proc/thread-self", "/proc/self/..", "/proc/./",
+                           "/dev", "/dev/null", "/dev/shm", "/dev/shm/."};
+    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++)
+        statx_attributes_show(paths[i], AT_FDCWD, paths[i], 0);
+    statx_attributes_show("/proc/self nofollow", AT_FDCWD, "/proc/self", AT_SYMLINK_NOFOLLOW);
+    char dir[64];
+    snprintf(dir, sizeof dir, "/dev/shm/statx-attributes-%d", (int)getpid());
+    if (mkdir(dir, 0700)) return 1;
+    char file[96], link[96], fifo[96], gone[96];
+    snprintf(file, sizeof file, "%s/file", dir);
+    snprintf(link, sizeof link, "%s/link", dir);
+    snprintf(fifo, sizeof fifo, "%s/fifo", dir);
+    snprintf(gone, sizeof gone, "%s/gone", dir);
+    int f = open(file, O_CREAT | O_WRONLY, 0600);
+    int made = f >= 0 && !symlink("file", link) && !mkfifo(fifo, 0600) && !mkfifo(gone, 0600);
+    /* A fifo opened, then removed: still tmpfs's, by its descriptor. */
+    int g = made ? open(gone, O_RDWR) : -1;
+    int pipes[2] = {-1, -1};
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    int memfd = (int)syscall(SYS_memfd_create, "statx", 0);
+    int efd = eventfd(0, 0);
+    int proc = open("/proc", O_PATH | O_DIRECTORY);
+    int null = open("/dev/null", O_RDONLY);
+    int r = 0;
+    if (!made || g < 0 || unlink(gone)) r = 2;
+    else if (pipe(pipes) || sock < 0 || memfd < 0 || efd < 0 || proc < 0 || null < 0) r = 3;
+    if (!r) {
+        statx_attributes_show("tmpfs dir", AT_FDCWD, dir, 0);
+        statx_attributes_show("tmpfs file", AT_FDCWD, file, 0);
+        statx_attributes_show("tmpfs link", AT_FDCWD, link, AT_SYMLINK_NOFOLLOW);
+        statx_attributes_show("tmpfs fifo", AT_FDCWD, fifo, 0);
+        statx_attributes_show("tmpfs descriptor", f, "", AT_EMPTY_PATH);
+        statx_attributes_show("removed tmpfs fifo", g, "", AT_EMPTY_PATH);
+        statx_attributes_show("pipe", pipes[0], "", AT_EMPTY_PATH);
+        statx_attributes_show("socket", sock, "", AT_EMPTY_PATH);
+        statx_attributes_show("memfd", memfd, "", AT_EMPTY_PATH);
+        statx_attributes_show("eventfd", efd, "", AT_EMPTY_PATH);
+        statx_attributes_show("/proc descriptor", proc, "", AT_EMPTY_PATH);
+        statx_attributes_show("/dev/null descriptor", null, "", AT_EMPTY_PATH);
+    }
+    unlink(file);
+    unlink(link);
+    unlink(fifo);
+    unlink(gone);
+    rmdir(dir);
+    if (r) return r;
+    if (chdir("/proc")) return 4;
+    statx_attributes_show("cwd /proc", AT_FDCWD, "", AT_EMPTY_PATH);
+    statx_attributes_show("/proc as .", AT_FDCWD, ".", 0);
+    statx_attributes_show("/proc as self/..", AT_FDCWD, "self/..", 0);
+    return 0;
+}
 
 static int generated_rooted_links_case(const char *self) {
     if (!mkdtemp(grl_base)) return 1;
@@ -31731,6 +31798,67 @@ static int sysctl_constants_case(void) {
             if (w >= 0) close(w);
         }
         printf(" read=%ld\n", kc_read("random/poolsize", buf, sizeof buf));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("not root: child=%d\n", status);
+    return 0;
+}
+
+/* The sysctl-limits case's read of `path` into `buf` (NUL-ended): whether
+   it is one decimal number and a newline, its value in `value`. */
+static int sl_number(const char *path, char *buf, size_t size, long long *value) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    long n = read(fd, buf, size - 1);
+    close(fd);
+    buf[n < 0 ? 0 : n] = 0;
+    if (n < 2 || buf[n - 1] != '\n') return 0;
+    for (long i = 0; i < n - 1; i++)
+        if (buf[i] < '0' || buf[i] > '9') return 0;
+    *value = atoll(buf);
+    return 1;
+}
+/* The sysctl-limits case: /proc/sys/fs's nr_open and pipe-max-size and
+   /proc/sys/vm's max_map_count. Their values differ from machine to
+   machine, so their form shows, and what nr_open and pipe-max-size bound:
+   a hard RLIMIT_NOFILE past nr_open, and a pipe of someone other than root
+   grown past pipe-max-size. */
+static int sysctl_limits_case(void) {
+    char buf[64];
+    long long nr_open = 0, pipe_max = 0, map_count = 0;
+    printf("nr_open: formed=%d\n", sl_number("/proc/sys/fs/nr_open", buf, sizeof buf, &nr_open));
+    printf("pipe-max-size: formed=%d\n", sl_number("/proc/sys/fs/pipe-max-size", buf, sizeof buf, &pipe_max));
+    int formed = sl_number("/proc/sys/vm/max_map_count", buf, sizeof buf, &map_count);
+    printf("max_map_count: formed=%d positive=%d\n", formed, map_count > 0);
+    const char *writable[] = {"/proc/sys/fs/nr_open", "/proc/sys/fs/pipe-max-size"};
+    for (int i = 0; i < 2; i++) {
+        struct stat st;
+        int r = stat(writable[i], &st);
+        printf("%s: stat=%d mode=%o uid=%u size=%lld\n", writable[i], r, (unsigned)(st.st_mode & 07777),
+               (unsigned)st.st_uid, (long long)st.st_size);
+    }
+    struct rlimit limit;
+    getrlimit(RLIMIT_NOFILE, &limit);
+    printf("nr_open: least=%d hard-within=%d\n", nr_open >= 64, (long long)limit.rlim_max <= nr_open);
+    struct rlimit past = {limit.rlim_cur, (rlim_t)nr_open + 1};
+    printf("nr_open: past=%d\n", setrlimit(RLIMIT_NOFILE, &past) < 0 ? -errno : 0);
+    printf("pipe-max-size: page-power=%d\n", pipe_max >= 4096 && (pipe_max & (pipe_max - 1)) == 0);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 && (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(2);
+        int p[2];
+        if (pipe(p)) _exit(3);
+        long start = fcntl(p[0], F_GETPIPE_SZ);
+        long at = fcntl(p[0], F_SETPIPE_SZ, (int)pipe_max);
+        long beyond = fcntl(p[0], F_SETPIPE_SZ, (int)pipe_max + 1);
+        int beyond_errno = beyond < 0 ? errno : 0;
+        printf("not root: start-within=%d at-max=%d beyond=%d\n", start == (pipe_max < 65536 ? pipe_max : 65536),
+               at == pipe_max, beyond < 0 ? -beyond_errno : (int)beyond);
         fflush(stdout);
         _exit(0);
     }
@@ -45715,6 +45843,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
     if (!strcmp(mode, "sysctl-constants")) return sysctl_constants_case();
+    if (!strcmp(mode, "sysctl-limits")) return sysctl_limits_case();
     if (!strcmp(mode, "poll-default")) return poll_default_case();
     if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
     if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();
@@ -45793,6 +45922,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-rooted-links")) return generated_rooted_links_case(self);
     if (!strcmp(mode, "proc-links")) return proc_links_case(self);
     if (!strcmp(mode, "proc-links-ran")) return 7;
+    if (!strcmp(mode, "statx-attributes")) return statx_attributes_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

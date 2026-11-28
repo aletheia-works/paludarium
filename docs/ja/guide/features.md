@@ -270,6 +270,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   mountinfo の ID は 21 から始まり、Linux の内部のマウントも mountinfo に出ません。
   `AT_EMPTY_PATH` はディスクリプタを、`AT_FDCWD` なら作業ディレクトリを指し、Linux 6.11
   からと同じく、それとともに渡した空ポインタのパスも同じ扱いです。
+  `stx_attributes_mask` には、Linux 7.0 がどのファイルにも知っているとする属性
+  （`STATX_ATTR_AUTOMOUNT`、`STATX_ATTR_MOUNT_ROOT`、`STATX_ATTR_DAX`。ここでは最初と
+  最後を持つファイルはありません）が入ります。tmpfs と devtmpfs のファイル（シンボリック
+  リンク・特殊ファイル・memfd も）は、`shmem_getattr` と同じく `STATX_ATTR_IMMUTABLE`、
+  `STATX_ATTR_APPEND`、`STATX_ATTR_NODUMP` を加えます。`STATX_ATTR_MOUNT_ROOT` は、
+  マウントのルートなら、どのパス（`.`、`..`、途中のリンク、そのディスクリプタ）で指しても
+  立ちます。シンボリックリンク、マウントのルートでない chroot のルート、パイプやソケットの
+  ファイルには立ちません。`/proc/<pid>` のディレクトリは inode が `S_IMMUTABLE` でも、
+  Linux の proc の `getattr` が返さないのと同じく、`STATX_ATTR_IMMUTABLE` を持ちません。
 
 - `name_to_handle_at` はファイルのハンドルを返し、Linux（6.13 以降）と同じ順に確かめます。
   まずフラグ（`EINVAL`。`AT_HANDLE_CONNECTABLE` と `AT_HANDLE_FID` か `AT_EMPTY_PATH` を
@@ -569,10 +578,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/sys/fs/lease-break-time`（最初は 45）は root のモード 0644 のファイルで、どの `int`
   も受け取ります（`proc_dointvec`）。
 
+- `/proc/sys/fs/nr_open` と `/proc/sys/fs/pipe-max-size`（どちらも最初は 1048576）は
+  マシン全体のもので、`unsigned int` を受け取る root のモード 0644 のファイルです
+  （`proc_douintvec_minmax`）。`nr_open` は 64 から 2147483584 まで（それ以外は `EINVAL`）、
+  `pipe-max-size` は 32 ビットに切ってから、`round_pipe_size` と同じく 1 ページ以上の
+  2 のべき乗に切り上げ、2³¹ を超えると `EINVAL` です。`nr_open` は、ハードの
+  `RLIMIT_NOFILE`（超えると `EPERM`）と、Linux の表と同じように伸びる記述子の表を
+  縛ります。表は最初 64 個の記述子の場所を持ち、場所を超える番号は、その番号の入る
+  いちばん小さい 2 のべき乗まで表を伸ばします。ただし `nr_open`（64 の倍数に切り下げた
+  もの）も 2²⁷ 個も超えません。伸ばせない番号は `EMFILE`（`dup2` と `dup3` では
+  `EBADF`）です。伸びた表は、`nr_open` が下がっても場所を保ちます。表の写し（`fork`、
+  `CLONE_FILES` のない `clone`、`unshare(CLONE_FILES)`、`CLOSE_RANGE_UNSHARE`、表を
+  共有するスレッドの exec）は、使っているいちばん大きい番号の分の場所を 64 刻みで持ち、
+  `close_range` が閉じる番号は数えません。`nr_open` がそれだけの場所を許さなくなって
+  いれば `EMFILE` で失敗し、exec は後戻りできない点を過ぎているので `SIGSEGV` で
+  終わります。埋め込む側が決めた開けるファイルの天井は、root が `nr_open` に何を書いても、
+  `nr_open` とは別にハードの上限を縛ります。
+
 - パイプは Linux と同じく 1 ページのバッファーを 16 個（64 KiB）持ちます。`fcntl` の
   `F_SETPIPE_SZ` と `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。
   大きさは 1 ページ以上の 2 のべき乗で、使っているバッファーより少なくすると `EBUSY`、
-  2³¹ を超えると `EINVAL` です。書き込みのうちページに満たない分は、`anon_pipe_write`
+  2³¹ を超えると `EINVAL` です。`CAP_SYS_RESOURCE` がなければ、`alloc_pipe_info` と
+  `pipe_set_size` と同じく、新しいパイプや FIFO は `/proc/sys/fs/pipe-max-size` までしか
+  持たず、`F_SETPIPE_SZ` でそれを超えて伸ばすこともできません（`EPERM`）。書き込みのうちページに満たない分は、`anon_pipe_write`
   と同じく、空きのある最後のバッファーに加わり、残りは新しいバッファーに入ります。
   `splice`、`tee`、`vmsplice` は、書き込みの加わらない自分のバッファーを作ります。
 
@@ -2770,7 +2798,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     続けてその送り元から経路を引き当てます（`ip_route_connect`）。ソケットのフローは自分の
     ポートをハッシュします。UDP のソケットは経路より先にポートを持ち（`inet_send_prepare`、
     `inet_dgram_connect`）、まだポートのない接続は乱数のポートをハッシュします
-    （`FLOWI_FLAG_ANY_SPORT`）。答えは自分のポートをハッシュします。パケットは、その送り元への
+    （`FLOWI_FLAG_ANY_SPORT`）。答えは自分のポートをハッシュします。IPv4 の port
+    unreachable は、それが知らせるデータグラムで経路を引き当て（`icmp_route_lookup`）、
+    `RTM_GETROUTE` のパケットと同じくハッシュします。ただしポリシー 1 では、connect
+    されたソケットからのデータグラムは、そのソケットが与えた乱数のフローのハッシュで
+    ハッシュします（`sk_txhash`、`skb_set_hash_from_sk`）。パケットは、その送り元への
     経路のどのホップのデバイスからも入れます（`fib_info_nh_uses_dev`）。その答えは自分の
     引き当てで選ばれる端か、リスナーがバインドされている端を通って返ります。端を
     通る出力の経路の検索は、端の最初のプライマリアドレスから、なければほかのデバイスの
@@ -4262,8 +4294,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ポーリングが、`POLLOUT` のない `POLLIN`、`POLLRDNORM`、`POLLERR`、`POLLPRI` を返します。
   見たかどうかは `dup` と子で共有します。それを見張る epoll のポーリングも、見たことになります。
 
-- `/proc/sys/vm` にあるのは `drop_caches` と `unprivileged_userfaultfd` だけなので、
-  ほかの `vm` の sysctl もある Linux とは一覧が違います。`unprivileged_userfaultfd` は
+- `/proc/sys/vm` にあるのは `drop_caches`、`max_map_count`、`unprivileged_userfaultfd`
+  だけなので、ほかの `vm` の sysctl もある Linux とは一覧が違います。`max_map_count` は
+  マシンの 65530（`DEFAULT_MAX_MAP_COUNT`）で、root のモード 0444 のファイルです。ここでは
+  プロセスのマッピングをこれで縛らないので、誰も書くために開けません（`EACCES`）。
+  `unprivileged_userfaultfd` は
   マシンのもので、初めは 0、root のモード 0644 のファイルで、書くために開けるのは root
   だけです。0 か 1 を受け付けます（`proc_dointvec_minmax`、ほかは `EINVAL`）。Linux の `fs/drop_caches.c` と同じく、このファイルは root の
   もので、モードは 0200 です。読むためには root でも開けず（`EACCES`。`test_perm` は root
@@ -4428,8 +4463,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ところです。自身のアドレスへのものはループバックを通り、veth の端からのものはピアへ行きます。
     ブロードキャストやグループへのものは、受け取る者がいてもいなくても 1 回で、送り手自身の
     コピーは数えずに戻ります（`dev_loopback_xmit`）。それに答える ICMP の port unreachable
-    も数えます。元のパケットは 576 バイト（IPv6 は 1280）に収まる分だけ引用します（`icmp_send`、
-    `icmp6_send`）。ARP の要求とその答え（`arp_send`）も数えます。数えないものは
+    も、それ自身の経路が通る端で数えます。元のパケットは 576 バイト（IPv6 は 1280）に
+    収まる分だけ引用します（`icmp_send`、`icmp6_send`）。ARP の要求とその答え（`arp_send`）と、
+    TCP の各セグメント（いくつかをまとめた GSO のバッファは 1 つ。`__tcp_transmit_skb`）も数えます。
+    TCP ヘッダは、SYN と SYN-ACK がそのオプション込み、閉じたポートへのリセットがオプションなし
+    （`tcp_v4_send_reset`）、ほかはタイムスタンプとその SACK ブロック込み（`tcp_options_write`）です。数えないものは
     [制限事項](./limitations) にあります。
   - `igmp`（`igmp_mc_seq_show`）は、デバイスごとの IPv4 のグループで、新しいものから順に、
     その利用者の数と並びます。その上には、デバイスの行があり、グループの数と問い合わせ元の
@@ -5143,6 +5181,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スレッドのものを）、`execve`（`PERF_RECORD_MISC_COMM_EXEC`）で書き、`execve` はそのあと新しい
   プログラムのスタックとマッピングを書きます。`PERF_RECORD_FORK` と `EXIT`
   （`task`、またはほかのどれか）は、スレッドが作られたときと終わったときに書きます。
+  `namespaces`（`CAP_PERFMON` が要ります）では、スレッドの名前空間の
+  `PERF_RECORD_NAMESPACES` を書きます。net、uts、ipc、pid、user、mnt、cgroup の
+  `/proc/<pid>/ns` のファイルそれぞれのデバイスと inode を含みます。新しいスレッドや子のものは
+  作ったスレッドが書きます。スレッドのものは、成功した `unshare` のたびに（新しい名前空間が
+  なくても）、また `setns` のたびに書きます。
   `context_switch` では、スレッドが眠るたびに `PERF_RECORD_SWITCH`（CPU のイベントには、
   代わりに動いたスレッドを含む `SWITCH_CPU_WIDE`）を書きます。
   `PERF_RECORD_MISC_SWITCH_OUT` の付いたものと、ふたたび動くときの付かないものの二つです。
@@ -5667,7 +5710,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux の `signalfd_notify` が、そのたびにファイルを起こすのと同じで、ほかのスレッドが
   まだ取り込んでいなくても、送られたときに数えます。同じ番号が
   待っているリアルタイムシグナルも数え、すでに保留されている標準のシグナルや、
-  ブロックされずに無視されるシグナルは数えません。マスクが変わるのもエッジです。
+  ブロックされずに無視されるシグナルは数えません。入れ子の PID 名前空間の init が、
+  ハンドラがないのでブロックされていなければ捨てるシグナル（`SIGNAL_UNKILLABLE`）も
+  数えません。マスクが変わるのもエッジです。
   signalfd のディスクリプタに `signalfd` を呼ぶと
   マスクが変わります（ほかのファイルなら `EINVAL`）。`SIGKILL` と `SIGSTOP` は
   マスクに入りません。アクションが `SA_IMMUTABLE`（下に書きます）のシグナルは、Linux master の
@@ -6013,8 +6058,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
   8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ハードの
-  `RLIMIT_NOFILE` は 1048576（Linux の `fs.nr_open`）まで、埋め込む側がそれより低い
-  天井を決めたときはその値まで上げられます。ハードの上限を上げるには
+  `RLIMIT_NOFILE` は `fs.nr_open`（最初は 1048576 で、root が `/proc/sys/fs/nr_open` で
+  変えられます）まで、埋め込む側がそれより低い天井を決めたときはその値まで上げられます。ハードの上限を上げるには
   `CAP_SYS_RESOURCE` が必要です（`EPERM`）。ほかのスレッドへの `prlimit64` は、読むにも
   書くにも、`CAP_SYS_RESOURCE` があるか、呼んだ側の実ユーザー ID と実グループ ID が相手の
   実、実効、保存の ID すべてと同じであることが必要です（`EPERM`。知らない資源より先に

@@ -115,6 +115,12 @@ fn join(
             Some(open) => open.open_again(flags)?,
             None => {
                 let [reader, _] = PipeEnd::fifo(node, Arc::clone(&c.files.readiness))?;
+                reader.start_within(
+                    c.processes.sysctls.pipe_max_size(),
+                    c.process
+                        .credentials
+                        .capable(crate::credentials::CAP_SYS_RESOURCE),
+                );
                 reader.open_again(flags)?
             }
         };

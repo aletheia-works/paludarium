@@ -536,30 +536,42 @@ fn early(c: &Context<'_>, attr: &[u8], insns: &[Insn]) -> Result<(), bpf_verifie
     Ok(())
 }
 
-/// `bpf_prog_calc_tag`: the first 8 bytes of the SHA-256 of the
-/// instructions, with the descriptors of maps in BPF_LD_IMM64 taken out.
+/// A program's tag: the first 8 bytes of the SHA-256 of its instructions,
+/// 8 bytes each as the program gave them, except that no map's descriptor
+/// counts. A 16-byte load of a map (`BPF_LD | BPF_IMM | BPF_DW` whose
+/// source is 1, a map's descriptor, or 2, a value in one) counts with its
+/// immediate as 0, and so does the instruction after it when that is a
+/// bare second half (its fields all 0 but the immediate). The slot after
+/// such a load is its second half whatever it holds, so it never counts
+/// as a map load itself.
 fn tag(insns: &[Insn]) -> [u8; 8] {
-    let mut bytes = Vec::with_capacity(insns.len() * 8);
-    let mut was_ld_map = false;
-    for insn in insns {
-        let mut imm = insn.imm;
-        if !was_ld_map && insn.code == 0x18 && matches!(insn.src, 1 | 2) {
-            was_ld_map = true;
-            imm = 0;
-        } else if was_ld_map && insn.code == 0 && insn.dst == 0 && insn.src == 0 && insn.off == 0 {
-            was_ld_map = false;
-            imm = 0;
-        } else {
-            was_ld_map = false;
+    let map_load = |insn: &Insn| insn.code == 0x18 && matches!(insn.src, 1 | 2);
+    let bare = |insn: &Insn| (insn.code, insn.dst, insn.src, insn.off) == (0, 0, 0, 0);
+    let mut counted = insns.to_vec();
+    let mut at = 0;
+    while let Some(insn) = counted.get_mut(at) {
+        if !map_load(insn) {
+            at += 1;
+            continue;
         }
-        bytes.push(insn.code);
-        bytes.push(insn.src << 4 | insn.dst);
-        bytes.extend(insn.off.to_le_bytes());
-        bytes.extend(imm.to_le_bytes());
+        insn.imm = 0;
+        if let Some(second) = counted.get_mut(at + 1)
+            && bare(second)
+        {
+            second.imm = 0;
+        }
+        at += 2;
     }
-    let digest = sha256(&bytes);
+    let bytes: Vec<u8> = counted
+        .iter()
+        .flat_map(|insn| {
+            let [o0, o1] = insn.off.to_le_bytes();
+            let [i0, i1, i2, i3] = insn.imm.to_le_bytes();
+            [insn.code, insn.src << 4 | insn.dst, o0, o1, i0, i1, i2, i3]
+        })
+        .collect();
     let mut out = [0; 8];
-    out.copy_from_slice(&digest[..8]);
+    out.copy_from_slice(&sha256(&bytes)[..8]);
     out
 }
 
@@ -1098,6 +1110,68 @@ mod tests {
             tag(&[insn(0x18, 0, 9), insn(0, 0, 0)])
         );
     }
+
+    /// Tags of programs around map loads, pinned as they were before the
+    /// tag was written in its own way: which immediates count, and which
+    /// instruction is taken as a map load's second half.
+    #[test]
+    fn tags_of_programs_around_map_loads_are_pinned() {
+        let i = |code: u8, dst: u8, src: u8, off: i16, imm: i32| Insn {
+            code,
+            dst,
+            src,
+            off,
+            imm,
+        };
+        let bare = |imm| i(0, 0, 0, 0, imm);
+        let exit = i(0x95, 0, 0, 0, 0);
+        let programs: Vec<Vec<Insn>> = vec![
+            vec![exit],
+            vec![i(0xb7, 0, 0, 0, 7), exit],
+            // A map by descriptor and by value, with a second half.
+            vec![i(0x18, 1, 1, 0, 5), bare(9), exit],
+            vec![i(0x18, 1, 2, 0, 5), bare(9), exit],
+            // Other sources keep their immediates.
+            vec![i(0x18, 1, 0, 0, 5), bare(9), exit],
+            vec![i(0x18, 1, 3, 0, 5), bare(9), exit],
+            vec![i(0x18, 1, 4, 0, 5), bare(9), exit],
+            // A second half that is not bare keeps its immediate.
+            vec![i(0x18, 1, 1, 0, 5), i(0, 1, 0, 0, 9), exit],
+            vec![i(0x18, 1, 1, 0, 5), i(0, 0, 0, 1, 9), exit],
+            vec![i(0x18, 1, 1, 0, 5), i(0x18, 1, 1, 0, 9), bare(4), exit],
+            // Two map loads in a row, and one at the end.
+            vec![
+                i(0x18, 1, 1, 0, 5),
+                bare(9),
+                i(0x18, 2, 2, 0, 6),
+                bare(8),
+                exit,
+            ],
+            vec![exit, i(0x18, 1, 1, 0, 5)],
+            // A bare instruction with no map load before it.
+            vec![bare(3), exit],
+        ];
+        let tags: Vec<String> = programs
+            .iter()
+            .map(|p| tag(p).iter().map(|b| format!("{b:02x}")).collect())
+            .collect();
+        assert_eq!(tags, PINNED_TAGS);
+    }
+    const PINNED_TAGS: [&str; 13] = [
+        "e1425229c865ac8b",
+        "9efe8873120741b3",
+        "846a7cf7f6566d88",
+        "28c7446ad861bb21",
+        "041926e44dc4d9bf",
+        "bef723e0b05f433b",
+        "20c4e3b7532641e1",
+        "48f87ba874b3e293",
+        "0f759d5078c0296d",
+        "fc9fac9e34be4af4",
+        "79dea481a1d8ade3",
+        "303b33b78f34226a",
+        "4a435f1781ec819c",
+    ];
 
     #[test]
     fn the_gpl_compatible_licenses_are_linuxs() {

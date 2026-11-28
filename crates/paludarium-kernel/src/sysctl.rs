@@ -63,6 +63,15 @@
 //! `kernel/seccomp.c`; and `kernel/random` the files of
 //! `drivers/char/random.c`, of which `urandom_min_reseed_secs` and
 //! `write_wakeup_threshold` are of mode 0644 and take a write to no effect.
+//! `/proc/sys/vm/max_map_count` is one too, which nothing here enforces.
+//!
+//! `/proc/sys/fs/nr_open` and `/proc/sys/fs/pipe-max-size` are the
+//! machine's `unsigned int`s (`proc_douintvec_minmax`), root's of mode 0644:
+//! `nr_open` from 64 to `INT_MAX` cut to a multiple of 64, which bounds
+//! RLIMIT_NOFILE and how far a descriptor table grows
+//! ([`crate::files::Files`]), and `pipe-max-size` rounded as `fs/pipe.c`'s
+//! `round_pipe_size` rounds it, which bounds the pipes of a user without
+//! `CAP_SYS_RESOURCE` ([`crate::sockets::PipeEnd::set_size`]).
 //!
 //! `/proc/sys/kernel` also shows the names of the UTS namespace of who
 //! reads or writes ([`Uts`]), as `kernel/utsname_sysctl.c` has them: strings
@@ -102,7 +111,7 @@ use crate::syscalls::Context;
 use crate::users::Ids as Kind;
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat};
 use paludarium_types::Errno;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 const DT_DIR: u8 = 4;
@@ -434,6 +443,11 @@ pub(crate) enum Kernel {
     /// `kernel.yama.ptrace_scope`, the machine's, under
     /// `/proc/sys/kernel/yama`.
     PtraceScope,
+    /// `/proc/sys/fs/nr_open` (`fs/file_table.c`) and
+    /// `/proc/sys/fs/pipe-max-size` (`fs/pipe.c`), the machine's
+    /// `unsigned int`s.
+    NrOpen,
+    PipeMaxSize,
 }
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
@@ -484,9 +498,11 @@ const KERNEL: [(&[u8], Entry); 25] = [
 /// A file of `/proc/sys/kernel` that no write changes: the machine's
 /// `cap_last_cap` and `ngroups_max` (`kernel/sysctl.c`), seccomp's
 /// `actions_avail` (`kernel/seccomp.c`) and the files of `kernel/random`
-/// (`drivers/char/random.c`).
+/// (`drivers/char/random.c`); and the machine's `vm.max_map_count`
+/// (`mm/mmap.c`), which nothing here enforces and no one writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Constant {
+    MaxMapCount,
     CapLastCap,
     NgroupsMax,
     ActionsAvail,
@@ -514,6 +530,19 @@ const RANDOM: [(&[u8], Constant); 6] = [
 /// as each is once a machine has booted (`POOL_READY_BITS`).
 const POOL_BITS: i32 = 256;
 
+/// `vm.max_map_count` (`DEFAULT_MAX_MAP_COUNT`).
+const MAX_MAP_COUNT: i32 = u16::MAX as i32 - 5;
+
+/// `fs.nr_open` at first, and the least and most a write may set it to
+/// (`sysctl_nr_open`, `sysctl_nr_open_min`, `sysctl_nr_open_max`): 2^20,
+/// `BITS_PER_LONG`, and `INT_MAX` cut to a multiple of `BITS_PER_LONG`.
+pub(crate) const NR_OPEN: u32 = 1 << 20;
+const NR_OPEN_MIN: u32 = 64;
+const NR_OPEN_MAX: u32 = i32::MAX as u32 & !63;
+
+/// `fs.pipe-max-size` at first (`pipe_max_size`).
+const PIPE_MAX_SIZE: u32 = 1 << 20;
+
 impl Constant {
     /// Whether it is root's of mode 0644, whose write Linux's
     /// `proc_do_rointvec` takes whole and ignores; the others are 0444.
@@ -531,6 +560,9 @@ impl Constant {
             Self::EntropyAvail | Self::Poolsize | Self::WriteWakeupThreshold => POOL_BITS,
             // `CRNG_RESEED_INTERVAL / HZ`.
             Self::UrandomMinReseedSecs => 60,
+            // `DEFAULT_MAX_MAP_COUNT`: `USHRT_MAX` less the margin an ELF
+            // core keeps (`MAPCOUNT_ELF_CORE_MARGIN`).
+            Self::MaxMapCount => MAX_MAP_COUNT,
             Self::ActionsAvail | Self::BootId | Self::Uuid => return None,
         })
     }
@@ -585,6 +617,8 @@ impl Kernel {
                 | Self::DirNotifyEnable
                 | Self::UnprivilegedUserfaultfd
                 | Self::PtraceScope
+                | Self::NrOpen
+                | Self::PipeMaxSize
         )
     }
     /// Whether it is one of the IPC namespace's next IDs.
@@ -610,6 +644,10 @@ pub(crate) struct Machine {
     leases_enable: AtomicI32,
     lease_break_time: AtomicI32,
     dir_notify_enable: AtomicI32,
+    /// `fs.nr_open`, which every descriptor table looks at as it grows
+    /// ([`crate::files::Files`]).
+    pub(crate) nr_open: Arc<AtomicU32>,
+    pipe_max_size: AtomicU32,
     /// `kernel.random.boot_id` once drawn (`sysctl_bootid`).
     boot_id: std::sync::OnceLock<[u8; 16]>,
     /// How often `kernel.hostname` and `kernel.domainname` changed, in any
@@ -631,6 +669,8 @@ impl Default for Machine {
             leases_enable: AtomicI32::new(1),
             lease_break_time: AtomicI32::new(45),
             dir_notify_enable: AtomicI32::new(1),
+            nr_open: Arc::new(AtomicU32::new(NR_OPEN)),
+            pipe_max_size: AtomicU32::new(PIPE_MAX_SIZE),
             boot_id: std::sync::OnceLock::new(),
             uts_events: Default::default(),
         }
@@ -686,6 +726,16 @@ impl Machine {
     pub(crate) fn lease_break_time(&self) -> i32 {
         self.lease_break_time.load(Ordering::SeqCst)
     }
+    /// The most descriptors a table may grow to hold, and the highest
+    /// RLIMIT_NOFILE hard limit a process may set (`sysctl_nr_open`).
+    pub(crate) fn nr_open(&self) -> u32 {
+        self.nr_open.load(Ordering::SeqCst)
+    }
+    /// The most bytes a pipe of a user without `CAP_SYS_RESOURCE` may hold,
+    /// a power of two of at least a page (`pipe_max_size`).
+    pub(crate) fn pipe_max_size(&self) -> u32 {
+        self.pipe_max_size.load(Ordering::SeqCst)
+    }
     /// Whether `F_NOTIFY` may be used (`dir_notify_enable`).
     pub(crate) fn dir_notify_enable(&self) -> bool {
         self.dir_notify_enable.load(Ordering::SeqCst) != 0
@@ -707,6 +757,11 @@ impl Machine {
         self.ptrace_scope.load(Ordering::SeqCst)
     }
     fn line(&self, file: Kernel) -> Vec<u8> {
+        match file {
+            Kernel::NrOpen => return format!("{}\n", self.nr_open()).into_bytes(),
+            Kernel::PipeMaxSize => return format!("{}\n", self.pipe_max_size()).into_bytes(),
+            _ => {}
+        }
         line(match file {
             Kernel::PtraceScope => self.ptrace_scope(),
             Kernel::UnprivilegedUserfaultfd => self.unprivileged_userfaultfd.load(Ordering::SeqCst),
@@ -739,6 +794,31 @@ impl Machine {
             let (value, consumed) = parse(buf, None)?;
             sysctl.store(value, Ordering::SeqCst);
             return Ok(consumed);
+        }
+        match file {
+            // `proc_douintvec_minmax`.
+            Kernel::NrOpen => {
+                let (value, consumed) = parse_unsigned(buf)?;
+                if !(NR_OPEN_MIN..=NR_OPEN_MAX).contains(&value) {
+                    return Err(Errno::EINVAL);
+                }
+                self.nr_open.store(value, Ordering::SeqCst);
+                return Ok(consumed);
+            }
+            // `proc_dopipe_max_size`: the value, cut to an `unsigned int`,
+            // rounds up to a power of two of at least a page; one past
+            // 2^31 rounds to nothing, which is below the least, 1.
+            Kernel::PipeMaxSize => {
+                let (negative, value, consumed) = scan(buf)?;
+                let size = value as u32;
+                if negative || size > 1 << 31 {
+                    return Err(Errno::EINVAL);
+                }
+                self.pipe_max_size
+                    .store(size.max(4096).next_power_of_two(), Ordering::SeqCst);
+                return Ok(consumed);
+            }
+            _ => {}
         }
         match file {
             // `perf_cpu_time_max_percent_handler`: 0 to 100, where 0 and
@@ -884,6 +964,8 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/fs/dir-notify-enable" => Some(Entry::Kernel(Kernel::DirNotifyEnable)),
         b"/fs/lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
         b"/fs/leases-enable" => Some(Entry::Kernel(Kernel::LeasesEnable)),
+        b"/fs/nr_open" => Some(Entry::Kernel(Kernel::NrOpen)),
+        b"/fs/pipe-max-size" => Some(Entry::Kernel(Kernel::PipeMaxSize)),
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
         b"/kernel/yama" => Some(Entry::Directory(Directory::Yama)),
         b"/kernel/yama/ptrace_scope" => Some(Entry::Kernel(Kernel::PtraceScope)),
@@ -892,6 +974,7 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/kernel/seccomp/actions_avail" => Some(Entry::Constant(Constant::ActionsAvail)),
         b"/vm" => Some(Entry::Directory(Directory::Vm)),
         b"/vm/drop_caches" => Some(Entry::DropCaches),
+        b"/vm/max_map_count" => Some(Entry::Constant(Constant::MaxMapCount)),
         b"/vm/unprivileged_userfaultfd" => Some(Entry::Kernel(Kernel::UnprivilegedUserfaultfd)),
         _ => {
             if let Some(rest) = rest.strip_prefix(b"/net")
@@ -955,6 +1038,7 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
         ],
         Directory::Vm => vec![
             (b"drop_caches", DT_REG),
+            (b"max_map_count", DT_REG),
             (b"unprivileged_userfaultfd", DT_REG),
         ],
         Directory::Net => vec![(b"ipv4", DT_DIR), (b"ipv6", DT_DIR)],
@@ -986,6 +1070,8 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
             (b"lease-break-time", DT_REG),
             (b"leases-enable", DT_REG),
             (b"mqueue", DT_DIR),
+            (b"nr_open", DT_REG),
+            (b"pipe-max-size", DT_REG),
         ],
         Directory::Mqueue => SETTINGS.iter().map(|&(name, _)| (name, DT_REG)).collect(),
         Directory::Inotify => INOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
@@ -1067,6 +1153,7 @@ fn child(
         },
         Directory::Vm => match name {
             b"drop_caches" => Some(Entry::DropCaches),
+            b"max_map_count" => Some(Entry::Constant(Constant::MaxMapCount)),
             b"unprivileged_userfaultfd" => Some(Entry::Kernel(Kernel::UnprivilegedUserfaultfd)),
             _ => None,
         },
@@ -1122,6 +1209,8 @@ fn child(
             b"lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
             b"leases-enable" => Some(Entry::Kernel(Kernel::LeasesEnable)),
             b"mqueue" => dir(Directory::Mqueue),
+            b"nr_open" => Some(Entry::Kernel(Kernel::NrOpen)),
+            b"pipe-max-size" => Some(Entry::Kernel(Kernel::PipeMaxSize)),
             _ => None,
         },
         Directory::Mqueue => find(&SETTINGS.map(|(n, s)| (n, Entry::Setting(s)))),
@@ -1200,7 +1289,9 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         | Kernel::LeaseBreakTime
         | Kernel::DirNotifyEnable
         | Kernel::UnprivilegedUserfaultfd
-        | Kernel::PtraceScope => Vec::new(),
+        | Kernel::PtraceScope
+        | Kernel::NrOpen
+        | Kernel::PipeMaxSize => Vec::new(),
     }
 }
 
@@ -1283,7 +1374,9 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
         | Kernel::LeaseBreakTime
         | Kernel::DirNotifyEnable
         | Kernel::UnprivilegedUserfaultfd
-        | Kernel::PtraceScope => Err(Errno::EINVAL),
+        | Kernel::PtraceScope
+        | Kernel::NrOpen
+        | Kernel::PipeMaxSize => Err(Errno::EINVAL),
     }
 }
 
@@ -2288,6 +2381,18 @@ fn parse_uint(buf: &[u8]) -> Result<u32, Errno> {
     }
 }
 
+/// One `unsigned int` written to a sysctl, as Linux's `do_proc_douintvec_w`
+/// reads it ([`scan`]): the value and the bytes taken. `EINVAL` as [`scan`]
+/// gives it, for a negative one and for one an `unsigned int` cannot hold.
+fn parse_unsigned(buf: &[u8]) -> Result<(u32, usize), Errno> {
+    match scan(buf)? {
+        (false, value, consumed) => {
+            Ok((u32::try_from(value).map_err(|_| Errno::EINVAL)?, consumed))
+        }
+        (true, ..) => Err(Errno::EINVAL),
+    }
+}
+
 /// The `int`s of a vector written to a sysctl, as Linux's
 /// `__do_proc_dointvec` reads them into `values`: each as [`parse`] reads
 /// one, until the end or the last of `values`. A bad one ends it with
@@ -2412,7 +2517,15 @@ mod tests {
             lookup(b"/proc/sys/fs/dir-notify-enable", None),
             Some(Entry::Kernel(Kernel::DirNotifyEnable))
         );
-        assert_eq!(entries_of(Directory::Fs, None).len(), 10);
+        assert_eq!(entries_of(Directory::Fs, None).len(), 12);
+        assert_eq!(
+            lookup(b"/proc/sys/fs/nr_open", None),
+            Some(Entry::Kernel(Kernel::NrOpen))
+        );
+        assert_eq!(
+            lookup(b"/proc/sys/fs/pipe-max-size", None),
+            Some(Entry::Kernel(Kernel::PipeMaxSize))
+        );
         assert_eq!(
             lookup(b"/proc/sys/fs/inotify", None),
             Some(Entry::Directory(Directory::Inotify))
@@ -2443,7 +2556,11 @@ mod tests {
             lookup(b"/proc/sys/vm/drop_caches", None),
             Some(Entry::DropCaches)
         );
-        assert_eq!(entries_of(Directory::Vm, None).len(), 4);
+        assert_eq!(entries_of(Directory::Vm, None).len(), 5);
+        assert_eq!(
+            lookup(b"/proc/sys/vm/max_map_count", None),
+            Some(Entry::Constant(Constant::MaxMapCount))
+        );
         assert_eq!(entries_of(Directory::Kernel, None).len(), 30);
         assert_eq!(
             lookup(b"/proc/sys/kernel/random/uuid", None),
@@ -2612,6 +2729,54 @@ mod tests {
                 b"forwarding"
             ]
         );
+    }
+
+    #[test]
+    fn nr_open_and_pipe_max_size_take_what_linux_s_handlers_take() {
+        let machine = Machine::default();
+        let read = |file| String::from_utf8(machine.line(file)).unwrap();
+        assert_eq!(read(Kernel::NrOpen), "1048576\n");
+        assert_eq!(read(Kernel::PipeMaxSize), "1048576\n");
+        // `proc_douintvec_minmax` from `BITS_PER_LONG` to `INT_MAX` cut to
+        // a multiple of it; what is out of them is `EINVAL`.
+        assert_eq!(machine.write(Kernel::NrOpen, b"64\n"), Ok(3));
+        assert_eq!(machine.nr_open(), 64);
+        assert_eq!(machine.write(Kernel::NrOpen, b"2147483584 9"), Ok(11));
+        assert_eq!(machine.nr_open(), 2_147_483_584);
+        for bad in [&b"63"[..], b"2147483585", b"-1", b"4294967296", b"x"] {
+            assert_eq!(
+                machine.write(Kernel::NrOpen, bad),
+                Err(Errno::EINVAL),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(machine.nr_open(), 2_147_483_584);
+        // `proc_dopipe_max_size`: rounded up to a power of two of at least
+        // a page, after the value is cut to an `unsigned int`.
+        for (written, size) in [
+            (&b"0"[..], 4096),
+            (b"4097", 8192),
+            (b"2147483648", 1 << 31),
+            (b"4294971392", 4096),
+        ] {
+            assert_eq!(
+                machine.write(Kernel::PipeMaxSize, written),
+                Ok(written.len())
+            );
+            assert_eq!(machine.pipe_max_size(), size, "{written:?}");
+        }
+        assert_eq!(read(Kernel::PipeMaxSize), "4096\n");
+        for bad in [&b"2147483649"[..], b"-4096", b"4294967295"] {
+            assert_eq!(
+                machine.write(Kernel::PipeMaxSize, bad),
+                Err(Errno::EINVAL),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(machine.pipe_max_size(), 4096);
+        // `vm.max_map_count` reads `DEFAULT_MAX_MAP_COUNT`, of mode 0444.
+        assert_eq!(Constant::MaxMapCount.int(), Some(65530));
+        assert!(!Constant::MaxMapCount.writable());
     }
 
     #[test]

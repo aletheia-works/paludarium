@@ -2,11 +2,12 @@
 //! to the buffers of the events that ask for them: `PERF_RECORD_MMAP` and
 //! `MMAP2` of a mapping (`perf_event_mmap`), `COMM` of a new name
 //! (`perf_event_comm`), `FORK` and `EXIT` of a task
-//! (`perf_event_task`), and `SWITCH` or `SWITCH_CPU_WIDE` of a thread that
-//! went to sleep and runs again (`perf_event_switch`). Each goes to the
-//! enabled events of the CPU of the thread that writes it and those that
-//! count it (`perf_iterate_sb`), through the buffer that event writes to,
-//! with the `sample_id` of that thread.
+//! (`perf_event_task`), `NAMESPACES` of a task's namespaces
+//! (`perf_event_namespaces`), and `SWITCH` or `SWITCH_CPU_WIDE` of a
+//! thread that went to sleep and runs again (`perf_event_switch`). Each
+//! goes to the enabled events of the CPU of the thread that writes it and
+//! those that count it (`perf_iterate_sb`), through the buffer that event
+//! writes to, with the `sample_id` of that thread.
 
 use super::sample::{Who, header, put};
 use super::{Event, Events, bit, lock};
@@ -22,6 +23,7 @@ const RECORD_FORK: u32 = 7;
 const RECORD_MMAP2: u32 = 10;
 const RECORD_SWITCH: u32 = 14;
 const RECORD_SWITCH_CPU_WIDE: u32 = 15;
+const RECORD_NAMESPACES: u32 = 16;
 
 const MISC_USER: u16 = 2;
 const MISC_COMM_EXEC: u16 = 1 << 13;
@@ -42,6 +44,13 @@ pub(super) fn asks(attr: &super::Attr) -> bool {
     [bit::MMAP, bit::COMM, bit::TASK, bit::MMAP_DATA, bit::MMAP2]
         .iter()
         .any(|&b| attr.flag(b))
+}
+
+/// Whether `attr` is of an event that takes side-band records of the CPU
+/// (`account_pmu_sb_event`): one that asks for those [`asks`] gives, or for
+/// `namespaces` or `context_switch`, which a task's records do not go to.
+pub(super) fn attached(attr: &super::Attr) -> bool {
+    asks(attr) || attr.flag(bit::NAMESPACES) || attr.flag(bit::CONTEXT_SWITCH)
 }
 
 /// Whether an event that asks for side-band records has been opened, so
@@ -257,6 +266,47 @@ pub(crate) fn switched(
     while let Some(cpu) = each.next() {
         write(MISC_SWITCH_OUT, cpu);
         write(0, each.peek().copied().unwrap_or(who.cpu));
+    }
+}
+
+/// `perf_event_namespaces`: thread `tid` of process `pid` is in
+/// `namespaces`, as thread `who` of `group` made it (`fork`) or as it
+/// changed them itself (`unshare` and `setns`). Each event with
+/// `namespaces` takes its IDs as the event's PID namespace numbers them
+/// and the device and inode of its `/proc/<pid>/ns` file of each kind, in
+/// the order of the record's indexes: net, uts, ipc, pid, user, mnt and
+/// cgroup.
+pub(crate) fn namespaces(
+    events: &Events,
+    group: &ThreadGroup,
+    who: &Who,
+    (pid, tid): (u32, u32),
+    namespaces: &crate::namespaces::Namespaces,
+) {
+    if !wanted(events) {
+        return;
+    }
+    let kinds = [
+        &namespaces.net,
+        &namespaces.uts,
+        &namespaces.ipc,
+        &namespaces.pid,
+        &namespaces.user,
+        &namespaces.mnt,
+        &namespaces.cgroup,
+    ];
+    let mut links = Vec::with_capacity(8 + 16 * kinds.len());
+    put(&mut links, kinds.len() as u64);
+    for namespace in kinds {
+        put(&mut links, crate::namespaces::DEVICE);
+        put(&mut links, u64::from(namespace.inode));
+    }
+    for event in receivers(events, group, who.tid, who, |attr| {
+        attr.flag(bit::NAMESPACES)
+    }) {
+        let mut body = event.pid_tid_of(pid, tid).to_vec();
+        body.extend_from_slice(&links);
+        event.side_band(RECORD_NAMESPACES, 0, &body, who);
     }
 }
 

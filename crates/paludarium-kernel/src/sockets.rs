@@ -496,16 +496,31 @@ impl PipeEnd {
         let _held = self.hold();
         self.endpoint.pair.window() as u64
     }
+    /// Gives a new pipe of a maker without `CAP_SYS_RESOURCE` (`resource`)
+    /// no more room than `fs.pipe-max-size` (`max_size`), as Linux's
+    /// `alloc_pipe_info` does.
+    pub(crate) fn start_within(&self, max_size: u32, resource: bool) {
+        if PIPE_DEFAULT > max_size as usize && !resource {
+            self.endpoint
+                .pair
+                .window
+                .store(max_size as usize, Ordering::SeqCst);
+        }
+    }
     /// `F_SETPIPE_SZ`, as Linux's `pipe_set_size`: the size rounds up to a
-    /// power of two of at least a page (`EINVAL` past 2^31), and may not drop
-    /// below the pages the unread data fills (`EBUSY`). The guest is root,
-    /// so no limit applies. Returns the new size.
-    pub(crate) fn set_size(&self, size: u32) -> Result<u64, Errno> {
+    /// power of two of at least a page (`EINVAL` past 2^31), may grow past
+    /// `fs.pipe-max-size` (`max_size`) only with `CAP_SYS_RESOURCE`
+    /// (`resource`, else `EPERM`), and may not drop below the pages the
+    /// unread data fills (`EBUSY`). Returns the new size.
+    pub(crate) fn set_size(&self, size: u32, max_size: u32, resource: bool) -> Result<u64, Errno> {
         if size > 1 << 31 {
             return Err(Errno::EINVAL);
         }
         let size = size.max(4096).next_power_of_two() as usize;
         let _held = self.hold();
+        if size > self.endpoint.pair.window() && size > max_size as usize && !resource {
+            return Err(Errno::EPERM);
+        }
         let sides = self
             .endpoint
             .pair

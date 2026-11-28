@@ -3199,6 +3199,7 @@ impl Kernel {
             tid,
             flags,
         );
+        state.cpu.made();
         self.pending_child = Some((Box::new(child), Thread { tid, cpu, state }));
         Ok(u64::from(tid))
     }

@@ -529,6 +529,12 @@ pub(crate) struct Event {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The ID the next event opened or inherited takes: every one there is has
+/// a smaller one.
+pub(crate) fn next_id() -> u64 {
+    NEXT_ID.load(Ordering::Relaxed)
+}
+
 /// The machine's events by the thread that opened them (each task's
 /// `perf_event_list`, for `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE`), and
 /// those that wait for their task's `execve` (`enable_on_exec` and

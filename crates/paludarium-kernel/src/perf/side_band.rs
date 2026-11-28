@@ -220,7 +220,9 @@ fn comm_from(
 /// each in on that of the next, the last on the CPU `who` is on now, as
 /// another thread's `sched_setaffinity` may have moved it while it slept.
 /// A thread that `started` was switched in for its first run, which comes
-/// first, alone: inherited events take that of a new thread or child. An
+/// first, alone, as its `clone` made it: inherited events take that of a
+/// new thread or child, and those opened before it, of a smaller ID than
+/// `started` gives, but none opened since. An
 /// event of a CPU takes `SWITCH_CPU_WIDE`, which gives the thread that ran
 /// instead, here the idle task (0): no other guest thread takes the CPU
 /// from a sleeping one. A sleeping thread is not runnable, so no switch is
@@ -229,16 +231,16 @@ pub(crate) fn switched(
     events: &Events,
     group: &ThreadGroup,
     who: &Who,
-    started: bool,
+    started: Option<u64>,
     sleeps: &[(u32, u64)],
 ) {
-    if !started && sleeps.is_empty() || !switches(events) {
+    if started.is_none() && sleeps.is_empty() || !switches(events) {
         return;
     }
     let wants = |attr: &super::Attr| attr.flag(bit::CONTEXT_SWITCH);
     // The receivers of each CPU, looked up once.
     let mut of_cpu: Vec<(u32, Vec<Arc<Event>>)> = Vec::new();
-    let mut write = |misc: u16, cpu: u32| {
+    let mut write = |misc: u16, cpu: u32, before: u64| {
         let writer = Who { cpu, ..*who };
         let at = match of_cpu.iter().position(|(on, _)| *on == cpu) {
             Some(at) => at,
@@ -247,7 +249,7 @@ pub(crate) fn switched(
                 of_cpu.len() - 1
             }
         };
-        for event in &of_cpu[at].1 {
+        for event in of_cpu[at].1.iter().filter(|e| e.stream_id < before) {
             if matches!(event.target, super::Target::Cpu) {
                 let idle = event.pid_tid_of(0, 0);
                 event.side_band(RECORD_SWITCH_CPU_WIDE, misc, &idle, &writer);
@@ -256,16 +258,16 @@ pub(crate) fn switched(
             }
         }
     };
-    if started {
-        write(0, who.cpu);
+    if let Some(before) = started {
+        write(0, who.cpu, before);
     }
     let mut each = sleeps
         .iter()
         .flat_map(|&(cpu, n)| std::iter::repeat_n(cpu, usize::try_from(n).unwrap_or(usize::MAX)))
         .peekable();
     while let Some(cpu) = each.next() {
-        write(MISC_SWITCH_OUT, cpu);
-        write(0, each.peek().copied().unwrap_or(who.cpu));
+        write(MISC_SWITCH_OUT, cpu, u64::MAX);
+        write(0, each.peek().copied().unwrap_or(who.cpu), u64::MAX);
     }
 }
 

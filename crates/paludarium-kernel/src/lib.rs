@@ -240,8 +240,20 @@ pub(crate) struct CpuAccount {
     /// `sched_setaffinity` may move it between two sleeps of one call.
     slept: Vec<(u32, u64)>,
     /// Whether perf has seen it run: a new thread's first run is a switch
-    /// in alone.
+    /// in alone, for the events there were when it was made
+    /// ([`CpuAccount::made`]).
     ran: bool,
+    /// The first ID of an event opened after a `clone` made the thread, or
+    /// `None` for one no `clone` made.
+    made_before: Option<u64>,
+}
+
+impl CpuAccount {
+    /// A `clone` made the thread, its inherited events too: those opened
+    /// from now are none of its first run's, which was before them.
+    pub(crate) fn made(&mut self) {
+        self.made_before = Some(perf::next_id());
+    }
 }
 impl Clone for CpuAccount {
     fn clone(&self) -> Self {
@@ -2537,7 +2549,9 @@ impl Kernel {
         }
         let sleeps = std::mem::take(&mut thread.state.cpu.slept);
         let started = !std::mem::replace(&mut thread.state.cpu.ran, true);
-        if (started || !sleeps.is_empty()) && perf::switches(&self.processes.perf_events) {
+        let started = started.then_some(thread.state.cpu.made_before).flatten();
+        if (started.is_some() || !sleeps.is_empty()) && perf::switches(&self.processes.perf_events)
+        {
             let who = perf::Who {
                 pid: thread.state.pid,
                 tid: thread.tid,

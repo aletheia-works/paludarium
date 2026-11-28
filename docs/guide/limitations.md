@@ -451,7 +451,10 @@ verified.
   failed `clone` writes neither; a thread is switched out only when it
   sleeps, never preempted (`PERF_RECORD_MISC_SWITCH_OUT_PREEMPT`), and both
   `SWITCH` records of a sleep are written as it runs again, the first with
-  the time it woke, where Linux writes it as the thread goes to sleep; an
+  the time it woke, where Linux writes it as the thread goes to sleep; a
+  sleep is taken to be on the CPU the thread was on at its last system
+  call or clock read, so that another thread's `sched_setaffinity` between
+  that and the sleep switches it out on the old CPU; an
   event of a CPU takes only the guest's threads' switches, each with the
   idle task (0) as the thread that ran instead; and `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE` and `AUX` records are not

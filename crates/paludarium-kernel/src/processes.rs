@@ -3990,6 +3990,7 @@ impl Kernel {
             pid,
             flags,
         );
+        state.cpu.made();
         self.vfork_wait = release;
         self.pending_child = Some((
             Box::new(child),

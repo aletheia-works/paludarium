@@ -1135,3 +1135,37 @@ fn unshare_writes_the_thread_s_namespaces() {
     env.each_record(comm, |_, record| other.push(record.to_vec()));
     assert!(other.is_empty());
 }
+
+/// A child's first run is a switch in for the events there were when its
+/// `clone` made it, inherited ones among them, and for none opened since:
+/// on Linux it ran before them.
+#[test]
+fn a_child_s_first_run_is_no_record_of_an_event_opened_after_it() {
+    const ATTR_CONTEXT_SWITCH: u64 = 1 << 26;
+    let mut env = Env::new();
+    env.call(GETPID, [0; 6]);
+    env.pin();
+    let (before_fd, before) = env.open_side_band(-1, 0, ATTR_CONTEXT_SWITCH).unwrap();
+    env.ioctl(before_fd, IOC_ENABLE);
+    let child = env.call(FORK, [0; 6]);
+    let (mut k, mut t) = env.k.take_child().unwrap();
+    let m = k.take_spawn_memory().unwrap();
+    let (after_fd, after) = env.open_side_band(child, -1, ATTR_CONTEXT_SWITCH).unwrap();
+    env.ioctl(after_fd, IOC_ENABLE);
+    // The child's first call.
+    t.cpu.gpr[reg::RAX] = GETPID;
+    let rip = t.cpu.rip;
+    k.handle(&mut t, &m, ExitReason::Syscall { rip });
+    for page in [before, after] {
+        let mut seen = Vec::new();
+        env.each_record(page, |_, record| {
+            seen.push((record[0] & 0xffff_ffff, halves(record[record.len() - 1])[1]));
+        });
+        env.say(format!("{seen:?}"));
+    }
+    k.finish_thread(&t, &m);
+    k.complete_process(ExitStatus::Exited(0));
+    env.wait(child);
+    let child = child as u32;
+    check(&env.lines, &[&format!("[(15, {child})]"), "[]"]);
+}

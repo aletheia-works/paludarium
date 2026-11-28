@@ -85,6 +85,7 @@
     {"name":"veth-ipv6-kept","binary":"veth-ipv6-kept"},
     {"name":"veth-hash-policy","binary":"veth-hash-policy"},
     {"name":"veth-use-neigh","binary":"veth-use-neigh"},
+    {"name":"veth-icmp-hop","binary":"veth-icmp-hop"},
     {"name":"veth-ipv6-gateway","binary":"veth-ipv6-gateway"},
     {"name":"veth-ipv6-ecmp","binary":"veth-ipv6-ecmp"},
     {"name":"veth-bindtodevice","binary":"veth-bindtodevice"},

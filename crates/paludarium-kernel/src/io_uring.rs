@@ -3894,6 +3894,8 @@ fn run_registration(
     a: [u64; 6],
 ) -> Result<u64, Errno> {
     match opcode {
+        // `__io_uring_register`: no argument, or more than 256 entries.
+        REGISTER_PROBE if a[2] == 0 || a[3] as u32 > 256 => Err(Errno::EINVAL),
         REGISTER_PROBE => probe(c, a),
         register::REGISTER_PERSONALITY | register::REGISTER_ENABLE_RINGS
             if a[2] != 0 || a[3] as u32 != 0 =>

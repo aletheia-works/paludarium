@@ -5612,6 +5612,8 @@ mod io_uring {
         // The probe: NOP, the transfers and EPOLL_CTL, of 65 operations.
         let probe = DATA + 0x400;
         f.mem.write(GuestAddr(probe), &[0; 16 + 8 * 65]).unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 8, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 8, probe, 257]), errno(Errno::EINVAL));
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 70]), 0);
         let mut head = [0; 2];
         f.mem.read(GuestAddr(probe), &mut head).unwrap();

@@ -6769,7 +6769,8 @@ kernel.
   `epoll` gets an edge for each signal queued to the process or any of its
   threads while one of the file's signals is pending for the waiter, as Linux's `signalfd_notify`
   wakes the file for each, as it is sent, even when another thread has yet
-  to take it in, and wakes a thread already waiting in `epoll` then: another real-time signal of a number already
+  to take it in, and wakes a thread already waiting in `epoll`, `poll`,
+  `select`, io_uring or aio then: another real-time signal of a number already
   waiting counts, a standard signal already pending or one ignored and
   unblocked does not, nor one the init of a nested PID namespace drops
   unblocked as it has no handler (`SIGNAL_UNKILLABLE`); a new mask is an

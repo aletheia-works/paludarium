@@ -2069,6 +2069,7 @@ fn wait_ready(
         // Sample the ticket and the generations before inspecting readiness,
         // so no change is lost.
         let ticket = c.files.readiness.token.value();
+        crate::signalfd::waiting(c);
         let now = keys(c);
         let quiet = match (&asleep, &now) {
             (Some(before), Some(now))

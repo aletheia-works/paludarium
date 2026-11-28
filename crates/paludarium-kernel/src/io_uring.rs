@@ -3856,6 +3856,7 @@ fn wait(
     let mut ran = false;
     let result = loop {
         let ticket = c.files.readiness.token.value();
+        crate::signalfd::waiting(c);
         if run_waiting(c, file, ring, wanted) {
             (fresh, ran) = (true, true);
             wanted = target.wrapping_sub(ring.load_u32(CQ_TAIL));

@@ -81,11 +81,12 @@ pub(crate) fn observe(process: &ThreadState, inbox: &SignalInbox, group: &Thread
 
 /// A thread group's count of the signals its threads made pending, for the
 /// signal files of the other threads ([`SignalInbox::others_arrivals`]), and
-/// the readiness of the file tables a thread of the group waited on in
-/// `epoll` while a signal file was open. Each signal counted wakes those
-/// waits, as Linux's `signalfd_notify` wakes every waiter on a signal file
-/// of the process as the signal is sent; a waiter otherwise saw it only as
-/// its wait timed out.
+/// the readiness of the file tables a thread of the group made a signal file
+/// in or polled files in (`epoll_wait`, `poll`, `select`, an io_uring or aio
+/// wait) while one was open. Each signal counted wakes those waits, as
+/// Linux's `signalfd_notify` wakes every waiter on a signal file of the
+/// process as the signal is sent; a waiter otherwise saw it only as its
+/// wait timed out.
 #[derive(Default)]
 pub(crate) struct Arrivals {
     count: AtomicU64,
@@ -126,8 +127,8 @@ impl Arrivals {
     }
 }
 
-/// Before an `epoll` wait looks at its files, with `ticket` already taken:
-/// the waits of `c`'s file table are woken by each signal its thread group
+/// Before a wait that polls files looks at them, with its ticket already
+/// taken: the waits of `c`'s file table are woken by each signal its thread group
 /// counts from now on, and what is pending for the caller is looked at
 /// again, so a signal counted before this is seen by the look and one after
 /// it changes the ticket.
@@ -170,6 +171,8 @@ fn create(c: &mut Context<'_>, fd: u64, mask: u64, size: u64, flags: u64) -> Res
     }
     if fd as i32 == -1 {
         let file = Arc::new(SignalFile::new(mask, flags));
+        // A thread of the table already asleep is woken from now on.
+        c.group.signal_arrivals().wait_on(&c.files.readiness);
         observe(c.process, c.inbox, c.group);
         return c
             .files

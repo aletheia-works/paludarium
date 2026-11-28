@@ -1220,6 +1220,7 @@ fn get_events(
     let mut interrupted = false;
     loop {
         let ticket = c.files.readiness.token.value();
+        crate::signalfd::waiting(c);
         progress(c);
         let over = deadline.is_some_and(|end| {
             c.host

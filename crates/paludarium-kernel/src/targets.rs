@@ -37,6 +37,9 @@ pub(crate) struct Tif {
     /// It is in a wait only a fatal signal ends, which looks around now and
     /// then: it sleeps all along.
     killable: AtomicBool,
+    /// It is in a wait Linux's task sleeps `TASK_KILLABLE` in, which
+    /// `/proc` shows as `D (disk sleep)` ([`Self::sleep_uninterruptible`]).
+    uninterruptible: AtomicBool,
     /// What wakes it from such a wait.
     wake: Arc<AtomicBool>,
     /// Its own pending standard signals as its last drain, take or discard
@@ -137,6 +140,18 @@ impl Tif {
         self.killable.store(true, Ordering::SeqCst);
         Killable(Arc::clone(self))
     }
+    /// It is in a wait that Linux's task sleeps `TASK_KILLABLE` in, until
+    /// what is returned goes: one of [`Self::sleep_killable`] that `/proc`
+    /// shows as `D (disk sleep)`, where a killable wait that stands for
+    /// Linux's `TASK_INTERRUPTIBLE` (a fault that a signal retries) is `S`.
+    pub(crate) fn sleep_uninterruptible(self: &Arc<Self>) -> Uninterruptible {
+        self.uninterruptible.store(true, Ordering::SeqCst);
+        Uninterruptible(Arc::clone(self))
+    }
+    /// Whether it is in a wait of [`Self::sleep_uninterruptible`].
+    pub(crate) fn uninterruptible(&self) -> bool {
+        self.uninterruptible.load(Ordering::SeqCst)
+    }
     /// Whether it is not `task_curr`.
     fn sleeps(&self) -> bool {
         self.asleep.load(Ordering::SeqCst) || self.killable.load(Ordering::SeqCst)
@@ -166,6 +181,14 @@ impl Tif {
         if number == 9 || self.wants(signals::bit(number)) {
             self.set_look();
         }
+    }
+}
+
+/// A wait of [`Tif::sleep_uninterruptible`].
+pub(crate) struct Uninterruptible(Arc<Tif>);
+impl Drop for Uninterruptible {
+    fn drop(&mut self) {
+        self.0.uninterruptible.store(false, Ordering::SeqCst);
     }
 }
 
@@ -427,5 +450,27 @@ impl std::fmt::Debug for Seat {
             Self::Thread(_) => "Thread",
             Self::Copy => "Copy",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_uninterruptible_wait_is_one_until_its_guard_goes() {
+        let tif = Arc::new(Tif::default());
+        assert!(!tif.uninterruptible());
+        let killable = tif.sleep_killable();
+        // A killable wait alone (a fault a signal retries) is not one.
+        assert!(!tif.uninterruptible());
+        {
+            let _shown = tif.sleep_uninterruptible();
+            assert!(tif.uninterruptible());
+            assert!(tif.sleeps());
+        }
+        assert!(!tif.uninterruptible());
+        drop(killable);
+        assert!(!tif.sleeps());
     }
 }

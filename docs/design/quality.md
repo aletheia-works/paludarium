@@ -121,9 +121,9 @@ CI run produces them afresh on an x86-64 Linux runner.
   `EINVAL` as Linux's fix of 2026 makes it, where `ubuntu-24.04`'s
   7.0.0-1017-azure still succeeded when this was written.
 
-- A test checks that `diff_processes` runs exactly the process cases that
-  `tests/guests/processes/cases.json` lists, so that a case cannot be listed
-  and never run.
+- The `cases!` list of `diff_processes` is the only list of the process cases,
+  and the tests are made from it, so a listed case always runs. A test checks
+  that the list is sorted by test name and holds no case twice.
 
 - `scripts/ci-changes.py --self-test`, which every pull request runs, checks
   that each differential test of `crates/paludarium-harness/tests` runs

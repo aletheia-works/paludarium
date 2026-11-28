@@ -924,6 +924,170 @@ fn mmap2_records_give_the_build_id_an_event_asks_for() {
     }
 }
 
+/// A sleep is a `PERF_RECORD_SWITCH` out and one back in, written as the
+/// thread runs again: to an event of the thread with the thread's IDs
+/// alone, and to one of its CPU as `SWITCH_CPU_WIDE` with the idle task as
+/// the thread that ran instead. A disabled event and one without
+/// `context_switch` take none.
+#[test]
+fn a_sleep_is_a_switch_out_and_back_in() {
+    const ATTR_CONTEXT_SWITCH: u64 = 1 << 26;
+    const RECORD_SWITCH: u64 = 14;
+    const RECORD_SWITCH_CPU_WIDE: u64 = 15;
+    const SWITCH_OUT: u64 = 1 << 13;
+    let mut env = Env::new();
+    let pid = env.call(GETPID, [0; 6]) as u32;
+    let tid = env.call(GETTID, [0; 6]) as u32;
+    env.pin();
+    let (own_fd, own) = env.open_side_band(0, -1, ATTR_CONTEXT_SWITCH).unwrap();
+    let (cpu_fd, cpu) = env.open_side_band(-1, 0, ATTR_CONTEXT_SWITCH).unwrap();
+    let (_, disabled) = env.open_side_band(0, -1, ATTR_CONTEXT_SWITCH).unwrap();
+    let (comm_fd, comm) = env.open_side_band(0, -1, ATTR_COMM).unwrap();
+    for fd in [own_fd, cpu_fd, comm_fd] {
+        env.ioctl(fd, IOC_ENABLE);
+    }
+    let _ = paludarium_host::switches::take();
+    for _ in 0..2 {
+        paludarium_host::switches::sleep(&mut false);
+    }
+    env.call(GETPID, [0; 6]);
+    // A call that did not sleep writes none.
+    env.call(GETPID, [0; 6]);
+    for page in [own, cpu, disabled, comm] {
+        let mut seen = Vec::new();
+        env.each_record(page, |_, record| seen.push(record.to_vec()));
+        let records: Vec<String> = seen
+            .iter()
+            .map(|record| {
+                let kind = record[0] & 0xffff_ffff;
+                let out = record[0] >> 32 & SWITCH_OUT != 0;
+                let ids = halves(record[record.len() - 1]) == [pid, tid];
+                let instead = match kind {
+                    RECORD_SWITCH => String::new(),
+                    RECORD_SWITCH_CPU_WIDE => format!(" instead {:?}", halves(record[1])),
+                    _ => " other".to_string(),
+                };
+                format!(
+                    "{kind} out {out} size {} ids {ids}{instead}",
+                    record[0] >> 48
+                )
+            })
+            .collect();
+        env.say(format!("{records:?}"));
+    }
+    let own_pair = [
+        "14 out true size 16 ids true",
+        "14 out false size 16 ids true",
+    ];
+    let cpu_pair = [
+        "15 out true size 24 ids true instead [0, 0]",
+        "15 out false size 24 ids true instead [0, 0]",
+    ];
+    check(
+        &env.lines,
+        &[
+            &format!("{:?}", [own_pair, own_pair].concat()),
+            &format!("{:?}", [cpu_pair, cpu_pair].concat()),
+            "[]",
+            "[]",
+        ],
+    );
+}
+
+/// A thread that another thread's `sched_setaffinity` moved while it slept
+/// is switched out on the CPU it slept on and in on the one it runs on now.
+#[test]
+fn a_moved_sleeper_is_switched_out_where_it_slept() {
+    const ATTR_CONTEXT_SWITCH: u64 = 1 << 26;
+    let mut env = Env::new();
+    let tid = env.call(GETTID, [0; 6]) as u32;
+    env.pin();
+    let (on_0, first) = env.open_side_band(-1, 0, ATTR_CONTEXT_SWITCH).unwrap();
+    let (on_1, second) = env.open_side_band(-1, 1, ATTR_CONTEXT_SWITCH).unwrap();
+    env.ioctl(on_0, IOC_ENABLE);
+    env.ioctl(on_1, IOC_ENABLE);
+    let _ = paludarium_host::switches::take();
+    paludarium_host::switches::sleep(&mut false);
+    env.k.group.set_affinity(tid, vec![2]);
+    env.call(GETPID, [0; 6]);
+    for page in [first, second] {
+        let mut outs = Vec::new();
+        env.each_record(page, |_, record| outs.push(record[0] >> 32 & 1 << 13 != 0));
+        env.say(format!("{outs:?}"));
+    }
+    check(&env.lines, &["[true]", "[false]"]);
+}
+
+/// The sleeps of a call are taken as it returns, so that an event opened
+/// after them takes none of them.
+#[test]
+fn a_call_s_sleeps_are_taken_as_it_returns() {
+    const NANOSLEEP: u64 = 35;
+    let mut env = Env::new();
+    env.call(GETPID, [0; 6]);
+    let _ = paludarium_host::switches::take();
+    env.put(
+        ARG,
+        &[0u64.to_le_bytes(), 1_000_000u64.to_le_bytes()].concat(),
+    );
+    assert_eq!(env.call(NANOSLEEP, [ARG, 0, 0, 0, 0, 0]), 0);
+    assert!(!paludarium_host::switches::pending());
+}
+
+/// A call that took its sleeps itself, as it read a clock after them (as
+/// `clock_nanosleep` does, through `sleep_clock_now`), drops them as it
+/// returns, so that an event another thread opens before the thread's next
+/// call takes none of them: they were before it.
+#[test]
+fn a_call_drops_the_sleeps_it_took_as_it_returns() {
+    let mut env = Env::new();
+    env.call(GETPID, [0; 6]);
+    let _ = paludarium_host::switches::take();
+    paludarium_host::switches::sleep(&mut false);
+    let host = Arc::clone(&env.k.host);
+    crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
+    assert!(!paludarium_host::switches::pending());
+    assert_eq!(env.t.state.cpu.slept, [(0, 1)]);
+    let _ = env.k.checkpoint(&mut env.t, &env.m);
+    assert!(env.t.state.cpu.slept.is_empty());
+}
+
+/// Two sleeps of one call, the call reading a clock after each, and a move
+/// by another thread's `sched_setaffinity` during the second: both are
+/// switched out on the CPU the thread slept on, the first in there too and
+/// the second in on the new one. Sleeps are taken to be on the CPU of the
+/// last account, as their counts are ([`Usage::switched_on`]), which a
+/// move during the sleep, the long part of the call, gives.
+#[test]
+fn two_sleeps_of_a_call_are_switched_where_each_was() {
+    const ATTR_CONTEXT_SWITCH: u64 = 1 << 26;
+    let mut env = Env::new();
+    let tid = env.call(GETTID, [0; 6]) as u32;
+    env.pin();
+    let (on_0, first) = env.open_side_band(-1, 0, ATTR_CONTEXT_SWITCH).unwrap();
+    let (on_1, second) = env.open_side_band(-1, 1, ATTR_CONTEXT_SWITCH).unwrap();
+    env.ioctl(on_0, IOC_ENABLE);
+    env.ioctl(on_1, IOC_ENABLE);
+    let _ = paludarium_host::switches::take();
+    let host = Arc::clone(&env.k.host);
+    paludarium_host::switches::sleep(&mut false);
+    crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
+    paludarium_host::switches::sleep(&mut false);
+    env.k.group.set_affinity(tid, vec![2]);
+    crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
+    // A third sleep, now that the thread runs on CPU 1.
+    paludarium_host::switches::sleep(&mut false);
+    crate::account_cpu(&*host, &env.k.group, &mut env.t.state, env.t.tid);
+    assert_eq!(env.t.state.cpu.slept, [(0, 2), (1, 1)]);
+    let _ = env.k.checkpoint(&mut env.t, &env.m);
+    for page in [first, second] {
+        let mut outs = Vec::new();
+        env.each_record(page, |_, record| outs.push(record[0] >> 32 & 1 << 13 != 0));
+        env.say(format!("{outs:?}"));
+    }
+    check(&env.lines, &["[true, false, true]", "[false, true, false]"]);
+}
+
 /// `unshare` writes `PERF_RECORD_NAMESPACES` of the thread's namespaces,
 /// whether it made new ones or not: its IDs, seven links of nsfs's device
 /// and each namespace's inode, and the writer's IDs. A failed one writes
@@ -970,4 +1134,38 @@ fn unshare_writes_the_thread_s_namespaces() {
     let mut other = Vec::new();
     env.each_record(comm, |_, record| other.push(record.to_vec()));
     assert!(other.is_empty());
+}
+
+/// A child's first run is a switch in for the events there were when its
+/// `clone` made it, inherited ones among them, and for none opened since:
+/// on Linux it ran before them.
+#[test]
+fn a_child_s_first_run_is_no_record_of_an_event_opened_after_it() {
+    const ATTR_CONTEXT_SWITCH: u64 = 1 << 26;
+    let mut env = Env::new();
+    env.call(GETPID, [0; 6]);
+    env.pin();
+    let (before_fd, before) = env.open_side_band(-1, 0, ATTR_CONTEXT_SWITCH).unwrap();
+    env.ioctl(before_fd, IOC_ENABLE);
+    let child = env.call(FORK, [0; 6]);
+    let (mut k, mut t) = env.k.take_child().unwrap();
+    let m = k.take_spawn_memory().unwrap();
+    let (after_fd, after) = env.open_side_band(child, -1, ATTR_CONTEXT_SWITCH).unwrap();
+    env.ioctl(after_fd, IOC_ENABLE);
+    // The child's first call.
+    t.cpu.gpr[reg::RAX] = GETPID;
+    let rip = t.cpu.rip;
+    k.handle(&mut t, &m, ExitReason::Syscall { rip });
+    for page in [before, after] {
+        let mut seen = Vec::new();
+        env.each_record(page, |_, record| {
+            seen.push((record[0] & 0xffff_ffff, halves(record[record.len() - 1])[1]));
+        });
+        env.say(format!("{seen:?}"));
+    }
+    k.finish_thread(&t, &m);
+    k.complete_process(ExitStatus::Exited(0));
+    env.wait(child);
+    let child = child as u32;
+    check(&env.lines, &[&format!("[(15, {child})]"), "[]"]);
 }

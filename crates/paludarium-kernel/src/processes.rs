@@ -2670,6 +2670,7 @@ impl Kernel {
         };
         let traced = self.processes.traces.tracer_of(thread.tid).is_some();
         let _sleeps = self.inbox.tif().sleep_killable();
+        let _shown = self.inbox.tif().sleep_uninterruptible();
         // The call that made the child is over: this shows the thread asleep.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
         loop {
@@ -3999,6 +4000,7 @@ impl Kernel {
             pid,
             flags,
         );
+        state.cpu.made();
         self.vfork_wait = release;
         self.pending_child = Some((
             Box::new(child),

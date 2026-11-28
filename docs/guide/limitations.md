@@ -208,8 +208,11 @@ verified.
   and `getrusage` and a wait's rusage as `ru_nvcsw` and 0 as `ru_nivcsw`.
   `status` has no `VmPin` or `VmPTE`, as nothing counts the pages pinned
   (`pinned_vm`) or the bytes of the page tables.
-  Another process's thread is `S (sleeping)` in every wait, where Linux shows
-  some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
+  Another process's thread is `D (disk sleep)` only in the waits Linux makes
+  `TASK_KILLABLE` that paludarium has (see features) and `S (sleeping)` in
+  every other, where Linux also shows its uninterruptible locks (a pipe's
+  mutex, which a thread here takes without showing it asleep) and I/O
+  waits as `D`. A thread shows another
   process what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen
   only while the thread is stopped in it. A task with no memory left (a
@@ -449,8 +452,16 @@ verified.
   start-up) as if its pages were all cached, where Linux gives none for a
   page it has not read or has evicted; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
-  failed `clone` writes neither; and `CGROUP`,
-  `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
+  failed `clone` writes neither; a thread is switched out only when it
+  sleeps, never preempted (`PERF_RECORD_MISC_SWITCH_OUT_PREEMPT`), and both
+  `SWITCH` records of a sleep are written as it runs again, the first with
+  the time it woke, where Linux writes it as the thread goes to sleep; a
+  sleep is taken to be on the CPU the thread was on at its last system
+  call or clock read, so that another thread's `sched_setaffinity` between
+  that and the sleep switches it out on the old CPU; an
+  event of a CPU takes only the guest's threads' switches, each with the
+  idle task (0) as the thread that ran instead; and `CGROUP`,
+  `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE` and `AUX` records are not
   written. When `REFRESH`'s last overflow disables the event, its count
   stops there, but its times (a clock's apart) and its group's other
   events go on up to that point. Its user page shows the count and
@@ -710,8 +721,13 @@ verified.
   `IORING_REGISTER_PERSONALITY`, `IORING_UNREGISTER_PERSONALITY`,
   `IORING_REGISTER_RESTRICTIONS`, `IORING_REGISTER_ENABLE_RINGS`,
   `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS` (the others
-  give `EINVAL`). Restrictions of a task, which Linux 7.0 has, are not
-  there (`EBADF` for descriptor -1).
+  give `EINVAL`). Without a ring (descriptor -1), only a task's
+  `IORING_REGISTER_RESTRICTIONS` is there: `IORING_REGISTER_SEND_MSG_RING`,
+  `_QUERY` and `_BPF_FILTER` give `EINVAL`, and a task's restrictions have
+  no BPF filters. Those restrictions do not limit the registrations without
+  a ring, as on Linux 7.0 and the test runners' kernel; Linux master
+  refuses the ones they do not allow there (`EACCES`, 4a93427e99a8). This
+  follows master once the runners' kernel does.
   `IORING_REGISTER_BUFFERS_UPDATE` reads each slot's `iovec`
   before its tag and refuses `IORING_RSRC_UPDATE_EXTENDED`, as Linux 7.0,
   the kernel the differential tests run on, does; Linux master reads the

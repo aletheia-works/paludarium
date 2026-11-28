@@ -77,15 +77,22 @@ fn shown(
         .or_else(|| view.group.public(pid))
         .unwrap_or_default();
     // A thread is shown asleep while it is blocked in a wait, as Linux shows
-    // a task that is not running, and running otherwise, in a system call
-    // or not; the reader is running, reading.
+    // a task that is not running, `D` in one Linux's task sleeps
+    // `TASK_KILLABLE` in, and running otherwise, in a system call or not;
+    // the reader is running, reading.
     let state = match member {
         _ if view.zombie => ('Z', "Z (zombie)"),
         // A leader that ended before its other threads.
         None => ('Z', "Z (zombie)"),
         Some(_) if processes.traces.in_stop(tid) => ('t', "t (tracing stop)"),
         Some(_) if view.group.is_stopped() => ('T', "T (stopped)"),
-        Some((_, blocked)) if blocked && tid != reader => ('S', "S (sleeping)"),
+        Some((_, blocked)) if blocked && tid != reader => {
+            if view.group.sleeps_uninterruptible(tid) {
+                ('D', "D (disk sleep)")
+            } else {
+                ('S', "S (sleeping)")
+            }
+        }
         Some(_) => ('R', "R (running)"),
     };
     let gone = !view.zombie && tid == pid && member.is_none();

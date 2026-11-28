@@ -1624,6 +1624,7 @@ fn lookup(
             .map_or(p, |(file, _)| file),
         false => p,
     };
+    generated_directories_on_the_way(c, &p, true)?;
     let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
     Ok((p, found))
 }
@@ -2054,6 +2055,7 @@ fn read_link(c: &mut Context<'_>, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
     // `/proc/self` is a link to this process's directory, and each
     // entry of its `fd` to a descriptor's file.
     let p = crate::devices::through_link(&p).unwrap_or(p);
+    generated_directories_on_the_way(c, &p, true)?;
     Ok(if p == b"/proc/self" {
         c.process.pid.to_string().into_bytes()
     } else if let Some(path) = task_path(c, &p) {
@@ -2298,7 +2300,11 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
     {
         return Ok(pseudo_fs(PID_FS_MAGIC));
     }
-    Ok(match d.file.stat()?.mode & 0o170000 {
+    let stat = d.file.stat()?;
+    if let Some(place) = fifo_place(c, d, &stat) {
+        return c.files.fs().statfs(&place);
+    }
+    Ok(match stat.mode & 0o170000 {
         0o010000 => pseudo_fs(0x5049_5045), // PIPEFS_MAGIC
         0o140000 => pseudo_fs(0x534F_434B), // SOCKFS_MAGIC
         0 if !is_namespace(d) => pseudo_fs(ANON_INODE_FS_MAGIC),
@@ -2308,6 +2314,29 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
             .statfs(&d.path)
             .or_else(|_| c.files.fs().statfs(b"/"))?,
     })
+}
+/// Where the file system of a fifo `d` opened by its name is (`stat` its
+/// file's): its path while that still names it, else the mount of its
+/// device, as a removed or renamed fifo is still a file of that file
+/// system; only `pipe`'s fifos are pipefs's. `None` for any other file.
+fn fifo_place(c: &Context<'_>, d: &Descriptor, stat: &FileStat) -> Option<Vec<u8>> {
+    if stat.mode & 0o170000 != 0o010000 || d.path.first() != Some(&b'/') {
+        return None;
+    }
+    let fs = c.files.fs();
+    if fs
+        .metadata(&d.path, false)
+        .is_ok_and(|now| now.inode == stat.inode)
+    {
+        return Some(d.path.clone());
+    }
+    let device = descriptor_device(c, d);
+    Some(
+        fs.mounts()
+            .into_iter()
+            .find(|m| m.device == device)
+            .map_or_else(|| b"/".to_vec(), |m| m.path),
+    )
 }
 /// `statfs`'s `f_flags` for `path`, whose file system `stats` describes:
 /// the mount's ([`paludarium_vfs::FileSystem::statfs_flags`]) for one a
@@ -2359,10 +2388,10 @@ fn descriptor_statfs_flags(
         .as_any()
         .is_some_and(|v| v.is::<crate::memfd::Memfd>());
     if memfd {
-        0x20
-    } else {
-        mount_statfs_flags(c, stats, &d.path)
+        return 0x20;
     }
+    let place = d.file.stat().ok().and_then(|stat| fifo_place(c, d, &stat));
+    mount_statfs_flags(c, stats, place.as_deref().unwrap_or(&d.path))
 }
 /// Linux's 120-byte `struct statfs` of the file system on `device`, with
 /// `f_flags` and `f_fsid` [`crate::fanotify::fsid`]'s.
@@ -8305,10 +8334,12 @@ fn open_path(
     flags: u32,
     mode: u32,
 ) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
+    const O_CREAT: u32 = 0o100;
     const O_NOFOLLOW: u32 = 0o400000;
     if let Some(target) = crate::devices::through_link(p) {
         return open_path(c, &target, flags, mode);
     }
+    generated_directories_on_the_way(c, p, flags & O_CREAT == 0)?;
     if flags & (O_PATH | O_NOFOLLOW) == O_PATH | O_NOFOLLOW
         && let Some(link) = LinkPath::of(c, p)?
     {
@@ -8634,8 +8665,6 @@ fn open_path(
         }
     } else if let Some(entry) = crate::sysctl::entry(c, p) {
         crate::sysctl::open(c, entry, flags)?
-    } else if crate::proc::below_system_entry(p) {
-        return Err(Errno::ENOTDIR);
     } else if crate::proc::is_sysvipc(p) {
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
@@ -9329,6 +9358,7 @@ pub(crate) fn exec_jumped(
     let through = through_magic_links(c, raw.to_vec())?;
     let mut jumped = through != raw;
     let mut p = c.files.path(dir, through)?;
+    generated_directories_on_the_way(c, &p, true)?;
     for _ in 0..40 {
         if !generated(&p) && p != b"/proc" {
             let Err(error) = c.files.fs().metadata(&p, follow) else {
@@ -9842,6 +9872,50 @@ fn generated_stat(
     path: &[u8],
     follow: bool,
 ) -> Result<Option<(FileStat, u64, u32)>, Errno> {
+    generated_directories_on_the_way(c, path, true)?;
+    generated_stat_of_last(c, path, follow)
+}
+/// `ENOTDIR` when a name before `path`'s last one is a file paludarium
+/// makes that is not a directory, its link followed as the walk to the
+/// last name follows each one: Linux's walk asks every name it goes on
+/// from to be a directory it can look in. With `slash`, the last name
+/// before a trailing slash counts too, as a call that goes on to the file
+/// asks it to be a directory (a trailing slash follows a link even without
+/// `follow`); an open that may make the last name leaves that to its own
+/// lookup (`EISDIR`). A name on the way that is not there, or an error
+/// finding it (a task that has ended), is left to the last name's lookup,
+/// which reports it as the walk would.
+fn generated_directories_on_the_way(
+    c: &Context<'_>,
+    path: &[u8],
+    slash: bool,
+) -> Result<(), Errno> {
+    const DIRECTORY: u32 = 0o040000;
+    let end = if slash {
+        path.len()
+    } else {
+        path.iter().rposition(|&b| b != b'/').map_or(0, |at| at + 1)
+    };
+    for at in (1..end).filter(|&at| path[at] == b'/' && path[at - 1] != b'/') {
+        let before = &path[..at];
+        if !generated(before) {
+            continue;
+        }
+        if let Ok(Some((stat, ..))) = generated_stat_of_last(c, before, true)
+            && stat.mode & 0o170000 != DIRECTORY
+        {
+            return Err(Errno::ENOTDIR);
+        }
+    }
+    Ok(())
+}
+/// [`generated_stat`] of `path`'s last name, the names before it taken to
+/// be directories.
+fn generated_stat_of_last(
+    c: &Context<'_>,
+    path: &[u8],
+    follow: bool,
+) -> Result<Option<(FileStat, u64, u32)>, Errno> {
     // Under another process's directory or `task`: ENOENT for what is not
     // there, rather than whatever a mounted directory holds at the path.
     if let Some(task_path) = task_path(c, path) {
@@ -9903,7 +9977,6 @@ fn known_stat(
             device(c, path),
             BLOCK_SIZE,
         ))),
-        None if crate::proc::below_system_entry(path) => Err(Errno::ENOTDIR),
         None => Ok(other_generated_stat(c, path, follow)),
     }
 }

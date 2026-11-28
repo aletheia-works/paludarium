@@ -711,6 +711,7 @@ mod linux {
         // Changes IDs as root.
         processes_credentials => ("credentials", "process", root),
         processes_dev_shm => ("dev-shm", "process"),
+        processes_dev_tty_node => ("dev-tty-node", "process"),
         processes_dgram => ("dgram", "process"),
         processes_dontneed_read_only_segment => ("dontneed-read-only-segment", "process"),
         processes_dump_min_sysctls => ("dump-min-sysctls", "process"),

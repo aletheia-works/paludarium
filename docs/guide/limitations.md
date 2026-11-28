@@ -252,7 +252,7 @@ verified.
   Linux's devtmpfs makes, removes and renames them. Another user gets
   Linux's `EACCES`.
 - **`O_PATH` of `/dev/tty`**: it opens the controlling terminal as any
-  open does, so without one it fails (`ENOENT`), where Linux's `O_PATH`
+  open does, so without one it fails (`ENXIO`), where Linux's `O_PATH`
   opens the name without the device.
 - **Changing the generated files, in part**: a new mode or owner of
   `/dev`, its devices and links, `/proc` or `/proc`'s system-wide files, which only

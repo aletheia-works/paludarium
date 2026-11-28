@@ -60,7 +60,7 @@ const TTY_GROUP: u32 = 5;
 const SLAVE_MODE: u32 = 0o620;
 /// The majors of the pseudo-terminal slaves and of `/dev/tty`, `/dev/ptmx`.
 const SLAVE_MAJOR: u64 = 136;
-const TTYAUX_MAJOR: u64 = 5;
+pub(crate) const TTYAUX_MAJOR: u64 = 5;
 
 const O_NOCTTY: u32 = 0o400;
 
@@ -2637,13 +2637,7 @@ impl FileHandle for Slave {
     }
     fn stat(&self) -> Result<FileStat, Errno> {
         if self.alias {
-            return Ok(FileStat {
-                inode: 4,
-                mode: 0o020_666,
-                links: 1,
-                rdev: encode_device(TTYAUX_MAJOR, 0),
-                ..FileStat::default()
-            });
+            return Ok(crate::devices::stat(crate::devices::Entry::Tty));
         }
         Ok(self.terminal.slave_stat())
     }

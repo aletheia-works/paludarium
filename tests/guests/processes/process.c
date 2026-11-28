@@ -19587,6 +19587,40 @@ static int magic_link_names_case(void) {
     printf("status=%d\n", reaped(child));
     return 0;
 }
+/* The dev-tty-node case: /dev/tty is a node of devtmpfs with or without a
+   controlling terminal. Its type, permission bits, owner and number, what
+   the calls that do not open it give, and whether /dev lists it. Not its
+   group, which udev may change, nor what an open finds. */
+static int dev_tty_node_case(void) {
+    struct stat st, ls;
+    struct statfs sf;
+    char b[8];
+    int s = stat("/dev/tty", &st);
+    int l = lstat("/dev/tty", &ls);
+    printf("stat=%d mode=%o uid=%d rdev=%u:%u nlink=%lu lstat=%d same=%d\n", s < 0 ? -errno : 0,
+           s ? 0 : st.st_mode, s ? -1 : (int)st.st_uid, s ? 0 : major(st.st_rdev),
+           s ? 0 : minor(st.st_rdev), s ? 0 : (unsigned long)st.st_nlink, l < 0 ? -errno : 0,
+           !s && !l && st.st_ino == ls.st_ino);
+    printf("access=%d,%d statfs=%d readlink=%d chdir=%d\n",
+           access("/dev/tty", R_OK | W_OK) < 0 ? -errno : 0, access("/dev/tty", X_OK) < 0 ? -errno : 0,
+           statfs("/dev/tty", &sf) < 0 ? -errno : 0, readlink("/dev/tty", b, sizeof b) < 0 ? -errno : 0,
+           chdir("/dev/tty") < 0 ? -errno : 0);
+    DIR *d = opendir("/dev");
+    if (!d) return 1;
+    int listed = 0;
+    for (struct dirent *e; (e = readdir(d));) listed |= !strcmp(e->d_name, "tty") && e->d_type == DT_CHR;
+    closedir(d);
+    printf("listed=%d\n", listed);
+    /* Opens that the node decides before any terminal: it is there, and no
+       directory. */
+    int excl = open("/dev/tty", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    int excl_error = excl < 0 ? -errno : 0;
+    int dir = open("/dev/tty", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    printf("excl=%d directory=%d\n", excl_error, dir < 0 ? -errno : 0);
+    if (excl >= 0) close(excl);
+    if (dir >= 0) close(dir);
+    return 0;
+}
 /* The named-fifo-statfs case: fstatfs of a fifo opened by its name is the
    file system that holds it, the same as statfs of its directory (type,
    fsid and flags), by a descriptor open for reading and writing and by an
@@ -46547,6 +46581,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "magic-link-names")) return magic_link_names_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
+    if (!strcmp(mode, "dev-tty-node")) return dev_tty_node_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
     if (!strcmp(mode, "named-fifo-statfs")) return named_fifo_statfs_case();
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();

@@ -39,6 +39,9 @@ pub(crate) enum Entry {
     Queue,
     /// `/dev/userfaultfd`, a misc device (`userfaultfd_misc`).
     Userfaultfd,
+    /// `/dev/tty`, the node that opens the controlling terminal
+    /// ([`crate::pty::open_controlling`]); there with or without one.
+    Tty,
 }
 
 /// The misc devices' major number (`MISC_MAJOR`).
@@ -50,7 +53,7 @@ pub(crate) const USERFAULTFD_MINOR: u64 = 122;
 /// The names in `/dev`, sorted as it lists them. Each has the inode number
 /// two more than its place here, and `/dev` itself has 1, so that `stat` and
 /// `getdents` agree.
-const NAMES: [(&[u8], Entry); 13] = [
+const NAMES: [(&[u8], Entry); 14] = [
     (b"fd", Entry::Link(b"/proc/self/fd")),
     (b"full", Entry::Device(Kind::Full)),
     (b"mqueue", Entry::Mqueue),
@@ -61,6 +64,7 @@ const NAMES: [(&[u8], Entry); 13] = [
     (b"stderr", Entry::Link(b"/proc/self/fd/2")),
     (b"stdin", Entry::Link(b"/proc/self/fd/0")),
     (b"stdout", Entry::Link(b"/proc/self/fd/1")),
+    (b"tty", Entry::Tty),
     (b"urandom", Entry::Device(Kind::Urandom)),
     (b"userfaultfd", Entry::Userfaultfd),
     (b"zero", Entry::Device(Kind::Zero)),
@@ -158,6 +162,15 @@ pub(crate) fn stat(entry: Entry) -> FileStat {
             mode: 0o020_600,
             links: 1,
             rdev: MISC_MAJOR << 8 | USERFAULTFD_MINOR,
+            ..FileStat::default()
+        },
+        // 0666 and root's, as devtmpfs makes it (`tty_devnode`), with
+        // `/dev/tty`'s number.
+        Entry::Tty => FileStat {
+            inode: inode(entry),
+            mode: 0o020_666,
+            links: 1,
+            rdev: crate::pty::TTYAUX_MAJOR << 8,
             ..FileStat::default()
         },
         // A slave's own, which `crate::pty::slave_stat` gives; the

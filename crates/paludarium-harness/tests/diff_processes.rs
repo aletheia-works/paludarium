@@ -212,7 +212,8 @@ mod linux {
             // which reads links from a chroot of its own mount namespace,
             // the maps-root case, which reads maps across a chroot,
             // the generated-name-errors case, which makes, removes and
-            // renames names in /proc as root and then becomes nobody,
+            // renames names in /proc as root and then becomes nobody, the
+            // magic-link-names case, which becomes nobody for its names,
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
@@ -245,6 +246,7 @@ mod linux {
                     | "proc-mem"
                     | "chroot-names"
                     | "generated-name-errors"
+                    | "magic-link-names"
                     | "maps-root"
                     | "path-flags"
                     | "permissions"

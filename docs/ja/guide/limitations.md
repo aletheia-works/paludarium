@@ -149,7 +149,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/interrupts`、`/proc/partitions`、`/proc/kallsyms`、
   `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、
-  `vm/unprivileged_userfaultfd` 以外など）と、
+  `vm/max_map_count`、`vm/unprivileged_userfaultfd` 以外など）と、
   読むプロセス自身のディレクトリのほかの名前
   （`stack`、`sched`、`attr` など）は、ほかのプロセスのディレクトリと同じく `ENOENT` です。
   ファイルシステムがそこに何を持っていても（`--mount /:/` ではホストの `/proc`）同じです。
@@ -159,7 +159,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   読める読み手には待っているカーネルの関数の名前を見せますが、ここには名前を付けるカーネルの
   関数がありません。`hostname` と `domainname` をいくつか見張る epoll 自身のポーリングは、
   用意のできたものが 1 つ見つかるまで、記述子の番号の順に見ます。Linux は変わった順に見るので、
-  いくつか変わっていると、見たことになるものが違うことがあります。`io` は、Linux の `kernel_read` と `kernel_write` が
+  いくつか変わっていると、見たことになるものが違うことがあります。`vm/max_map_count` は
+  モード 0444 で何も縛りません。Linux のものは root が書けて（0644）、それを超える
+  マッピングを `ENOMEM` にします。`fs/pipe-user-pages-soft` と `fs/pipe-user-pages-hard`
+  はなく、ユーザーのパイプのページを数えるものもないので、Linux のソフトの上限を超えた
+  ユーザーのパイプも小さくされず、伸ばすのも拒まれません（`EPERM`）。`io` は、Linux の `kernel_read` と `kernel_write` が
   そのプロセスに数えるもの（`execve` がプログラムとインタープリターを読むこと、コアダンプの
   書き込み）を数えません。また、Linux がファイルの操作の前でも中でも返す errno
   （`EINVAL`、`EFAULT`。eventfd に小さすぎるバッファを渡したときなど）で失敗した読み書きは、

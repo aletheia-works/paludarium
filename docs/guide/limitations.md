@@ -175,7 +175,7 @@ verified.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/interrupts`, `/proc/partitions`, `/proc/kallsyms`, the files of `/proc/sys` but for the ones of `fs`,
-  `kernel` and `net` it has and `vm/drop_caches` and
+  `kernel` and `net` it has and `vm/drop_caches`, `vm/max_map_count` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, `attr`, ...) are `ENOENT`, as in
   another process's directory, whatever the filesystem holds there (with
@@ -187,6 +187,11 @@ verified.
   of `hostname` and `domainname` polls them by descriptor number until one is
   ready, where Linux does in the order they changed, so that of several that
   changed another may be the one it has seen.
+  `vm/max_map_count` is of mode 0444 and bounds nothing, where Linux's is
+  root's to write (0644) and makes a mapping past it `ENOMEM`. There are no
+  `fs/pipe-user-pages-soft` and `fs/pipe-user-pages-hard`, and nothing counts
+  a user's pipe pages, so a pipe of a user past Linux's soft limit is not
+  made smaller nor refused growth (`EPERM`).
   `io` does not count what Linux's
   `kernel_read` and `kernel_write` count for the process (`execve` reading its
   program and interpreter, a core dump's writes), and a read or write that

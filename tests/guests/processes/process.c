@@ -31807,6 +31807,67 @@ static int sysctl_constants_case(void) {
     return 0;
 }
 
+/* The sysctl-limits case's read of `path` into `buf` (NUL-ended): whether
+   it is one decimal number and a newline, its value in `value`. */
+static int sl_number(const char *path, char *buf, size_t size, long long *value) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    long n = read(fd, buf, size - 1);
+    close(fd);
+    buf[n < 0 ? 0 : n] = 0;
+    if (n < 2 || buf[n - 1] != '\n') return 0;
+    for (long i = 0; i < n - 1; i++)
+        if (buf[i] < '0' || buf[i] > '9') return 0;
+    *value = atoll(buf);
+    return 1;
+}
+/* The sysctl-limits case: /proc/sys/fs's nr_open and pipe-max-size and
+   /proc/sys/vm's max_map_count. Their values differ from machine to
+   machine, so their form shows, and what nr_open and pipe-max-size bound:
+   a hard RLIMIT_NOFILE past nr_open, and a pipe of someone other than root
+   grown past pipe-max-size. */
+static int sysctl_limits_case(void) {
+    char buf[64];
+    long long nr_open = 0, pipe_max = 0, map_count = 0;
+    printf("nr_open: formed=%d\n", sl_number("/proc/sys/fs/nr_open", buf, sizeof buf, &nr_open));
+    printf("pipe-max-size: formed=%d\n", sl_number("/proc/sys/fs/pipe-max-size", buf, sizeof buf, &pipe_max));
+    int formed = sl_number("/proc/sys/vm/max_map_count", buf, sizeof buf, &map_count);
+    printf("max_map_count: formed=%d positive=%d\n", formed, map_count > 0);
+    const char *writable[] = {"/proc/sys/fs/nr_open", "/proc/sys/fs/pipe-max-size"};
+    for (int i = 0; i < 2; i++) {
+        struct stat st;
+        int r = stat(writable[i], &st);
+        printf("%s: stat=%d mode=%o uid=%u size=%lld\n", writable[i], r, (unsigned)(st.st_mode & 07777),
+               (unsigned)st.st_uid, (long long)st.st_size);
+    }
+    struct rlimit limit;
+    getrlimit(RLIMIT_NOFILE, &limit);
+    printf("nr_open: least=%d hard-within=%d\n", nr_open >= 64, (long long)limit.rlim_max <= nr_open);
+    struct rlimit past = {limit.rlim_cur, (rlim_t)nr_open + 1};
+    printf("nr_open: past=%d\n", setrlimit(RLIMIT_NOFILE, &past) < 0 ? -errno : 0);
+    printf("pipe-max-size: page-power=%d\n", pipe_max >= 4096 && (pipe_max & (pipe_max - 1)) == 0);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 && (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(2);
+        int p[2];
+        if (pipe(p)) _exit(3);
+        long start = fcntl(p[0], F_GETPIPE_SZ);
+        long at = fcntl(p[0], F_SETPIPE_SZ, (int)pipe_max);
+        long beyond = fcntl(p[0], F_SETPIPE_SZ, (int)pipe_max + 1);
+        int beyond_errno = beyond < 0 ? errno : 0;
+        printf("not root: start-within=%d at-max=%d beyond=%d\n", start == (pipe_max < 65536 ? pipe_max : 65536),
+               at == pipe_max, beyond < 0 ? -beyond_errno : (int)beyond);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("not root: child=%d\n", status);
+    return 0;
+}
+
 /* The uts-sysctl case's files, under /proc/sys/kernel. */
 static int us_open(const char *name, int flags) {
     char path[96];
@@ -45782,6 +45843,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
     if (!strcmp(mode, "sysctl-constants")) return sysctl_constants_case();
+    if (!strcmp(mode, "sysctl-limits")) return sysctl_limits_case();
     if (!strcmp(mode, "poll-default")) return poll_default_case();
     if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
     if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();

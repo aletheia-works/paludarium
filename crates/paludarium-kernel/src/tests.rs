@@ -1573,7 +1573,7 @@ fn close_range_marks_closes_and_unshares_the_table() {
     let fd = f.ret(2, &[DATA, 66, 0o600]);
     let (a, b) = (f.ret(32, &[fd]), f.ret(32, &[fd]));
     // A CLONE_FILES sibling, which sees every change to a shared table.
-    let sibling = f.kernel.files.for_clone(true, false);
+    let sibling = f.kernel.files.for_clone(true, false).unwrap();
     assert_eq!(f.ret(436, &[b, b, 4]), 0); // CLOSE_RANGE_CLOEXEC
     assert_eq!((f.ret(72, &[b, 1]), f.ret(72, &[a, 1])), (1, 0)); // F_GETFD
     // CLOSE_RANGE_UNSHARE: the copy loses `a`, the sibling's table keeps it,
@@ -11704,7 +11704,7 @@ mod inotify {
         let wd = f.ret(ADD, &[fd, home, 0x400]) as i32;
         // A copy of the working directory, as a child without CLONE_FS
         // gets, holds it too.
-        let child = f.kernel.files.for_clone(true, false);
+        let child = f.kernel.files.for_clone(true, false).unwrap();
         assert_eq!(f.ret(84, &[home]), 0);
         assert_eq!(masks(&events(&mut f, fd)), []);
         assert_eq!(f.ret(80, &[tmp]), 0);

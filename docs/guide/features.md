@@ -666,10 +666,33 @@ kernel.
   (45 at first) are root's files of mode 0644, which take any `int`
   (`proc_dointvec`).
 
+- `/proc/sys/fs/nr_open` and `/proc/sys/fs/pipe-max-size` (both 1048576 at
+  first) are the machine's, root's files of mode 0644 that take an
+  `unsigned int` (`proc_douintvec_minmax`): `nr_open` from 64 to 2147483584
+  (`EINVAL` otherwise), and `pipe-max-size` cut to 32 bits and rounded up to
+  a power of two of at least a page, as `round_pipe_size` rounds it, past
+  2³¹ `EINVAL`. `nr_open` bounds the hard `RLIMIT_NOFILE` (`EPERM` past it)
+  and each descriptor table, as Linux's tables grow: a table has room for 64
+  descriptors at first, and a number past its room grows it to the least
+  power of two that holds the number, but not past `nr_open`, cut back to a
+  multiple of 64, nor past 2²⁷ descriptors; a number it cannot grow to is
+  `EMFILE` (`EBADF` for `dup2` and `dup3`). A table that grew keeps its room
+  when `nr_open` drops. A copy of a table (`fork`, `clone` without
+  `CLONE_FILES`, `unshare(CLONE_FILES)`, `CLOSE_RANGE_UNSHARE` and the exec
+  of a thread that shares its table) has room for its highest number in use,
+  in steps of 64, not counting the numbers `close_range` closes, and fails
+  with `EMFILE` when `nr_open` no longer lets a table have that much; the
+  exec, past its point of no return, ends with `SIGSEGV`. An embedder's
+  ceiling on open files bounds the hard limit beside `nr_open`, whatever
+  root writes to it.
+
 - A pipe holds 16 buffers of a page each (64 KiB), as on Linux, and
   `fcntl`'s `F_SETPIPE_SZ` and `F_GETPIPE_SZ` resize and report it like
   `pipe_set_size`: a power of two of at least a page, `EBUSY` below the
-  buffers in use and `EINVAL` past 2³¹. A write's bytes past whole pages
+  buffers in use and `EINVAL` past 2³¹. Without `CAP_SYS_RESOURCE`, a new
+  pipe or FIFO holds no more than `/proc/sys/fs/pipe-max-size`, and
+  `F_SETPIPE_SZ` may not grow a pipe past it (`EPERM`), as
+  `alloc_pipe_info` and `pipe_set_size` have it. A write's bytes past whole pages
   join the last buffer where it has room, and the rest go into new
   buffers, as `anon_pipe_write` places them; `splice`, `tee` and
   `vmsplice` make buffers of their own, which no write joins.
@@ -5000,9 +5023,12 @@ kernel.
   `POLLRDNORM`, `POLLERR` and `POLLPRI` and no `POLLOUT`. A `dup` and a child
   share what it has seen, and a poll of an epoll that watches it is one too.
 
-- `/proc/sys/vm` has `drop_caches` and `unprivileged_userfaultfd` alone, so
-  its listing differs from Linux's, which has the rest of the `vm` sysctls
-  too. `unprivileged_userfaultfd` is the machine's, 0 at first, root's of
+- `/proc/sys/vm` has `drop_caches`, `max_map_count` and
+  `unprivileged_userfaultfd` alone, so its listing differs from Linux's,
+  which has the rest of the `vm` sysctls too. `max_map_count` is the
+  machine's 65530 (`DEFAULT_MAX_MAP_COUNT`), root's, of mode 0444, which no
+  one opens to write (`EACCES`), as nothing here bounds a process's
+  mappings by it. `unprivileged_userfaultfd` is the machine's, 0 at first, root's of
   mode 0644, which only root opens to write, and takes 0 or 1
   (`proc_dointvec_minmax`, else `EINVAL`). As Linux's
   `fs/drop_caches.c` has it, the file is root's, of mode 0200: no one may
@@ -7079,8 +7105,9 @@ kernel.
 
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
-  read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's
-  `fs.nr_open`), or to a lower ceiling the embedder sets. Raising a hard limit
+  read and changed; the hard `RLIMIT_NOFILE` goes up to `fs.nr_open`
+  (1048576 at first, which root may change through `/proc/sys/fs/nr_open`),
+  or to a lower ceiling the embedder sets. Raising a hard limit
   needs `CAP_SYS_RESOURCE` (`EPERM`). `prlimit64` on another thread, to read
   or to set, needs `CAP_SYS_RESOURCE`, or the caller's real user and group IDs
   to be all of that thread's real, effective and saved ones (`EPERM`, before

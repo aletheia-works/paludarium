@@ -578,10 +578,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/sys/fs/lease-break-time`（最初は 45）は root のモード 0644 のファイルで、どの `int`
   も受け取ります（`proc_dointvec`）。
 
+- `/proc/sys/fs/nr_open` と `/proc/sys/fs/pipe-max-size`（どちらも最初は 1048576）は
+  マシン全体のもので、`unsigned int` を受け取る root のモード 0644 のファイルです
+  （`proc_douintvec_minmax`）。`nr_open` は 64 から 2147483584 まで（それ以外は `EINVAL`）、
+  `pipe-max-size` は 32 ビットに切ってから、`round_pipe_size` と同じく 1 ページ以上の
+  2 のべき乗に切り上げ、2³¹ を超えると `EINVAL` です。`nr_open` は、ハードの
+  `RLIMIT_NOFILE`（超えると `EPERM`）と、Linux の表と同じように伸びる記述子の表を
+  縛ります。表は最初 64 個の記述子の場所を持ち、場所を超える番号は、その番号の入る
+  いちばん小さい 2 のべき乗まで表を伸ばします。ただし `nr_open`（64 の倍数に切り下げた
+  もの）も 2²⁷ 個も超えません。伸ばせない番号は `EMFILE`（`dup2` と `dup3` では
+  `EBADF`）です。伸びた表は、`nr_open` が下がっても場所を保ちます。表の写し（`fork`、
+  `CLONE_FILES` のない `clone`、`unshare(CLONE_FILES)`、`CLOSE_RANGE_UNSHARE`、表を
+  共有するスレッドの exec）は、使っているいちばん大きい番号の分の場所を 64 刻みで持ち、
+  `close_range` が閉じる番号は数えません。`nr_open` がそれだけの場所を許さなくなって
+  いれば `EMFILE` で失敗し、exec は後戻りできない点を過ぎているので `SIGSEGV` で
+  終わります。埋め込む側が決めた開けるファイルの天井は、root が `nr_open` に何を書いても、
+  `nr_open` とは別にハードの上限を縛ります。
+
 - パイプは Linux と同じく 1 ページのバッファーを 16 個（64 KiB）持ちます。`fcntl` の
   `F_SETPIPE_SZ` と `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。
   大きさは 1 ページ以上の 2 のべき乗で、使っているバッファーより少なくすると `EBUSY`、
-  2³¹ を超えると `EINVAL` です。書き込みのうちページに満たない分は、`anon_pipe_write`
+  2³¹ を超えると `EINVAL` です。`CAP_SYS_RESOURCE` がなければ、`alloc_pipe_info` と
+  `pipe_set_size` と同じく、新しいパイプや FIFO は `/proc/sys/fs/pipe-max-size` までしか
+  持たず、`F_SETPIPE_SZ` でそれを超えて伸ばすこともできません（`EPERM`）。書き込みのうちページに満たない分は、`anon_pipe_write`
   と同じく、空きのある最後のバッファーに加わり、残りは新しいバッファーに入ります。
   `splice`、`tee`、`vmsplice` は、書き込みの加わらない自分のバッファーを作ります。
 
@@ -4275,8 +4294,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ポーリングが、`POLLOUT` のない `POLLIN`、`POLLRDNORM`、`POLLERR`、`POLLPRI` を返します。
   見たかどうかは `dup` と子で共有します。それを見張る epoll のポーリングも、見たことになります。
 
-- `/proc/sys/vm` にあるのは `drop_caches` と `unprivileged_userfaultfd` だけなので、
-  ほかの `vm` の sysctl もある Linux とは一覧が違います。`unprivileged_userfaultfd` は
+- `/proc/sys/vm` にあるのは `drop_caches`、`max_map_count`、`unprivileged_userfaultfd`
+  だけなので、ほかの `vm` の sysctl もある Linux とは一覧が違います。`max_map_count` は
+  マシンの 65530（`DEFAULT_MAX_MAP_COUNT`）で、root のモード 0444 のファイルです。ここでは
+  プロセスのマッピングをこれで縛らないので、誰も書くために開けません（`EACCES`）。
+  `unprivileged_userfaultfd` は
   マシンのもので、初めは 0、root のモード 0644 のファイルで、書くために開けるのは root
   だけです。0 か 1 を受け付けます（`proc_dointvec_minmax`、ほかは `EINVAL`）。Linux の `fs/drop_caches.c` と同じく、このファイルは root の
   もので、モードは 0200 です。読むためには root でも開けず（`EACCES`。`test_perm` は root
@@ -6026,8 +6048,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
   8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ハードの
-  `RLIMIT_NOFILE` は 1048576（Linux の `fs.nr_open`）まで、埋め込む側がそれより低い
-  天井を決めたときはその値まで上げられます。ハードの上限を上げるには
+  `RLIMIT_NOFILE` は `fs.nr_open`（最初は 1048576 で、root が `/proc/sys/fs/nr_open` で
+  変えられます）まで、埋め込む側がそれより低い天井を決めたときはその値まで上げられます。ハードの上限を上げるには
   `CAP_SYS_RESOURCE` が必要です（`EPERM`）。ほかのスレッドへの `prlimit64` は、読むにも
   書くにも、`CAP_SYS_RESOURCE` があるか、呼んだ側の実ユーザー ID と実グループ ID が相手の
   実、実効、保存の ID すべてと同じであることが必要です（`EPERM`。知らない資源より先に

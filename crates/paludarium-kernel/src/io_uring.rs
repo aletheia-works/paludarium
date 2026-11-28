@@ -1,4 +1,6 @@
-//! io_uring, as Linux 6.12's (`io_uring/`) with these operations:
+//! io_uring, as Linux 7.0's (`io_uring/`), the kernel the differential tests
+//! run on, with the changes of Linux master its runners have, and with these
+//! operations:
 //! `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL` (the one libuv batches its
 //! `epoll_ctl` calls with) and `_EPOLL_WAIT`, the file transfers
 //! `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`,
@@ -1950,17 +1952,36 @@ pub(super) fn select_send(
 impl BufferRing {
     /// The buffers a send of up to `want` bytes (0 for any, and no more
     /// than `MAX_RW_COUNT`) takes from the head, which are used at once, as
-    /// Linux master's `io_ring_buffers_peek` and `io_kbuf_commit` take them.
-    /// None ready, or a first of no bytes, is `ENOBUFS`, and one outside the
-    /// user half `EFAULT`.
-    ///
-    /// A send takes one; a bundle as many as are ready, but no more than
-    /// 1024, 256, or what `want` needs at the first's length. Each gives
-    /// what is left of `want` at most, its entry as it was. One cut short
-    /// stays only as the first, unless the ring has `IOU_PBUF_RING_INC`,
-    /// whose bytes come off the buffer instead. The group counts as emptied
-    /// when every buffer ready was taken.
+    /// Linux master's `io_ring_buffers_peek` and `io_kbuf_commit` take them
+    /// ([`BufferRing::peek`]). A send takes one, a bundle up to 256.
     fn take_for_send(&mut self, c: &Context<'_>, want: u32, bundle: bool) -> Result<Picked, Errno> {
+        let budget = if want == 0 { i32::MAX as u32 } else { want };
+        let peeked = self.peek(c, budget, if bundle { 256 } else { 1 })?;
+        let used: u32 = peeked.pieces.iter().map(|&(_, len)| len as u32).sum();
+        let more = if self.incremental {
+            !self.commit(c, used)?
+        } else {
+            self.head = self.head.wrapping_add(peeked.pieces.len() as u16);
+            false
+        };
+        Ok(Picked {
+            bid: peeked.bid,
+            pieces: peeked.pieces,
+            more,
+            emptied: peeked.emptied,
+        })
+    }
+
+    /// The buffers from the head that up to `budget` bytes (no more than
+    /// `MAX_RW_COUNT`) would take, at most `most` of them and as many as
+    /// that budget needs at the first's length, none of them used yet. None
+    /// ready, or a first of no bytes, is `ENOBUFS`, and one outside the user
+    /// half `EFAULT`. Each gives what is left of the budget at most, its
+    /// entry as it was. One cut short stays only as the first (`cut`),
+    /// unless the ring has `IOU_PBUF_RING_INC`, whose bytes come off the
+    /// buffer as they are used. The group counts as emptied when every
+    /// buffer ready was taken.
+    fn peek(&mut self, c: &Context<'_>, budget: u32, most: u32) -> Result<Peeked, Errno> {
         let ready = self.tail(c)?.wrapping_sub(self.head);
         if ready == 0 {
             return Err(ENOBUFS);
@@ -1969,24 +1990,23 @@ impl BufferRing {
         if first_len == 0 {
             return Err(ENOBUFS);
         }
-        let budget =
-            (if want == 0 { i32::MAX as u32 } else { want }).min(crate::files::MAX_RW_COUNT as u32);
-        let most = if bundle {
-            u32::from(ready)
-                .min(1024)
-                .min(256)
-                .min(budget.div_ceil(first_len))
-        } else {
-            1
-        };
+        let budget = budget.min(crate::files::MAX_RW_COUNT as u32);
+        let most = u32::from(ready)
+            .min(1024)
+            .min(most)
+            .min(budget.div_ceil(first_len));
         let mut pieces = Vec::new();
         let mut left = budget;
+        let mut cut = false;
         for offset in 0..most as u16 {
             let index = self.head.wrapping_add(offset);
             let (addr, size, _) = self.entry(c, index)?;
             let part = size.min(left);
-            if part < size && !self.incremental && !pieces.is_empty() {
-                break;
+            if part < size && !self.incremental {
+                if !pieces.is_empty() {
+                    break;
+                }
+                cut = true;
             }
             crate::sockets::access_ok_u64(addr, u64::from(part))?;
             pieces.push((addr, part as usize));
@@ -1995,20 +2015,143 @@ impl BufferRing {
                 break;
             }
         }
-        let taken = pieces.len() as u16;
-        let emptied = taken == ready;
-        let more = if self.incremental {
-            !self.commit(c, budget - left)?
-        } else {
-            self.head = self.head.wrapping_add(taken);
-            false
-        };
-        Ok(Picked {
+        let emptied = pieces.len() as u16 == ready;
+        Ok(Peeked {
             bid,
             pieces,
-            more,
             emptied,
+            cut,
         })
+    }
+
+    /// Uses what a receive filled of the `count` buffers it took from the
+    /// head, `len` bytes (`io_kbuf_commit`): the head moves past them, or
+    /// with `IOU_PBUF_RING_INC` the bytes come off them. Whether the last
+    /// is used up.
+    fn commit_received(&mut self, c: &Context<'_>, len: u32, count: u16) -> Result<bool, Errno> {
+        if self.incremental {
+            return self.commit(c, len);
+        }
+        self.head = self.head.wrapping_add(count);
+        Ok(true)
+    }
+}
+
+/// Buffers looked at from a ring's head, not yet used ([`BufferRing::peek`]).
+struct Peeked {
+    bid: u16,
+    pieces: Vec<(u64, usize)>,
+    emptied: bool,
+    cut: bool,
+}
+
+/// The buffers a receive with `IORING_RECVSEND_BUNDLE` and
+/// `IOSQE_BUFFER_SELECT` receives to (`io_buffers_peek`): the first's ID,
+/// their bytes, the provided buffer it took, which goes back if nothing
+/// comes, whether the group has none left (`REQ_F_BL_EMPTY`) and whether
+/// the first was cut short (`IORING_RECV_PARTIAL_MAP`).
+pub(super) struct Received {
+    bgid: u16,
+    pub(super) bid: u16,
+    pub(super) pieces: Vec<(u64, usize)>,
+    provided: Option<Chosen>,
+    pub(super) emptied: bool,
+    pub(super) cut: bool,
+}
+
+/// `io_buffers_peek` for a receive's bundle of up to `max` bytes (0 for any
+/// one buffer): no group is `ENOENT`; a ring gives as many buffers as
+/// [`BufferRing::peek`] does, but only one when `max` is 0, and a group of
+/// provided buffers one, cut to `max`, as `io_provided_buffer_select` does.
+pub(super) fn select_receive(
+    c: &Context<'_>,
+    ring: &Ring,
+    bgid: u16,
+    max: u32,
+) -> Result<Received, Errno> {
+    let mut lists = ring
+        .buffer_lists
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    match lists.get_mut(&bgid) {
+        None => Err(Errno::ENOENT),
+        Some(BufferList::Provided(list)) => {
+            let buffer = list.pop_front().ok_or(ENOBUFS)?;
+            let len = if max == 0 || max > buffer.len {
+                buffer.len
+            } else {
+                max
+            };
+            Ok(Received {
+                bgid,
+                bid: buffer.bid,
+                pieces: vec![(buffer.addr, len as usize)],
+                provided: Some(Chosen {
+                    bgid,
+                    bid: buffer.bid,
+                    addr: buffer.addr,
+                    len,
+                    size: buffer.len,
+                    ring: false,
+                    committed: true,
+                    more: false,
+                }),
+                emptied: list.is_empty(),
+                cut: false,
+            })
+        }
+        Some(BufferList::Ring(buffers)) => {
+            let budget = if max == 0 { i32::MAX as u32 } else { max };
+            let peeked = buffers.peek(c, budget, if max == 0 { 1 } else { 256 })?;
+            Ok(Received {
+                bgid,
+                bid: peeked.bid,
+                pieces: peeked.pieces,
+                provided: None,
+                emptied: peeked.emptied,
+                cut: peeked.cut,
+            })
+        }
+    }
+}
+
+/// What a bundle receive's buffers become once it filled `len` bytes of
+/// them, and its completion's flags (`io_put_kbufs` with
+/// `io_bundle_nbufs`): with none, a provided buffer goes back to its group
+/// and a ring's stay as they were (`io_kbuf_recycle`), with no flags.
+/// Otherwise the buffers it filled any of are used, and the completion has
+/// `IORING_CQE_F_BUFFER` with the first's ID, and `IORING_CQE_F_BUF_MORE`
+/// when some of a ring's last is left.
+pub(super) fn put_received(c: &Context<'_>, ring: &Ring, received: &Received, len: u64) -> u32 {
+    if len == 0 {
+        if let Some(chosen) = &received.provided {
+            net::recycle(ring, chosen);
+        }
+        return 0;
+    }
+    let flags = CQE_F_BUFFER | u32::from(received.bid) << CQE_BUFFER_SHIFT;
+    if received.provided.is_some() {
+        return flags;
+    }
+    let mut left = len;
+    let mut count = 0u16;
+    for &(_, size) in &received.pieces {
+        if left == 0 {
+            break;
+        }
+        left = left.saturating_sub(size as u64);
+        count += 1;
+    }
+    let mut lists = ring
+        .buffer_lists
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    match lists.get_mut(&received.bgid) {
+        Some(BufferList::Ring(buffers)) => match buffers.commit_received(c, len as u32, count) {
+            Ok(true) | Err(_) => flags,
+            Ok(false) => flags | CQE_F_BUF_MORE,
+        },
+        _ => flags,
     }
 }
 

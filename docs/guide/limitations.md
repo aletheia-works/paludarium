@@ -675,8 +675,8 @@ verified.
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
   Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
-  socket requests, a receive's bundle (`IORING_RECVSEND_BUNDLE`) and a
-  receive with `MSG_WAITALL` that selects a buffer are not there yet
+  socket requests, a receive with `MSG_WAITALL` that selects a buffer, a
+  bundle (`IORING_RECVSEND_BUNDLE`) among them, is not there yet
   (`EINVAL`). A send's selected buffers follow Linux master; the kernel of
   the differential tests' runners still sends a provided buffer whole
   whatever the length (before master's b7322810d187), so the tests do not

@@ -8903,6 +8903,7 @@ mod io_uring {
     }
 
     const SENDMSG: u8 = 9;
+    const RECVMSG: u8 = 10;
     const ACCEPT: u8 = 13;
     const CONNECT: u8 = 16;
     const SEND: u8 = 26;
@@ -8999,9 +9000,11 @@ mod io_uring {
                 -22,
             ),
             (with(net(SEND, a, 1 << 40, buf, 1, 0, 0), 44, &[4]), -14),
-            // A message takes no bundle, and a receive's is not there yet.
+            // A message takes no bundle, and a receive that selects a whole
+            // buffer is not there yet.
             (net(SENDMSG, a, 0, buf, 0, 0, 16), -22),
-            (net(RECV, a, 0, buf, 1, 0, 16), -22),
+            (net(RECVMSG, a, 0, buf, 1, 0, 16), -22),
+            (with(net(RECV, a, 0, 0, 1, WAITALL, 16), 1, &[1 << 5]), -22),
             // A vectored send reads its iovecs as it is prepared.
             (net(SEND, a, 0, buf, 1025, 0, 32), -22),
             (net(SEND, a, 0, 1 << 63, 1, 0, 32), -14),
@@ -9179,6 +9182,77 @@ mod io_uring {
         assert_eq!(reap_flags(&mut f, &r), [(1, 5, MORE), (1, 0, 0)]);
         assert_eq!(f.ret(0, &[b, got, 16]), 5);
         assert_eq!(bytes(&f, got, 5), b"abcde");
+    }
+
+    #[test]
+    fn a_receive_bundle_fills_buffers_and_tries_once_more_as_linux_7_0_does() {
+        const NONEMPTY: u32 = 4;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (a, b) = unix_pair(&mut f, 1);
+        let (put, got) = (DATA + 0x100, DATA + 0x200);
+        f.mem.write(GuestAddr(put), b"abcdefghijklmnopq").unwrap();
+        let bundle = |bgid: u16, len: u32| {
+            with(
+                with(net(RECV, a, 0, 0, len, 0, 16), 1, &[1 << 5]),
+                40,
+                &bgid.to_le_bytes(),
+            )
+        };
+        // No group is ENOENT, as `io_buffers_peek` has it.
+        assert_eq!(f.ret(1, &[b, put, 6]), 6);
+        assert_eq!(one(&mut f, &r, &bundle(7, 8)), -2);
+        // A ring's buffers, as many as the length needs: the completion
+        // names the first, and the head moves past those it filled.
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(pbuf(&mut f, &r, page, 4, 1, 0), 0);
+        for index in 0..4 {
+            entry(&f, page, index, got + 8 * index, 4, 10 + index as u16);
+        }
+        tail(&f, page, 4);
+        assert_eq!(one_flags(&mut f, &r, &bundle(1, 8)), (6, BUFFER | 10 << 16));
+        assert_eq!(head(&mut f, &r, 1), 2);
+        assert_eq!(bytes(&f, got, 4), b"abcd");
+        assert_eq!(bytes(&f, got + 8, 2), b"ef");
+        // Filled whole while the socket has more, it tries once more for
+        // what is there, in the same completion.
+        assert_eq!(f.ret(1, &[b, put + 6, 10]), 10);
+        assert_eq!(
+            one_flags(&mut f, &r, &bundle(1, 4)),
+            (8, BUFFER | NONEMPTY | 12 << 16)
+        );
+        assert_eq!(head(&mut f, &r, 1), 4);
+        assert_eq!(bytes(&f, got + 16, 4), b"ghij");
+        assert_eq!(bytes(&f, got + 24, 4), b"klmn");
+        // A provided buffer, one at most, cut to the length; with nothing to
+        // read the request waits and the buffer goes back meanwhile.
+        assert_eq!(one(&mut f, &r, &provide(1, got + 0x40, 6, 7, 3)), 0);
+        assert_eq!(one_flags(&mut f, &r, &bundle(7, 0)), (2, BUFFER | 3 << 16));
+        assert_eq!(bytes(&f, got + 0x40, 2), b"op");
+        assert_eq!(one(&mut f, &r, &provide(1, got + 0x40, 6, 7, 4)), 0);
+        submit_only(&mut f, &r, &[bundle(7, 0)]);
+        assert_eq!(reap_flags(&mut f, &r), []);
+        assert_eq!(one(&mut f, &r, &provide(1, got + 0x50, 6, 7, 5)), 0);
+        assert_eq!(f.ret(1, &[b, put + 16, 1]), 1);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 1, BUFFER | 4 << 16)]);
+        assert_eq!(bytes(&f, got + 0x40, 1), b"q");
+        // A multishot one posts and goes on, but ends once it took the
+        // group's last buffers (`REQ_F_BL_EMPTY`).
+        const MORE: u32 = 2;
+        assert_eq!(pbuf(&mut f, &r, page, 4, 1, 0), errno(Errno::EEXIST));
+        tail(&f, page, 8);
+        // The ring has four entries: its head wraps to the first.
+        for index in 0..4 {
+            entry(&f, page, index, got + 8 * index, 4, 24 + index as u16);
+        }
+        let multishot = with(bundle(1, 8), 2, &[2 | 16]);
+        assert_eq!(f.ret(1, &[b, put, 6]), 6);
+        submit_only(&mut f, &r, &[multishot]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 6, MORE | BUFFER | 24 << 16)]);
+        assert_eq!(f.ret(1, &[b, put, 8]), 8);
+        assert_eq!(f.ret(426, &[r.fd, 0, 1, GETEVENTS]), 0);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 8, BUFFER | 26 << 16)]);
+        assert_eq!(head(&mut f, &r, 1), 8);
     }
 
     #[test]

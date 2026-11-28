@@ -1713,10 +1713,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     成功してマップされたまま残します。
   - `fork` の子は封印を受け継ぎ、`exec` のあとは何も封印されていません。
 
-- io_uring は Linux 6.12 のものですが、登録したファイル、バッファーのグループ、NOP の
-  フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
-  `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。知っている操作、登録、setup と
-  `io_uring_enter` のフラグも Linux 7.0 のものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
+- io_uring は、差分テストを走らせるカーネルである Linux 7.0 のもので、テストのランナーのカーネルに
+  ある Linux master の変更（NOP の `IOSQE_FIXED_FILE` など）も含みます。操作、登録、setup と
+  `io_uring_enter` のフラグは、それが知っているものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と `_EPOLL_WAIT`、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`_READV_FIXED`、`_WRITEV_FIXED`、
   `IORING_OP_FILES_UPDATE`、
@@ -1934,7 +1933,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   取ります。切り詰めることになるバッファーは、リングが `IOU_PBUF_RING_INC` でなければ次に残し、
   最後のバッファーを取るとグループは空になります。何か送ったバンドルは `IORING_CQE_F_MORE` 付きで投稿して、長さなしの新しいバッファーで
   すぐにまた送り、何も送らなくなるか、グループの最後のバッファーを取るか、待ったところで終わります
-  （`io_send_finish`）。バッファーを選ばないものは、2 度目には何も送りません。`MSG_WAITALL` では、
+  （`io_send_finish`）。バッファーを選ばないものは、2 度目には何も送りません。バッファーを選ぶ
+  `IORING_RECVSEND_BUNDLE` の `IORING_OP_RECV` は、長さに要るだけのリングのバッファーに受信します。
+  長さを頼まなければ、ソケットが最後に告げた量に要るだけで（最初は 1 個）、最大 256 個、マルチショットの
+  受信なら残りの量までです（`io_recv_buf_select`）。見つからないグループは `ENOENT` で、提供された
+  バッファーのグループは 1 個を返します。1 バイトでも埋めたバッファーを使い、完了は最初のものを示します。
+  すべて埋めて、ソケットにまだあり、最初のものを切り詰めていなければ、一度だけその量をもう一度受信して
+  同じ完了に足します（`io_recv_finish`）。グループの最後のバッファーを取ったものは、マルチショットでも
+  `IORING_CQE_F_MORE` なしで完了します。`IORING_OP_RECVMSG` はバンドルを取りません（`EINVAL`）。`MSG_WAITALL` では、
   ストリームまたは順序付きパケットのソケットの送受信は長さ全体まで続け、動かした分をすべて
   返します。途中で失敗したもの（待たないように頼んだものや、取り消されたもの）も、それまでに動かした分を
   返します（`io_sendrecv_fail`）。受信は提供されたバッファーを選べ（`ENOBUFS`）、そのバッファーは、Linux master の

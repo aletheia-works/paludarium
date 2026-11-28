@@ -1948,11 +1948,10 @@ kernel.
     ignores its failed unmap.
   - A child of `fork` keeps the seals; `exec` starts without any.
 
-- io_uring is Linux 6.12's, but for its registered files, its groups of
-  buffers and a NOP's flags, which are Linux 7.0's (`io_uring/rsrc.c`,
-  `kbuf.c` and `nop.c`, with master's `IOSQE_FIXED_FILE` for a NOP), the
-  kernel the differential tests run on, and so are the operations,
-  registrations and setup and `io_uring_enter` flags it knows of. Its
+- io_uring is Linux 7.0's, the kernel the differential tests run on, with
+  the changes of Linux master that the test runners' kernel has, such as a
+  NOP's `IOSQE_FIXED_FILE`; its operations, registrations and setup and
+  `io_uring_enter` flags are those it knows of. Its
   operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with) and
   `_EPOLL_WAIT`, the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`,
@@ -2232,7 +2231,18 @@ kernel.
   sent anything posts with `IORING_CQE_F_MORE` and sends again at once,
   with no length and new buffers, until it sends nothing, takes its
   group's last buffers or waited (`io_send_finish`); one that selects none
-  sends nothing the second time. With `MSG_WAITALL`, a stream or
+  sends nothing the second time. An `IORING_OP_RECV` with
+  `IORING_RECVSEND_BUNDLE` that selects receives to as many of a ring's
+  buffers as its length needs, or as its socket last said it has when it
+  asks for none (one, at first), at most 256 and no more than a multishot
+  receive has left (`io_recv_buf_select`); a group it does not find is
+  `ENOENT`, and a group of provided buffers gives one. It uses the buffers
+  it filled any of, and its completion names the first. Once, if it filled
+  them all, its socket has more and the first was not cut, it receives
+  again for that much and adds it to the same completion
+  (`io_recv_finish`). One that took the group's last buffers completes, a
+  multishot one too, without `IORING_CQE_F_MORE`. `IORING_OP_RECVMSG`
+  takes no bundle (`EINVAL`). With `MSG_WAITALL`, a stream or
   sequenced-packet socket's send or receive goes on to its whole length
   and gives all it moved; one that fails on the way, as it asked not to
   wait or was cancelled, gives what it moved too (`io_sendrecv_fail`). A

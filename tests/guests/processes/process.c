@@ -13253,6 +13253,76 @@ static int io_uring_multishot_case(void) {
     unet_push(&u, 26, 1, sp[0], 0, (long)sout, 5, 0, 16);
     um_run(&u, 1, 1, "send-bundle-plain");
     printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    /* A receive's bundle (IORING_RECVSEND_BUNDLE with IOSQE_BUFFER_SELECT):
+       no group is ENOENT; a ring gives as many buffers as the length needs,
+       and one filled whole while more waits tries once more for it, in the
+       same completion; a provided buffer is one at most; a multishot one
+       ends once it took the group's last buffers. */
+    if (write(sp[1], "abcdef", 6) != 6) return 87;
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 8, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 9;
+    um_run(&u, 1, 1, "recv-bundle-none");
+    unsigned char *rring = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (rring == MAP_FAILED) return 88;
+    {
+        unsigned char reg[40] = {0};
+        unsigned long at = (unsigned long)rring;
+        unsigned entries = 4;
+        unsigned short bgid = 8;
+        memcpy(reg, &at, 8);
+        memcpy(reg + 8, &entries, 4);
+        memcpy(reg + 12, &bgid, 2);
+        uring_show("recv-ring", syscall(427, u.fd, 22, reg, 1));
+    }
+    char rin[64];
+    memset(rin, '.', sizeof rin);
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *e = rring + 16 * i;
+        unsigned long a = (unsigned long)rin + 8 * i;
+        unsigned len = 4;
+        unsigned short bid = 30 + i;
+        memcpy(e, &a, 8);
+        memcpy(e + 8, &len, 4);
+        memcpy(e + 12, &bid, 2);
+    }
+    __atomic_store_n((unsigned short *)(rring + 14), 4, __ATOMIC_RELEASE);
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 8, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 8;
+    um_run(&u, 1, 1, "recv-bundle");
+    if (write(sp[1], "ghijklmnop", 10) != 10) return 89;
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 4, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 8;
+    um_run(&u, 1, 1, "recv-bundle-again");
+    printf("buffers %.32s\n", rin);
+    char provided[8];
+    memset(provided, '.', sizeof provided);
+    unet_push(&u, 31, 1, 1, 4, (long)provided, 6, 0, 0)[40] = 9;
+    um_run(&u, 1, 1, "recv-provide");
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 0, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 9;
+    um_run(&u, 1, 1, "recv-bundle-provided");
+    printf("provided %.6s\n", provided);
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *e = rring + 16 * i;
+        unsigned long a = (unsigned long)rin + 32 + 8 * i;
+        unsigned short bid = 40 + i;
+        memcpy(e, &a, 8);
+        memcpy(e + 12, &bid, 2);
+    }
+    __atomic_store_n((unsigned short *)(rring + 14), 8, __ATOMIC_RELEASE);
+    if (write(sp[1], "qrstuv", 6) != 6) return 90;
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 8, 0, 2 | 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 8;
+    um_run(&u, 1, 1, "recv-bundle-multishot");
+    if (write(sp[1], "wxyz1234", 8) != 8) return 91;
+    um_run(&u, 0, 1, "recv-bundle-multishot-last");
+    printf("buffers %.32s\n", rin + 32);
     close(sp[0]);
     close(sp[1]);
     close(gram[0]);

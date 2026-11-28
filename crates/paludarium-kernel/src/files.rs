@@ -129,6 +129,12 @@ pub struct Files {
     /// before the file exists: no allocation gets them and no lookup sees
     /// them. Shared exactly as `fds` is; locked after it.
     reserved: Arc<Mutex<BTreeSet<u32>>>,
+    /// The numbers the table has room for (Linux's `max_fdtable`), shared
+    /// exactly as `fds` is and changed with it locked: a number past them
+    /// grows the table, as far as `fs.nr_open` lets it ([`Slots`]).
+    slots: Arc<AtomicU32>,
+    /// The machine's `fs.nr_open` ([`crate::sysctl::Machine::nr_open`]).
+    pub(crate) nr_open: Arc<AtomicU32>,
     cwd: Arc<Mutex<Vec<u8>>>,
     /// The working directory's hold on its file, as `fs->pwd` holds its
     /// dentry; shared with the cwd.
@@ -288,6 +294,8 @@ impl Default for Files {
             fds: Arc::new(Mutex::new(BTreeMap::new())),
             table: Arc::new(Table::new()),
             reserved: Arc::default(),
+            slots: Arc::new(AtomicU32::new(Slots::FIRST)),
+            nr_open: Arc::new(AtomicU32::new(crate::sysctl::NR_OPEN)),
             cwd: Arc::new(Mutex::new(b"/".to_vec())),
             home: Arc::default(),
             umask: Arc::new(AtomicU32::new(0o022)),
@@ -770,14 +778,16 @@ impl Files {
             .map(|(_, descriptor)| descriptor)
             .collect()
     }
-    pub(crate) fn for_exec(&self) -> Self {
-        let child = self.unshared(false);
+    /// The table exec goes on with: its own copy of a shared one
+    /// ([`Self::unshared`]), without the descriptors marked close-on-exec.
+    pub(crate) fn for_exec(&self) -> Result<Self, Errno> {
+        let child = self.unshared(false, None)?;
         child
             .fds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|_, descriptor| !descriptor.cloexec);
-        child
+        Ok(child)
     }
     pub(crate) fn install(
         &mut self,
@@ -844,7 +854,9 @@ impl Files {
         let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
         let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         let one = lowest_free(&fds, &reserved, 0, limit)?;
+        self.make_room(one)?;
         let two = lowest_free(&fds, &reserved, one + 1, limit)?;
+        self.make_room(two)?;
         for (n, file) in [one, two].into_iter().zip(files) {
             let path = Vec::new();
             fds.insert(
@@ -869,6 +881,7 @@ impl Files {
         let fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
         let mut reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         let n = lowest_free(&fds, &reserved, 0, limit)?;
+        self.make_room(n)?;
         reserved.insert(n);
         Ok(n)
     }
@@ -904,11 +917,69 @@ impl Files {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&n);
     }
+    /// Makes room for number `n`, which must be below the RLIMIT_NOFILE soft
+    /// limit, as dup2 does before it looks at the descriptor it copies: the
+    /// table grows ([`Slots`]), or `EMFILE`.
+    pub(crate) fn room_for(&self, n: u32) -> Result<(), Errno> {
+        let _fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
+        self.make_room(n)
+    }
+    /// Makes room for number `n` with `fds` locked: one the table has no
+    /// room for grows it ([`Slots`]), and `EMFILE` when `fs.nr_open` keeps
+    /// it from growing that far.
+    fn make_room(&self, n: u32) -> Result<(), Errno> {
+        if n < self.slots.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let nr_open = self.nr_open.load(Ordering::SeqCst);
+        if n >= nr_open {
+            return Err(Errno::EMFILE);
+        }
+        self.slots
+            .store(Slots::holding(n + 1, nr_open)?, Ordering::SeqCst);
+        Ok(())
+    }
+    /// The room a copy of this table starts with: enough for its highest
+    /// number in use (open, or taken by an unfinished open), counted in
+    /// steps of [`Slots::FIRST`], and grown as a table grows ([`Slots`]).
+    /// With `hole` holding the highest, the highest below `hole` counts
+    /// instead, as the copy `close_range` closes them in does not need room
+    /// for them. `EMFILE` when `fs.nr_open` is now too low for that room.
+    fn copy_slots(&self, hole: Option<std::ops::RangeInclusive<u32>>) -> Result<u32, Errno> {
+        let fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
+        let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        let highest = |below: u32| {
+            fds.keys()
+                .chain(reserved.iter())
+                .copied()
+                .filter(|&n| n < below)
+                .max()
+        };
+        let mut last = highest(u32::MAX);
+        if let (Some(at), Some(hole)) = (last, &hole)
+            && hole.contains(&at)
+        {
+            last = highest(*hole.start());
+        }
+        let Some(last) = last else {
+            return Ok(Slots::FIRST);
+        };
+        let step = u64::from(Slots::FIRST);
+        let wanted =
+            u32::try_from((u64::from(last) / step + 1) * step).map_err(|_| Errno::EMFILE)?;
+        if wanted <= Slots::FIRST {
+            return Ok(Slots::FIRST);
+        }
+        Slots::holding(wanted, self.nr_open.load(Ordering::SeqCst))
+    }
     /// Puts `d` at `n`, as dup2 does, and returns what was there for the
     /// caller to close; EBUSY when an unfinished open of another thread has
-    /// taken `n`, as in Linux.
+    /// taken `n`, as in Linux. `n` must be below the RLIMIT_NOFILE soft
+    /// limit; one the table has no room for grows it, or is `EMFILE`
+    /// ([`Self::room_for`]).
     pub(crate) fn replace(&self, n: u32, d: Descriptor) -> Result<Option<Descriptor>, Errno> {
         let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
+        self.make_room(n)?;
         let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         if reserved.contains(&n) {
             return Err(Errno(16));
@@ -963,6 +1034,7 @@ impl Files {
         let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
         let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         let n = lowest_free(&fds, &reserved, min, limit)?;
+        self.make_room(n)?;
         fds.insert(n, d);
         Ok(n)
     }
@@ -1193,17 +1265,40 @@ impl Files {
     /// one (for `unshare(CLONE_FILES)`, `CLOSE_RANGE_UNSHARE` and exec): of a
     /// table no other task shares, the same table, with its record locks, as
     /// Linux copies only a shared one. With `share_fs` the working directory
-    /// stays shared.
-    pub(crate) fn unshared(&self, share_fs: bool) -> Self {
-        let mut copy = self.for_clone(false, share_fs);
+    /// stays shared. A copy has room as [`Self::copy_slots`] gives it, past
+    /// `hole` (`close_range`'s numbers), and is `EMFILE` when `fs.nr_open`
+    /// no longer lets a table hold the numbers in use.
+    pub(crate) fn unshared(
+        &self,
+        share_fs: bool,
+        hole: Option<std::ops::RangeInclusive<u32>>,
+    ) -> Result<Self, Errno> {
         if Arc::strong_count(&self.fds) == 1 {
+            let mut copy = self.cloned(Some(self.slots.load(Ordering::SeqCst)), share_fs);
             copy.table = Arc::clone(&self.table);
+            return Ok(copy);
         }
-        copy
+        let slots = self.copy_slots(hole)?;
+        Ok(self.cloned(Some(slots), share_fs))
     }
-    pub(crate) fn for_clone(&self, share_files: bool, share_fs: bool) -> Self {
+    /// The table and file-system state of a new task: these, with
+    /// `share_files` and `share_fs`, or copies, as `clone` gives them
+    /// (`EMFILE` as [`Self::unshared`] gives it).
+    pub(crate) fn for_clone(&self, share_files: bool, share_fs: bool) -> Result<Self, Errno> {
+        let slots = if share_files {
+            None
+        } else {
+            Some(self.copy_slots(None)?)
+        };
+        Ok(self.cloned(slots, share_fs))
+    }
+    /// A copy of this with a descriptor table of its own with room for
+    /// `slots` numbers, or this table for none, and with `share_fs` the same
+    /// file-system state.
+    fn cloned(&self, slots: Option<u32>, share_fs: bool) -> Self {
         let mut child = self.clone();
-        if !share_files {
+        if let Some(slots) = slots {
+            child.slots = Arc::new(AtomicU32::new(slots));
             child.table = Arc::new(Table::new());
             child.fds = Arc::new(Mutex::new(
                 self.fds
@@ -1288,6 +1383,33 @@ impl Table {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+/// How much room a descriptor table has, as Linux sizes one: room for
+/// [`Self::FIRST`] numbers at first; past them, for the least power of two
+/// that holds the numbers wanted, but never for more than `fs.nr_open`, cut
+/// back to a multiple of [`Self::FIRST`] there, nor for more than fit
+/// `INT_MAX` bytes of 8-byte pointers. A number past what may be had is
+/// `EMFILE`.
+struct Slots;
+impl Slots {
+    /// A table's room at first (`NR_OPEN_DEFAULT`, `BITS_PER_LONG`), and
+    /// the step a table's room keeps to.
+    const FIRST: u32 = 64;
+    /// The room of a table that must hold `wanted` numbers, with
+    /// `fs.nr_open` at `nr_open`.
+    fn holding(wanted: u32, nr_open: u32) -> Result<u32, Errno> {
+        let mut slots = wanted.checked_next_power_of_two().ok_or(Errno::EMFILE)?;
+        if slots > nr_open {
+            slots = nr_open - nr_open % Self::FIRST;
+            if slots < wanted {
+                return Err(Errno::EMFILE);
+            }
+        }
+        if slots > i32::MAX as u32 / 8 {
+            return Err(Errno::EMFILE);
+        }
+        Ok(slots)
     }
 }
 /// The lowest number from `min` with no descriptor or reservation, which
@@ -1535,6 +1657,7 @@ fn lookup(
             .map_or(p, |(file, _)| file),
         false => p,
     };
+    generated_directories_on_the_way(c, &p, true)?;
     let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
     Ok((p, found))
 }
@@ -1965,6 +2088,7 @@ fn read_link(c: &mut Context<'_>, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
     // `/proc/self` is a link to this process's directory, and each
     // entry of its `fd` to a descriptor's file.
     let p = crate::devices::through_link(&p).unwrap_or(p);
+    generated_directories_on_the_way(c, &p, true)?;
     Ok(if p == b"/proc/self" {
         c.process.pid.to_string().into_bytes()
     } else if let Some(path) = task_path(c, &p) {
@@ -2946,7 +3070,7 @@ fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (p, _) = lookup_linked(c, a[0], raw, follow)?;
     chown_path(c, &p, follow, a[2], a[3])
 }
-fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
+pub(crate) fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
 }
 /// Linux's largest single read or write (`MAX_RW_COUNT`).
@@ -3375,8 +3499,11 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
         return Err(Errno::EINVAL);
     }
+    // A copy needs no room for the numbers it closes (`punch_hole`), but
+    // keeps all for `CLOSE_RANGE_CLOEXEC`.
     if flags & CLOSE_RANGE_UNSHARE != 0 {
-        *c.files = c.files.unshared(true);
+        let hole = (flags & CLOSE_RANGE_CLOEXEC == 0).then_some(first..=last);
+        *c.files = c.files.unshared(true, hole)?;
     }
     let mut fds = c.files.fds.lock().unwrap_or_else(PoisonError::into_inner);
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
@@ -3641,6 +3768,56 @@ pub(crate) fn iovecs(
         .map_err(|_| Errno::EFAULT)
     })
 }
+/// The two ends of a new pipe, as `create_pipe_files` makes them for
+/// `pipe2` and io_uring's `IORING_OP_PIPE`: `O_NONBLOCK` on both, packets
+/// with `O_DIRECT`, no larger to start than `fs.pipe-max-size` allows, owned
+/// by the caller's file system IDs. There are no
+/// watch queues, so a notification pipe (`O_NOTIFICATION_PIPE`) is `EINVAL`,
+/// a limitation the guide lists.
+pub(crate) fn new_pipe(c: &Context<'_>, flags: u32) -> Result<[Arc<dyn FileHandle>; 2], Errno> {
+    if flags & O_NOTIFICATION_PIPE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let ends = crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
+    let creds = &c.process.credentials;
+    ends[0].start_within(
+        c.processes.sysctls.pipe_max_size(),
+        creds.capable(crate::credentials::CAP_SYS_RESOURCE),
+    );
+    ends[0].set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
+    Ok(ends.map(|end| end as Arc<dyn FileHandle>))
+}
+/// The `count` entries of the `struct iovec` array at `at`, as
+/// `iovec_from_user` reads them: none for no entries, more than
+/// `UIO_MAXIOV` (1024) `EINVAL`, an array outside the user half or not
+/// mapped `EFAULT`, and a negative length `EINVAL`, in order. The buffers
+/// are not looked at.
+pub(crate) fn iovec_entries(
+    mem: &AddressSpace,
+    at: u64,
+    count: u64,
+) -> Result<Vec<(u64, u64)>, Errno> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    crate::sockets::access_ok(at, (count * 16) as usize)?;
+    (0..count)
+        .map(|index| {
+            let addr = at + index * 16;
+            let base = mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
+            let length = mem
+                .read_u64(GuestAddr(addr + 8))
+                .map_err(|_| Errno::EFAULT)?;
+            if (length as i64) < 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok((base, length))
+        })
+        .collect()
+}
 /// The `struct iovec` array at `at`, in Linux's `import_iovec` order: none
 /// for no entries; more than 1024 are EINVAL; the array must lie in the user
 /// half (EFAULT); then every entry is read (EFAULT) and a negative length is
@@ -3655,25 +3832,7 @@ pub(crate) fn iovecs_checked(
     count: u64,
     check: impl Fn(u64, usize) -> Result<(), Errno>,
 ) -> Result<Vec<(u64, usize)>, Errno> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    if count > 1024 {
-        return Err(Errno::EINVAL);
-    }
-    crate::sockets::access_ok(at, (count * 16) as usize)?;
-    let mut entries = Vec::with_capacity(count as usize);
-    for index in 0..count {
-        let addr = at + index * 16;
-        let base = mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
-        let length = mem
-            .read_u64(GuestAddr(addr + 8))
-            .map_err(|_| Errno::EFAULT)?;
-        if (length as i64) < 0 {
-            return Err(Errno::EINVAL);
-        }
-        entries.push((base, length));
-    }
+    let entries = iovec_entries(mem, at, count)?;
     // The lengths stay 64-bit until they are cut, as `usize` is 32 bits in
     // WebAssembly.
     let mut segments = Vec::with_capacity(entries.len());
@@ -3692,23 +3851,25 @@ pub(crate) fn iovecs_checked(
 }
 /// The memory an aio or io_uring transfer moves bytes to or from: the
 /// program's, at the addresses of `segments` as they are mapped at the
-/// time, or `len` bytes from `at` of a registered buffer's pinned pages
-/// ([`paludarium_mmu::Pinned`]), whatever maps them now.
+/// time, or pieces of a registered buffer's pinned pages
+/// ([`paludarium_mmu::Pinned`]), whatever maps them now: each piece is an
+/// offset into the pages and a length, in order.
 #[derive(Clone, Copy)]
 pub(crate) enum Memory<'a> {
     Guest(&'a [(u64, usize)]),
     Pinned {
         pages: &'a paludarium_mmu::Pinned,
-        at: usize,
-        len: usize,
+        pieces: &'a [(u64, usize)],
     },
 }
 
 impl Memory<'_> {
     fn total(&self) -> usize {
         match self {
-            Memory::Guest(segments) => segments.iter().map(|&(_, length)| length).sum(),
-            Memory::Pinned { len, .. } => *len,
+            Memory::Guest(segments)
+            | Memory::Pinned {
+                pieces: segments, ..
+            } => segments.iter().map(|&(_, length)| length).sum(),
         }
     }
     /// Checks that the first `len` bytes may be written (`EFAULT`), which
@@ -3721,48 +3882,51 @@ impl Memory<'_> {
     }
     /// Stores `bytes` from its byte `at` on; whether all of them were.
     pub(crate) fn store(&self, mem: &AddressSpace, at: usize, bytes: &[u8]) -> bool {
-        match self {
+        let mut done = 0;
+        let all = match self {
             Memory::Guest(segments) => {
-                let mut done = 0;
                 crate::sockets::spans(segments, at, bytes.len()).all(|(to, n)| {
                     let piece = &bytes[done..done + n];
                     done += n;
                     mem.write(to, piece).is_ok()
-                }) && done == bytes.len()
+                })
             }
-            Memory::Pinned {
-                pages, at: from, ..
-            } => {
-                pages.write(from + at, bytes);
+            Memory::Pinned { pages, pieces } => {
+                for (to, n) in crate::sockets::spans(pieces, at, bytes.len()) {
+                    pages.write(to.0 as usize, &bytes[done..done + n]);
+                    done += n;
+                }
                 true
             }
-        }
+        };
+        all && done == bytes.len()
     }
     /// Loads `bytes` from its byte `at` on; whether all of them were.
     pub(crate) fn load(&self, mem: &AddressSpace, at: usize, bytes: &mut [u8]) -> bool {
-        match self {
-            Memory::Guest(segments) => {
-                let (mut done, len) = (0, bytes.len());
-                crate::sockets::spans(segments, at, len).all(|(from, n)| {
-                    let piece = &mut bytes[done..done + n];
+        let (mut done, len) = (0, bytes.len());
+        let all = match self {
+            Memory::Guest(segments) => crate::sockets::spans(segments, at, len).all(|(from, n)| {
+                let piece = &mut bytes[done..done + n];
+                done += n;
+                mem.read(from, piece).is_ok()
+            }),
+            Memory::Pinned { pages, pieces } => {
+                for (from, n) in crate::sockets::spans(pieces, at, len) {
+                    pages.read(from.0 as usize, &mut bytes[done..done + n]);
                     done += n;
-                    mem.read(from, piece).is_ok()
-                }) && done == len
-            }
-            Memory::Pinned {
-                pages, at: from, ..
-            } => {
-                pages.read(from + at, bytes);
+                }
                 true
             }
-        }
+        };
+        all && done == len
     }
     /// Stores `bytes` from the start.
     fn scatter(&self, c: &Context<'_>, bytes: &[u8]) -> Result<(), Errno> {
         match self {
             Memory::Guest(segments) => scatter(c, segments, bytes),
-            Memory::Pinned { pages, at, len } => {
-                pages.write(*at, &bytes[..bytes.len().min(*len)]);
+            Memory::Pinned { .. } => {
+                let bytes = &bytes[..bytes.len().min(self.total())];
+                self.store(c.mem, 0, bytes);
                 Ok(())
             }
         }
@@ -3780,10 +3944,10 @@ impl Memory<'_> {
                         .map_err(|_| Errno::EFAULT)?;
                 }
             }
-            Memory::Pinned { pages, at, len } => {
+            Memory::Pinned { .. } => {
                 let start = bytes.len();
-                bytes.resize(start + len, 0);
-                pages.read(*at, &mut bytes[start..]);
+                bytes.resize(start + self.total(), 0);
+                self.load(c.mem, 0, &mut bytes[start..]);
             }
         }
         Ok(())
@@ -5495,12 +5659,12 @@ mod mtime_tests {
     #[test]
     fn umask_is_shared_exactly_with_clone_fs() {
         let files = Files::default();
-        let shared = files.for_clone(false, true);
-        let separate = files.for_clone(true, false);
+        let shared = files.for_clone(false, true).unwrap();
+        let separate = files.for_clone(true, false).unwrap();
         shared.umask.store(0o077, Ordering::SeqCst);
         assert_eq!(files.umask(), 0o077);
         assert_eq!(separate.umask(), 0o022);
-        assert_eq!(files.for_exec().umask(), 0o077);
+        assert_eq!(files.for_exec().unwrap().umask(), 0o077);
     }
     #[test]
     fn mtime_stat_codec_signed_boundaries() {
@@ -5705,11 +5869,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.mem
                 .check_write(GuestAddr(a[0]), 8)
                 .map_err(|_| Errno::EFAULT)?;
-            let ends = crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
-            let creds = &c.process.credentials;
-            ends[0].set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
             let [first, second] = c.files.install_pair(
-                ends.map(|end| end as Arc<dyn FileHandle>),
+                new_pipe(c, flags)?,
                 flags & crate::events::CLOEXEC != 0,
                 c.group.nofile(),
             )?;
@@ -5926,10 +6087,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if u64::from(new) >= c.group.nofile() {
                 return Err(Errno::EBADF);
             }
+            // The table grows for `new` before `old` is looked at, and a
+            // table that cannot is `EBADF` too (`ksys_dup3`).
+            let room = c.files.room_for(new);
             let d = Descriptor {
                 cloexec: n == 292 && a[2] & 0x80000 != 0,
                 ..c.files.descriptor(u64::from(old))?
             };
+            room.map_err(|e| if e == Errno::EMFILE { Errno::EBADF } else { e })?;
             if let Some(closed) = c.files.replace(new, d)? {
                 crate::record_locks::closed(c, &closed);
                 crate::mqueue::closed(c, &closed);
@@ -5991,7 +6156,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         .and_then(|any| any.downcast_ref::<crate::sockets::PipeEnd>())
                         .ok_or(Errno::EBADF)?;
                     if a[1] == 1031 {
-                        pipe.set_size(a[2] as u32)
+                        pipe.set_size(
+                            a[2] as u32,
+                            c.processes.sysctls.pipe_max_size(),
+                            c.process
+                                .credentials
+                                .capable(crate::credentials::CAP_SYS_RESOURCE),
+                        )
                     } else {
                         Ok(pipe.size())
                     }
@@ -7099,6 +7270,8 @@ pub(crate) struct StandardFile {
 }
 /// `O_DIRECT`.
 pub(crate) const O_DIRECT: u32 = 0o40000;
+/// `O_NOTIFICATION_PIPE`, which is `O_EXCL`.
+const O_NOTIFICATION_PIPE: u32 = 0o200;
 /// `O_NOATIME`.
 pub(crate) const O_NOATIME: u32 = 0o1000000;
 /// Whether an open file description has Linux's `FMODE_CAN_ODIRECT`,
@@ -7304,7 +7477,7 @@ impl StandardFile {
                     && let Some(processes) = to.processes.upgrade()
                 {
                     let owner = processes.file_owner(&file);
-                    processes.send_io(owner, to.fd, reason);
+                    processes.send_io(&owner, to.fd, reason);
                 }
                 was = ready;
             }
@@ -7508,19 +7681,60 @@ mod files_tests {
         assert_eq!(f.install_pair([x, y], false, 2), Ok([0, 1]));
     }
     #[test]
+    fn a_table_grows_as_far_as_nr_open_lets_it() {
+        // A power of two past what is wanted, cut back to a multiple of 64
+        // at `nr_open`, and never past 2^27 numbers.
+        assert_eq!(Slots::holding(65, 1 << 20), Ok(128));
+        assert_eq!(Slots::holding(1025, 1 << 20), Ok(2048));
+        assert_eq!(Slots::holding(1025, 1100), Ok(1088));
+        assert_eq!(Slots::holding(1100, 1100), Err(Errno::EMFILE));
+        assert_eq!(Slots::holding(1 << 27, u32::MAX), Ok(1 << 27));
+        assert_eq!(Slots::holding((1 << 27) + 1, u32::MAX), Err(Errno::EMFILE));
+        let fs = MemFs::new();
+        let mut f = Files::default();
+        f.nr_open.store(100, Ordering::SeqCst);
+        // The first 64 numbers are always there; past them, a number at or
+        // past `nr_open` is `EMFILE`, below it the table grows (to 64 here,
+        // `nr_open` cut back, which does not hold 64: `EMFILE` too).
+        assert_eq!(f.allocate(d(&fs, b"/a"), 63, 1024), Ok(63));
+        assert_eq!(f.allocate(d(&fs, b"/b"), 64, 1024), Err(Errno::EMFILE));
+        assert_eq!(f.room_for(100), Err(Errno::EMFILE));
+        f.nr_open.store(1 << 20, Ordering::SeqCst);
+        assert_eq!(f.allocate(d(&fs, b"/b"), 200, 1024), Ok(200));
+        // Grown, the table keeps its room though `nr_open` drops.
+        f.nr_open.store(64, Ordering::SeqCst);
+        assert_eq!(f.allocate(d(&fs, b"/c"), 250, 1024), Ok(250));
+        assert_eq!(f.room_for(255), Ok(()));
+        assert_eq!(f.room_for(256), Err(Errno::EMFILE));
+        // A copy needs room for its highest number, 250, in steps of 64:
+        // 256, which a table of 64 at most cannot have.
+        assert!(f.for_clone(false, false).is_err());
+        assert!(f.for_clone(true, false).is_ok());
+        f.nr_open.store(256, Ordering::SeqCst);
+        let copy = f.for_clone(false, false).unwrap();
+        assert_eq!(copy.room_for(255), Ok(()));
+        assert_eq!(copy.room_for(256), Err(Errno::EMFILE));
+        // `close_range`'s copy needs none for the numbers it closes.
+        f.nr_open.store(64, Ordering::SeqCst);
+        let shared = f.for_clone(true, true).unwrap();
+        assert!(shared.unshared(true, Some(100..=300)).is_ok());
+        assert!(shared.unshared(true, Some(201..=300)).is_err());
+        assert!(shared.unshared(true, Some(240..=249)).is_err());
+    }
+    #[test]
     fn a_table_keeps_its_number_where_it_stays_the_same_table() {
         let mut f = Files::default();
         // A CLONE_FILES task shares the table; a fork's child has its own.
-        let mut shared = f.for_clone(true, true);
+        let mut shared = f.for_clone(true, true).unwrap();
         assert_eq!(shared.table(), f.table());
-        let forked = f.for_clone(false, false);
+        let forked = f.for_clone(false, false).unwrap();
         assert_ne!(forked.table(), f.table());
         // Unsharing a shared table copies it; one used by no other task stays.
-        let copy = f.unshared(true);
+        let copy = f.unshared(true, None).unwrap();
         assert_ne!(copy.table(), f.table());
-        let lone = forked.unshared(true);
+        let lone = forked.unshared(true, None).unwrap();
         assert_eq!(lone.table(), forked.table());
-        assert_eq!(forked.for_exec().table(), forked.table());
+        assert_eq!(forked.for_exec().unwrap().table(), forked.table());
         // Only the last task to let go gets the table's number, for its locks.
         let table = f.table();
         assert_eq!(f.release_descriptors().0, None);
@@ -7540,7 +7754,7 @@ mod files_tests {
             },
         );
         // Shared with another task, the table keeps them open there.
-        let shared = f.for_clone(true, true);
+        let shared = f.for_clone(true, true).unwrap();
         assert!(f.take_close_on_exec().is_empty());
         drop(shared);
         let closed = f.take_close_on_exec();
@@ -7570,7 +7784,9 @@ mod files_tests {
         // A process of its own starts with no reservations.
         assert_eq!(f.reserve(1024), Ok(3));
         assert_eq!(
-            f.for_clone(false, false).allocate(d(&fs, b"/e"), 0, 1024),
+            f.for_clone(false, false)
+                .unwrap()
+                .allocate(d(&fs, b"/e"), 0, 1024),
             Ok(3)
         );
     }
@@ -8129,10 +8345,12 @@ fn open_path(
     flags: u32,
     mode: u32,
 ) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
+    const O_CREAT: u32 = 0o100;
     const O_NOFOLLOW: u32 = 0o400000;
     if let Some(target) = crate::devices::through_link(p) {
         return open_path(c, &target, flags, mode);
     }
+    generated_directories_on_the_way(c, p, flags & O_CREAT == 0)?;
     if flags & (O_PATH | O_NOFOLLOW) == O_PATH | O_NOFOLLOW
         && let Some(link) = LinkPath::of(c, p)?
     {
@@ -8458,8 +8676,6 @@ fn open_path(
         }
     } else if let Some(entry) = crate::sysctl::entry(c, p) {
         crate::sysctl::open(c, entry, flags)?
-    } else if crate::proc::below_system_entry(p) {
-        return Err(Errno::ENOTDIR);
     } else if crate::proc::is_sysvipc(p) {
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
@@ -9153,6 +9369,7 @@ pub(crate) fn exec_jumped(
     let through = through_magic_links(c, raw.to_vec())?;
     let mut jumped = through != raw;
     let mut p = c.files.path(dir, through)?;
+    generated_directories_on_the_way(c, &p, true)?;
     for _ in 0..40 {
         if !generated(&p) && p != b"/proc" {
             let Err(error) = c.files.fs().metadata(&p, follow) else {
@@ -9666,6 +9883,50 @@ fn generated_stat(
     path: &[u8],
     follow: bool,
 ) -> Result<Option<(FileStat, u64, u32)>, Errno> {
+    generated_directories_on_the_way(c, path, true)?;
+    generated_stat_of_last(c, path, follow)
+}
+/// `ENOTDIR` when a name before `path`'s last one is a file paludarium
+/// makes that is not a directory, its link followed as the walk to the
+/// last name follows each one: Linux's walk asks every name it goes on
+/// from to be a directory it can look in. With `slash`, the last name
+/// before a trailing slash counts too, as a call that goes on to the file
+/// asks it to be a directory (a trailing slash follows a link even without
+/// `follow`); an open that may make the last name leaves that to its own
+/// lookup (`EISDIR`). A name on the way that is not there, or an error
+/// finding it (a task that has ended), is left to the last name's lookup,
+/// which reports it as the walk would.
+fn generated_directories_on_the_way(
+    c: &Context<'_>,
+    path: &[u8],
+    slash: bool,
+) -> Result<(), Errno> {
+    const DIRECTORY: u32 = 0o040000;
+    let end = if slash {
+        path.len()
+    } else {
+        path.iter().rposition(|&b| b != b'/').map_or(0, |at| at + 1)
+    };
+    for at in (1..end).filter(|&at| path[at] == b'/' && path[at - 1] != b'/') {
+        let before = &path[..at];
+        if !generated(before) {
+            continue;
+        }
+        if let Ok(Some((stat, ..))) = generated_stat_of_last(c, before, true)
+            && stat.mode & 0o170000 != DIRECTORY
+        {
+            return Err(Errno::ENOTDIR);
+        }
+    }
+    Ok(())
+}
+/// [`generated_stat`] of `path`'s last name, the names before it taken to
+/// be directories.
+fn generated_stat_of_last(
+    c: &Context<'_>,
+    path: &[u8],
+    follow: bool,
+) -> Result<Option<(FileStat, u64, u32)>, Errno> {
     // Under another process's directory or `task`: ENOENT for what is not
     // there, rather than whatever a mounted directory holds at the path.
     if let Some(task_path) = task_path(c, path) {
@@ -9727,7 +9988,6 @@ fn known_stat(
             device(c, path),
             BLOCK_SIZE,
         ))),
-        None if crate::proc::below_system_entry(path) => Err(Errno::ENOTDIR),
         None => Ok(other_generated_stat(c, path, follow)),
     }
 }

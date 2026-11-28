@@ -4564,7 +4564,7 @@ fn lookup(
         dport,
         label: 0,
         packet: true,
-        l4_hash: 0,
+        socket_hash: 0,
     };
     // The device it comes in on alone, before the addresses: the groups it
     // has joined, its forwarding, and the reverse path filtering that counts.

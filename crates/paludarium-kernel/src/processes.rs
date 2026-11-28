@@ -202,8 +202,6 @@ struct PriorityThread {
     nice_limit: u64,
     rtprio_limit: u64,
 }
-/// fs.nr_open: the highest RLIMIT_NOFILE Linux accepts by default.
-const NR_OPEN: u64 = 1 << 20;
 /// `pid_max`, at its highest (`PID_MAX_LIMIT`), as on a 64-bit Linux that
 /// systemd starts: `set_tid` takes numbers below it.
 pub(crate) const PID_MAX: u32 = 4_194_304;
@@ -246,8 +244,9 @@ pub struct Processes {
     taken: Mutex<std::collections::BTreeSet<u32>>,
     entries: Mutex<BTreeMap<u32, Entry>>,
     tasks: Arc<TaskCount>,
-    /// The highest RLIMIT_NOFILE hard limit a process may set, as fs.nr_open.
-    nr_open: AtomicU64,
+    /// The embedder's ceiling on RLIMIT_NOFILE, which no hard limit passes
+    /// whatever `fs.nr_open` is ([`Self::set_open_file_limit`]).
+    open_file_ceiling: AtomicU64,
     /// Notified whenever a process exits, stops or continues, lets its vfork
     /// parent go, or is sent a signal by a process (`kill`, a queued signal),
     /// so that a wait for a child wakes at once for these; another signal (a
@@ -305,8 +304,8 @@ impl Processes {
         });
         Self {
             next: AtomicU32::new(2),
+            open_file_ceiling: AtomicU64::new(u64::MAX),
             taken: Mutex::default(),
-            nr_open: AtomicU64::new(NR_OPEN),
             changed: WaitToken::default(),
             file_owners: Mutex::default(),
             locks: crate::record_locks::Locks::default(),
@@ -383,11 +382,12 @@ impl Processes {
         Ok(TaskCharge(Arc::clone(&self.tasks)))
     }
     /// Caps RLIMIT_NOFILE at `max`, as a container started with that limit
-    /// and fs.nr_open: raising the hard limit beyond it fails with EPERM. Set
-    /// before the guest starts, when the first process is the only one; the
-    /// processes it creates inherit its limits.
+    /// and fs.nr_open: raising the hard limit beyond it fails with EPERM,
+    /// whatever root then writes to `/proc/sys/fs/nr_open`. Set before the
+    /// guest starts, when the first process is the only one; the processes
+    /// it creates inherit its limits.
     pub(crate) fn set_open_file_limit(&self, max: u64) {
-        self.nr_open.store(max, Ordering::SeqCst);
+        self.open_file_ceiling.store(max, Ordering::SeqCst);
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         debug_assert_eq!(entries.len(), 1, "set before the guest starts");
         for entry in entries.values_mut() {
@@ -1164,7 +1164,10 @@ impl Processes {
             if soft > hard {
                 return Err(Errno::EINVAL);
             }
-            if resource == 7 && hard > self.nr_open.load(Ordering::SeqCst) {
+            if resource == 7
+                && (hard > u64::from(self.sysctls.nr_open())
+                    || hard > self.open_file_ceiling.load(Ordering::SeqCst))
+            {
                 return Err(Errno::EPERM);
             }
             if hard > old.1 && !sender.capable(crate::credentials::CAP_SYS_RESOURCE) {
@@ -2134,7 +2137,7 @@ impl Processes {
     /// The processes (and, for a thread owner, the thread) `owner` names:
     /// a thread, a process (or the process of one of its threads), or a
     /// process group.
-    fn owned_by(entries: &BTreeMap<u32, Entry>, owner: FileOwner) -> Vec<(u32, Option<u32>)> {
+    fn owned_by(entries: &BTreeMap<u32, Entry>, owner: &FileOwner) -> Vec<(u32, Option<u32>)> {
         let id = owner.id;
         entries
             .iter()
@@ -2150,14 +2153,14 @@ impl Processes {
     }
     /// Whether anything is there in the role `owner` names it in: a thread,
     /// a process or a member of a group (Linux's `pid_task`).
-    pub(crate) fn owner_present(&self, owner: FileOwner) -> bool {
+    pub(crate) fn owner_present(&self, owner: &FileOwner) -> bool {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         !Self::owned_by(&entries, owner).is_empty()
     }
     /// Whether `owner`'s ID is in use, as Linux's `f_setown` and
     /// `SCM_CREDENTIALS` find it with `find_vpid` (ESRCH otherwise): a
     /// thread, or a process, group or session, whatever kind of owner it is.
-    pub(crate) fn owner_exists(&self, owner: FileOwner) -> bool {
+    pub(crate) fn owner_exists(&self, owner: &FileOwner) -> bool {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let id = owner.id;
         !Self::owned_by(&entries, owner).is_empty()
@@ -2165,22 +2168,31 @@ impl Processes {
                 .iter()
                 .any(|(&pid, entry)| pid == id || entry.pgid == id || entry.sid == id)
     }
-    fn send_owner(&self, owner: FileOwner, signal: signals::PendingSignal) {
+    /// Sends `signal` to each process (or thread) `owner` names that the
+    /// one who named the owner may reach ([`crate::fasync::Setter`]), as
+    /// the IDs of the thread it goes to, a process's first one, stand.
+    fn send_owner(&self, owner: &FileOwner, signal: signals::PendingSignal) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         for (pid, thread) in Self::owned_by(&entries, owner) {
-            let _ = self.send(&mut entries, pid, thread, signal);
+            let reached = entries.get(&pid).is_some_and(|entry| {
+                let target = entry.group.task_ids(pid, thread.unwrap_or(pid));
+                owner.setter.reaches(pid, &target)
+            });
+            if reached {
+                let _ = self.send(&mut entries, pid, thread, signal);
+            }
         }
     }
     /// Sends SIGURG from the kernel to `owner`, as a socket's out-of-band
     /// byte does.
-    pub(crate) fn send_urgent(&self, owner: FileOwner) {
+    pub(crate) fn send_urgent(&self, owner: &FileOwner) {
         self.send_owner(owner, Self::from_kernel(23));
     }
     /// Sends `owner` the signal of an `O_ASYNC` file, registered through
     /// descriptor `fd`, as Linux's `send_sigio`: SIGIO from the kernel, or
     /// with `F_SETSIG` that signal with `si_code`, `si_band` and `si_fd`. A
     /// `Priority` change sends only the latter, SIGURG telling the rest.
-    pub(crate) fn send_io(&self, owner: FileOwner, fd: i32, reason: Reason) {
+    pub(crate) fn send_io(&self, owner: &FileOwner, fd: i32, reason: Reason) {
         if owner.id == 0 {
             return;
         }
@@ -2213,7 +2225,7 @@ impl Processes {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .at(file)
-            .map_or_else(FileOwner::default, |owner| *owner)
+            .map_or_else(FileOwner::default, |owner| owner.clone())
     }
     /// Makes `owner` the owner of the open description at address `file`,
     /// if it has had one.
@@ -3378,6 +3390,15 @@ impl Kernel {
         if flags & VM != 0 && self.processes.shares_memory(self.process.pid, mem) {
             return Err(Errno::EINVAL);
         }
+        // unshare_fs and unshare_fd come first: the copy of a shared table
+        // fails when `fs.nr_open` no longer lets one hold its numbers.
+        let files = if flags & FILES != 0 {
+            Some(self.files.unshared(flags & FS == 0, None)?)
+        } else if flags & FS != 0 {
+            Some(self.files.for_clone(true, false)?)
+        } else {
+            None
+        };
         // unshare_userns, then unshare_nsproxy_namespaces with the
         // credentials it gave.
         let own = self.group.namespaces(thread.tid);
@@ -3411,10 +3432,8 @@ impl Kernel {
             self.group.set_task_ids(thread.tid, credentials.task_ids());
             thread.state.credentials = credentials;
         }
-        if flags & FILES != 0 {
-            self.files = self.files.unshared(flags & FS == 0);
-        } else if flags & FS != 0 {
-            self.files = self.files.for_clone(true, false);
+        if let Some(files) = files {
+            self.files = files;
         }
         // CLONE_NEWNS took a working directory and root of the thread's own,
         // which are now on the new namespace's copies.
@@ -3430,7 +3449,23 @@ impl Kernel {
         if flags & crate::namespaces::CLONE_NEWIPC != 0 {
             self.group.leave_shm(thread.tid);
         }
+        // Every unshare that succeeds tells perf the namespaces, new or not.
+        self.namespaces_record(thread);
         Ok(0)
+    }
+    /// `perf_event_namespaces` of the thread, after its `unshare` or `setns`.
+    fn namespaces_record(&self, thread: &Thread) {
+        let events = &self.processes.perf_events;
+        if !crate::perf::wanted(events) {
+            return;
+        }
+        let who = crate::perf::Who {
+            pid: self.process.pid,
+            tid: thread.tid,
+            cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+        };
+        let namespaces = self.group.namespaces(thread.tid);
+        crate::perf::namespaces(events, &self.group, &who, (who.pid, who.tid), &namespaces);
     }
     /// `setpriority(which, who, nice)`: sets the nice value of every thread
     /// the caller may change to `nice`, cut to -20..19, as Linux's
@@ -3680,6 +3715,7 @@ impl Kernel {
             self.group.set_task_ids(thread.tid, credentials.task_ids());
             thread.state.credentials = credentials;
         }
+        self.namespaces_record(thread);
         Ok(0)
     }
     /// `clone` of a new process, `fork` and `vfork` ([`Self::clone_process`]);
@@ -3768,6 +3804,11 @@ impl Kernel {
         let msgqueue = self.processes.soft_limit(self.process.pid, 12);
         let credentials =
             crate::namespaces::user_for(&own, &parent.state.credentials, namespaces, msgqueue)?;
+        // copy_files, before copy_mm: a copy of the table fails when
+        // `fs.nr_open` no longer lets one hold its numbers (`EMFILE`).
+        let files = self
+            .files
+            .for_clone(flags & 0x400 != 0, flags & 0x200 != 0)?;
         // copy_mm, before copy_namespaces: `dup_mm` fails with `ENOMEM` when a
         // pinned page's copy finds no room.
         let child_mem = if flags & 0x100 == 0 {
@@ -3918,7 +3959,7 @@ impl Kernel {
             host: self.host.clone(),
             process: crate::Process { pid },
             table: crate::SyscallTable::u1(),
-            files: self.files.for_clone(flags & 0x400 != 0, flags & 0x200 != 0),
+            files,
             cancellation: inbox.wake_token(),
             inbox,
             group,
@@ -5476,7 +5517,13 @@ impl Kernel {
         self.processes.exec_renumber(self.process.pid, thread.tid);
         thread.tid = self.process.pid;
         let closed = self.files.take_close_on_exec();
-        self.files = self.files.for_exec();
+        // `unshare_files`, past the point of no return: a shared table that
+        // `fs.nr_open` no longer lets a copy of hold ends the program.
+        let unshared = self.files.for_exec();
+        let copy_failed = unshared.is_err();
+        if let Ok(files) = unshared {
+            self.files = files;
+        }
         self.group.exec_actions();
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
         self.group.set_program(&image);
@@ -5552,7 +5599,7 @@ impl Kernel {
         self.group.keep_peak(mem.resident_pages().0);
         self.exec_memory = Some(Arc::new(memory));
         self.release_vfork();
-        Ok((closed, image.fails))
+        Ok((closed, image.fails || copy_failed))
     }
 }
 /// What an exec that loaded its program gives: the descriptors it closed,

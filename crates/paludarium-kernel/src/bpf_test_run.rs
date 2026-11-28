@@ -123,8 +123,20 @@ fn word(b: &[u8], at: usize) -> u64 {
 fn read(c: &Context<'_>, at: u64, out: &mut [u8]) -> Result<(), Errno> {
     c.mem.read(GuestAddr(at), out).map_err(|_| Errno::EFAULT)
 }
+/// A copy out to the caller, as Linux's `copy_to_user` makes it: in
+/// pieces that end where the caller's pages do, so that one that faults
+/// leaves the bytes before its page written; EFAULT then.
 fn write(c: &Context<'_>, at: u64, bytes: &[u8]) -> Result<(), Errno> {
-    c.mem.write(GuestAddr(at), bytes).map_err(|_| Errno::EFAULT)
+    let mut done = 0;
+    while done < bytes.len() {
+        let here = at.wrapping_add(done as u64);
+        let take = ((PAGE_SIZE - here % PAGE_SIZE) as usize).min(bytes.len() - done);
+        c.mem
+            .write(GuestAddr(here), &bytes[done..done + take])
+            .map_err(|_| Errno::EFAULT)?;
+        done += take;
+    }
+    Ok(())
 }
 
 /// `bpf_prog_test_run`: `attr` from the caller's `at`, whose fields past
@@ -320,7 +332,7 @@ fn run_skb(
     let duration = u32::try_from(spent).unwrap_or(u32::MAX);
     let mut out = vec![0; ETH_HLEN];
     out.extend_from_slice(data);
-    finish(c, attr, at, &out, linear, (retval, duration))?;
+    finish(c, attr, at, &out, (retval, duration))?;
     if let Some(ctx) = &mut context {
         convert_out(ctx, &skb, device.index, wire_len);
         context_finish(c, attr, at, ctx)?;
@@ -422,49 +434,33 @@ fn convert_out(ctx: &mut [u8; skb::SIZE], skb: &Skb, index: u32, wire_len: u32) 
     ctx[skb::CB].copy_from_slice(&skb.cb);
 }
 
-/// `bpf_test_finish`, as master has it (b5f3534268e3): the packet, as much
-/// as `data_size_out` takes if it is not 0 (else `ENOSPC`, once the rest is
-/// written), its linear part first, then its pages; then its size, the
-/// program's result and the time a run took.
+/// What a run gives back of the packet `out`: as much of it as
+/// `data_size_out` takes, if that is not 0, to `data_out`, if that is not
+/// NULL; then its whole size, the program's result and the time a run
+/// took; and ENOSPC, after all that, when the packet was cut. A copy that
+/// faults (EFAULT) leaves what it has written, and nothing after it.
 fn finish(
     c: &Context<'_>,
     attr: &[u8],
     at: u64,
     out: &[u8],
-    linear: usize,
     (retval, duration): (u32, u32),
 ) -> Result<(), Errno> {
-    let size = out.len();
     let room = half(attr, field::DATA_SIZE_OUT) as usize;
-    let mut result = Ok(());
-    let mut copy = size;
-    if room != 0 && copy > room {
-        copy = room;
-        result = Err(ENOSPC);
-    }
+    let cut = room != 0 && out.len() > room;
     let address = word(attr, field::DATA_OUT);
     if address != 0 {
-        let head = copy.min(linear);
-        write(c, address, &out[..head])?;
-        let mut offset = head;
-        for page in out[linear..].chunks(PAGE_SIZE as usize) {
-            if offset >= copy {
-                result = Err(ENOSPC);
-                break;
-            }
-            let take = (copy - offset).min(page.len());
-            write(c, address + offset as u64, &page[..take])?;
-            offset += take;
-        }
+        write(c, address, &out[..if cut { room } else { out.len() }])?;
     }
+    let to = |f: usize| at + f as u64;
     write(
         c,
-        at + field::DATA_SIZE_OUT as u64,
-        &(size as u32).to_le_bytes(),
+        to(field::DATA_SIZE_OUT),
+        &(out.len() as u32).to_le_bytes(),
     )?;
-    write(c, at + field::RETVAL as u64, &retval.to_le_bytes())?;
-    write(c, at + field::DURATION as u64, &duration.to_le_bytes())?;
-    result
+    write(c, to(field::RETVAL), &retval.to_le_bytes())?;
+    write(c, to(field::DURATION), &duration.to_le_bytes())?;
+    if cut { Err(ENOSPC) } else { Ok(()) }
 }
 
 /// `bpf_ctx_finish`: the context, as much as `ctx_size_out` takes (else

@@ -923,3 +923,51 @@ fn mmap2_records_give_the_build_id_an_event_asks_for() {
         }
     }
 }
+
+/// `unshare` writes `PERF_RECORD_NAMESPACES` of the thread's namespaces,
+/// whether it made new ones or not: its IDs, seven links of nsfs's device
+/// and each namespace's inode, and the writer's IDs. A failed one writes
+/// none, and an event without `namespaces` takes none.
+#[test]
+fn unshare_writes_the_thread_s_namespaces() {
+    const ATTR_NAMESPACES: u64 = 1 << 28;
+    const UNSHARE: u64 = 272;
+    const CLONE_NEWUTS: u64 = 0x0400_0000;
+    const CLONE_PTRACE: u64 = 0x2000;
+    let mut env = Env::new();
+    let pid = env.call(GETPID, [0; 6]) as u32;
+    let tid = env.call(GETTID, [0; 6]) as u32;
+    let (fd, page) = env.open_side_band(0, -1, ATTR_NAMESPACES).unwrap();
+    let (comm_fd, comm) = env.open_side_band(0, -1, ATTR_COMM).unwrap();
+    env.ioctl(fd, IOC_ENABLE);
+    env.ioctl(comm_fd, IOC_ENABLE);
+    let before = env.k.group.namespaces(tid);
+    assert_eq!(env.call(UNSHARE, [0; 6]), 0);
+    assert_eq!(env.call(UNSHARE, [CLONE_NEWUTS, 0, 0, 0, 0, 0]), 0);
+    let after = env.k.group.namespaces(tid);
+    assert_eq!(env.call(UNSHARE, [CLONE_PTRACE, 0, 0, 0, 0, 0]), -22);
+    let links = |n: &crate::namespaces::Namespaces| {
+        let mut words = vec![7];
+        for ns in [&n.net, &n.uts, &n.ipc, &n.pid, &n.user, &n.mnt, &n.cgroup] {
+            words.extend([crate::namespaces::DEVICE, u64::from(ns.inode)]);
+        }
+        words
+    };
+    let mut records = Vec::new();
+    env.each_record(page, |_, record| records.push(record.to_vec()));
+    let ids = u64::from(pid) | u64::from(tid) << 32;
+    let expected: Vec<Vec<u64>> = [&before, &after]
+        .iter()
+        .map(|n| {
+            let mut words = vec![16 | (8 + 8 + 8 + 7 * 16 + 8) << 48, ids];
+            words.extend(links(n));
+            words.push(ids);
+            words
+        })
+        .collect();
+    assert_eq!(records, expected);
+    assert_ne!(before.uts.inode, after.uts.inode);
+    let mut other = Vec::new();
+    env.each_record(comm, |_, record| other.push(record.to_vec()));
+    assert!(other.is_empty());
+}

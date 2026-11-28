@@ -1,19 +1,23 @@
-//! Classic BPF socket filters (`SO_ATTACH_FILTER`), as Linux's
-//! `net/core/filter.c` takes them: [`check`] is `bpf_check_classic`, and
-//! [`convert`] is `bpf_convert_filter`, which turns the program into eBPF
-//! instructions that [`crate::bpf_interp`] runs as Linux runs the converted
-//! program.
+//! Classic BPF socket filters (`SO_ATTACH_FILTER`): [`check`] refuses
+//! what Linux refuses, and [`convert`] turns the program into the eBPF
+//! instructions that [`crate::bpf_interp`] runs, as Linux runs a classic
+//! program after it converts it.
 //!
-//! The instructions are Linux's, one for one, so that the program has its
-//! length on Linux, which the socket is charged for and which decides
-//! whether a jump reaches. Only what they read differs:
+//! What a program can see of the conversion is what Linux's gives: each
+//! classic instruction converts to as many instructions as Linux's does,
+//! with its jumps to other instructions in the same places, so that the
+//! program has Linux's length, which the socket is charged for, and the
+//! same jumps reach; and it returns what Linux's returns. The instructions
+//! themselves are this file's own:
+//! - packet loads are eBPF's `BPF_LD | BPF_ABS` and `BPF_IND`, and
+//!   comparisons 32-bit jumps;
 //! - the `sk_buff` fields are read from the context (`struct __sk_buff`)
 //!   where it has them, and from the fields the interpreter keeps after it
-//!   ([`crate::bpf_interp::classic`]): the data's address, `data_len`, and
-//!   `dev`, which an AF_UNIX message has none of;
-//! - Linux's internal helpers (`bpf_skb_load_helper_*`,
-//!   `bpf_skb_get_nlattr` and the rest) are numbers of the interpreter's
-//!   own, which no eBPF program can call.
+//!   ([`crate::bpf_interp::classic`]), `dev` among them, which an AF_UNIX
+//!   message has none of;
+//! - the netlink attribute searches and the rest are helpers with numbers
+//!   of the interpreter's own, which no eBPF program can call;
+//! - a block shorter than Linux's ends with no-ops.
 use paludarium_types::Errno;
 
 use crate::bpf_interp::classic::{self as helper, field};
@@ -105,128 +109,188 @@ const JGT: u16 = 0x20;
 const JGE: u16 = 0x30;
 const JSET: u16 = 0x40;
 
-/// The conditional jumps, with K or X.
-fn conditional(code: u16) -> bool {
-    [JEQ, JGT, JGE, JSET]
-        .iter()
-        .any(|&op| code == JMP | op | K || code == JMP | op | X)
+/// Which of the two classic registers an instruction uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reg {
+    A,
+    X,
 }
 
-/// `chk_code_allowed`: the codes a classic program may use.
-fn allowed(code: u16) -> bool {
-    let alu = [ADD, SUB, MUL, DIV, MOD, AND, OR, XOR, LSH, RSH]
-        .iter()
-        .any(|&op| code == ALU | op | K || code == ALU | op | X);
-    alu || conditional(code)
-        || [
-            ALU | NEG,
-            LD | W | ABS,
-            LD | H | ABS,
-            LD | B | ABS,
-            LD | W | LEN,
-            LD | W | IND,
-            LD | H | IND,
-            LD | B | IND,
-            LD | IMM,
-            LD | MEM,
-            LDX | W | LEN,
-            LDX | B | MSH,
-            LDX | IMM,
-            LDX | MEM,
-            ST,
-            STX,
-            MISC | TAX,
-            MISC | TXA,
-            RET | K,
-            RET | RET_A,
-            JMP | JA,
-        ]
-        .contains(&code)
+/// What a classic instruction does, decoded from its code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    /// `ld[bhw] [k]`, or `[x + k]` when `indirect`; an ancillary load when
+    /// `k` is one and the load is not indirect.
+    Packet { size: u16, indirect: bool },
+    /// `ldxb 4 * ([k] & 0xf)`.
+    HeaderLength,
+    /// `ld #k` and `ldx #k`.
+    Immediate(Reg),
+    /// `ld M[k]` and `ldx M[k]`.
+    Scratch(Reg),
+    /// `ld #len` and `ldx #len`.
+    Length(Reg),
+    /// `st M[k]` (from A) and `stx M[k]` (from X).
+    Store(Reg),
+    /// An operation on A with k or, when `x`, X.
+    Alu { op: u16, x: bool },
+    /// `neg`.
+    Neg,
+    /// `ja k`.
+    Always,
+    /// A conditional jump on A against k or, when `x`, X.
+    Conditional { op: u16, x: bool },
+    /// `ret #k`, or `ret a` when `a`.
+    Return { a: bool },
+    /// `tax`.
+    Tax,
+    /// `txa`.
+    Txa,
 }
 
-/// Whether `k` of a `BPF_LD | BPF_ABS` is an ancillary load Linux knows
-/// (`bpf_anc_helper`).
+/// The operations on A, all with k or X but `neg`.
+const ALU_OPS: [u16; 10] = [ADD, SUB, MUL, DIV, MOD, AND, OR, XOR, LSH, RSH];
+/// The conditional jumps, all with k or X.
+const CONDITIONS: [u16; 4] = [JEQ, JGT, JGE, JSET];
+
+/// The operation of a classic code, or `None` for one Linux refuses. A code
+/// has a class in its low 3 bits; loads add a size (`0x18`) and a mode
+/// (`0xe0`), operations and jumps a source (`0x08`) and an operation
+/// (`0xf0`), and a return what it returns (`0x18`).
+fn decode(code: u16) -> Option<Op> {
+    let class = code & 0x07;
+    let (size, mode) = (code & 0x18, code & 0xe0);
+    let (x, operation) = (code & X != 0, code & 0xf0);
+    if code > 0xff {
+        return None;
+    }
+    let to = if class == LD { Reg::A } else { Reg::X };
+    match class {
+        LD | LDX => match (mode, size) {
+            (IMM, W) => Some(Op::Immediate(to)),
+            (MEM, W) => Some(Op::Scratch(to)),
+            (LEN, W) => Some(Op::Length(to)),
+            (ABS | IND, W | H | B) if class == LD => Some(Op::Packet {
+                size,
+                indirect: mode == IND,
+            }),
+            (MSH, B) if class == LDX => Some(Op::HeaderLength),
+            _ => None,
+        },
+        ST if code == ST => Some(Op::Store(Reg::A)),
+        STX if code == STX => Some(Op::Store(Reg::X)),
+        ALU if code == ALU | NEG => Some(Op::Neg),
+        ALU if ALU_OPS.contains(&operation) => Some(Op::Alu { op: operation, x }),
+        JMP if code == JMP | JA => Some(Op::Always),
+        JMP if CONDITIONS.contains(&operation) => Some(Op::Conditional { op: operation, x }),
+        RET if code == RET | K || code == RET | RET_A => Some(Op::Return { a: code != RET | K }),
+        MISC if code == MISC | TAX => Some(Op::Tax),
+        MISC if code == MISC | TXA => Some(Op::Txa),
+        _ => None,
+    }
+}
+
+/// Whether `k` of an `ld[bhw] [k]` is one of the 16 ancillary loads, the
+/// words from [`AD_OFF`] to [`ad::VLAN_TPID`].
 fn ancillary(k: u32) -> bool {
     k.wrapping_sub(AD_OFF) <= ad::VLAN_TPID && k.wrapping_sub(AD_OFF).is_multiple_of(4)
 }
 
-/// `bpf_check_basics_ok` and `bpf_check_classic`: EINVAL for no
-/// instructions or more than [`MAX_INSNS`], a code Linux does not know, a
-/// division by a constant 0, a constant shift of 32 or more, a scratch word
-/// past the 16th, a jump past the end, an unknown ancillary load, a last
-/// instruction that does not return, and a scratch word read where some
-/// path has not written it.
+/// Where the classic instruction `f` at `pc` goes next: the instructions
+/// it jumps to, and whether it goes on to `pc + 1`. A return goes on too:
+/// what Linux knows of the scratch words after it carries into the
+/// instruction after it, which only a jump reaches.
+fn next(pc: usize, op: Op, f: SockFilter) -> ([Option<usize>; 2], bool) {
+    match op {
+        Op::Always => ([Some(pc + 1 + f.k as usize), None], false),
+        Op::Conditional { .. } => (
+            [
+                Some(pc + 1 + usize::from(f.jt)),
+                Some(pc + 1 + usize::from(f.jf)),
+            ],
+            false,
+        ),
+        _ => ([None; 2], true),
+    }
+}
+
+/// The checks of `SO_ATTACH_FILTER` and `SO_ATTACH_REUSEPORT_CBPF`: EINVAL
+/// for no instructions or more than [`MAX_INSNS`], a code Linux does not
+/// know, a division by a constant 0, a constant shift of 32 or more, a
+/// scratch word past the 16th, a jump past the end, an `ld[bhw] [k]` at or
+/// past [`AD_OFF`] that is no ancillary load, a last instruction that does
+/// not return, and a scratch word read where some path has not written it.
 pub(crate) fn check(filter: &[SockFilter]) -> Result<(), Errno> {
     let len = filter.len();
     if len == 0 || len > MAX_INSNS {
         return Err(Errno::EINVAL);
     }
-    for (pc, f) in filter.iter().enumerate() {
-        if !allowed(f.code) {
-            return Err(Errno::EINVAL);
-        }
-        let bad = match f.code {
-            c if c == ALU | DIV | K || c == ALU | MOD | K => f.k == 0,
-            c if c == ALU | LSH | K || c == ALU | RSH | K => f.k >= 32,
-            c if c == LD | MEM || c == LDX | MEM || c == ST || c == STX => f.k >= MEMWORDS,
-            c if c == JMP | JA => f.k as usize >= len - pc - 1,
-            c if conditional(c) => {
-                pc + usize::from(f.jt) + 1 >= len || pc + usize::from(f.jf) + 1 >= len
-            }
-            c if c == LD | W | ABS || c == LD | H | ABS || c == LD | B | ABS => {
-                !ancillary(f.k) && f.k >= AD_OFF
-            }
-            _ => false,
+    for (pc, &f) in filter.iter().enumerate() {
+        let op = decode(f.code).ok_or(Errno::EINVAL)?;
+        let after = len - pc - 1;
+        let valid = match op {
+            Op::Alu {
+                op: DIV | MOD,
+                x: false,
+            } => f.k != 0,
+            Op::Alu {
+                op: LSH | RSH,
+                x: false,
+            } => f.k < 32,
+            Op::Scratch(_) | Op::Store(_) => f.k < MEMWORDS,
+            Op::Always => (f.k as usize) < after,
+            Op::Conditional { .. } => usize::from(f.jt.max(f.jf)) < after,
+            Op::Packet {
+                indirect: false, ..
+            } => f.k < AD_OFF || ancillary(f.k),
+            _ => true,
         };
-        if bad {
+        if !valid {
             return Err(Errno::EINVAL);
         }
     }
-    if ![RET | K, RET | RET_A].contains(&filter[len - 1].code) {
-        return Err(Errno::EINVAL);
+    match decode(filter[len - 1].code) {
+        Some(Op::Return { .. }) => loads_after_stores(filter),
+        _ => Err(Errno::EINVAL),
     }
-    loads_after_stores(filter)
 }
 
-/// `check_load_and_stores`: a scratch word is read only where every path to
-/// the read has written it.
+/// EINVAL for a scratch word read where some path to the read has not
+/// written it. Classic jumps only go forward, so one walk in order sees
+/// every path into an instruction before the instruction: each keeps the
+/// words that every path into it has written.
 fn loads_after_stores(filter: &[SockFilter]) -> Result<(), Errno> {
-    let mut masks = vec![u16::MAX; filter.len()];
-    let mut valid: u16 = 0;
-    for (pc, f) in filter.iter().enumerate() {
-        valid &= masks[pc];
-        match f.code {
-            c if c == ST || c == STX => valid |= 1 << f.k,
-            c if (c == LD | MEM || c == LDX | MEM) && valid & (1 << f.k) == 0 => {
-                return Err(Errno::EINVAL);
-            }
-            c if c == JMP | JA => {
-                masks[pc + 1 + f.k as usize] &= valid;
-                valid = u16::MAX;
-            }
-            c if conditional(c) => {
-                masks[pc + 1 + usize::from(f.jt)] &= valid;
-                masks[pc + 1 + usize::from(f.jf)] &= valid;
-                valid = u16::MAX;
-            }
+    let mut written = vec![u16::MAX; filter.len() + 1];
+    written[0] = 0;
+    for (pc, &f) in filter.iter().enumerate() {
+        let op = decode(f.code).ok_or(Errno::EINVAL)?;
+        let mut known = written[pc];
+        match op {
+            Op::Store(_) => known |= 1 << f.k,
+            Op::Scratch(_) if known & 1 << f.k == 0 => return Err(Errno::EINVAL),
             _ => {}
+        }
+        let (targets, on) = next(pc, op, f);
+        for to in targets.into_iter().flatten().chain(on.then_some(pc + 1)) {
+            written[to] &= known;
         }
     }
     Ok(())
 }
 
-/// The registers of the converted program (`BPF_REG_A` and the rest).
+/// The registers of the converted program. A is R0, where packet loads and
+/// helpers leave what they give; the context is R6, where a packet load
+/// finds it; X is R7, and R8 keeps A while a header length is loaded,
+/// both kept across calls; R1 to R3 are a helper's arguments.
 mod reg {
     pub const A: u8 = 0;
     pub const ARG1: u8 = 1;
     pub const ARG2: u8 = 2;
     pub const ARG3: u8 = 3;
-    pub const ARG4: u8 = 4;
     pub const TMP: u8 = 2;
     pub const CTX: u8 = 6;
     pub const X: u8 = 7;
-    pub const D: u8 = 8;
-    pub const H: u8 = 9;
+    pub const SAVED: u8 = 8;
     pub const FP: u8 = 10;
 }
 
@@ -235,9 +299,8 @@ mod op {
     pub const ALU32: u8 = 0x04;
     pub const ALU64: u8 = 0x07;
     pub const JMP: u8 = 0x05;
+    pub const JMP32: u8 = 0x06;
     pub const X: u8 = 0x08;
-    pub const SUB: u8 = 0x10;
-    pub const ADD: u8 = 0x00;
     pub const AND: u8 = 0x50;
     pub const LSH: u8 = 0x60;
     pub const XOR: u8 = 0xa0;
@@ -246,12 +309,15 @@ mod op {
     pub const JA: u8 = 0x00;
     pub const JEQ: u8 = 0x10;
     pub const JNE: u8 = 0x50;
-    pub const JSGE: u8 = 0x70;
     pub const JLT: u8 = 0xa0;
     pub const JLE: u8 = 0xb0;
-    pub const JSLT: u8 = 0xc0;
     pub const CALL: u8 = 0x80;
     pub const EXIT: u8 = 0x90;
+    /// `BPF_LD | BPF_ABS` and `BPF_LD | BPF_IND`, the packet loads, which
+    /// take the context from R6, give the bytes in host order in R0, and
+    /// return 0 from the program where the packet has none.
+    pub const LD_ABS: u8 = 0x20;
+    pub const LD_IND: u8 = 0x40;
     /// `BPF_LDX | BPF_MEM` and `BPF_STX | BPF_MEM`, and the sizes.
     pub const LDX_MEM: u8 = 0x61;
     pub const STX_MEM: u8 = 0x63;
@@ -273,11 +339,11 @@ const fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> Insn {
 const fn mov64_reg(dst: u8, src: u8) -> Insn {
     insn(op::ALU64 | op::MOV | op::X, dst, src, 0, 0)
 }
+const fn mov32_reg(dst: u8, src: u8) -> Insn {
+    insn(op::ALU32 | op::MOV | op::X, dst, src, 0, 0)
+}
 const fn mov32_imm(dst: u8, imm: i32) -> Insn {
     insn(op::ALU32 | op::MOV, dst, 0, 0, imm)
-}
-const fn alu32_reg(o: u8, dst: u8, src: u8) -> Insn {
-    insn(op::ALU32 | o | op::X, dst, src, 0, 0)
 }
 const fn alu32_imm(o: u8, dst: u8, imm: i32) -> Insn {
     insn(op::ALU32 | o, dst, 0, 0, imm)
@@ -285,8 +351,10 @@ const fn alu32_imm(o: u8, dst: u8, imm: i32) -> Insn {
 const fn ldx(size: u8, dst: u8, src: u8, off: i16) -> Insn {
     insn(op::LDX_MEM | size, dst, src, off, 0)
 }
-const fn jmp_imm(o: u8, dst: u8, imm: i32, off: i16) -> Insn {
-    insn(op::JMP | o, dst, 0, off, imm)
+/// A jump on the low 32 bits of `dst` against `imm`, which is how classic
+/// programs compare.
+const fn jmp32_imm(o: u8, dst: u8, imm: i32, off: i16) -> Insn {
+    insn(op::JMP32 | o, dst, 0, off, imm)
 }
 const fn exit() -> Insn {
     insn(op::JMP | op::EXIT, 0, 0, 0, 0)
@@ -297,298 +365,346 @@ const fn call(id: i32) -> Insn {
 const fn from_be(dst: u8, bits: i32) -> Insn {
     insn(op::ALU32 | op::END_BE, dst, 0, 0, bits)
 }
+/// A jump to the next instruction, which fills a block to its length.
+const fn nop() -> Insn {
+    insn(op::JMP | op::JA, 0, 0, 0, 0)
+}
 
-/// `convert_skb_access`: an `sk_buff` field into `A`.
-fn skb_access(field: u32, out: &mut Vec<Insn>) {
-    match field {
-        ad::MARK => out.push(ldx(op::W, reg::A, reg::CTX, field::MARK)),
-        ad::PKTTYPE => {
-            out.push(ldx(op::B, reg::A, reg::CTX, field::PKT_TYPE));
-            // PKT_TYPE_MAX.
-            out.push(alu32_imm(op::AND, reg::A, 7));
+/// An instruction of the converted program, or a jump whose `off` goes to
+/// the start of a classic instruction's block.
+#[derive(Clone, Copy)]
+enum Piece {
+    Insn(Insn),
+    Jump(Insn, usize),
+}
+
+/// The converted block of one classic instruction.
+#[derive(Default)]
+struct Block(Vec<Piece>);
+
+impl Block {
+    fn push(&mut self, i: Insn) {
+        self.0.push(Piece::Insn(i));
+    }
+    fn extend(&mut self, insns: impl IntoIterator<Item = Insn>) {
+        for i in insns {
+            self.push(i);
         }
-        ad::QUEUE => out.push(ldx(op::H, reg::A, reg::CTX, field::QUEUE_MAPPING)),
-        ad::VLAN_TAG => out.push(ldx(op::H, reg::A, reg::CTX, field::VLAN_TCI)),
-        _ => {
-            out.push(ldx(op::W, reg::A, reg::CTX, field::VLAN_ALL));
-            out.push(jmp_imm(op::JEQ, reg::A, 0, 1));
-            out.push(alu32_imm(op::MOV, reg::A, 1));
+    }
+    fn jump(&mut self, i: Insn, target: usize) {
+        self.0.push(Piece::Jump(i, target));
+    }
+    /// No-ops after the instructions, up to `length`.
+    fn pad(&mut self, length: usize) {
+        debug_assert!(self.0.len() <= length, "{} > {length}", self.0.len());
+        while self.0.len() < length {
+            self.push(nop());
         }
     }
 }
 
-/// `convert_bpf_extensions`: an ancillary load, or `false` for a `k` that
-/// is none.
-fn extension(k: u32, out: &mut Vec<Insn>) -> bool {
-    let Some(which) = k.checked_sub(AD_OFF).filter(|_| ancillary(k)) else {
-        return false;
-    };
+/// The classic register's register in the converted program.
+const fn register(r: Reg) -> u8 {
+    match r {
+        Reg::A => reg::A,
+        Reg::X => reg::X,
+    }
+}
+
+/// How many instructions Linux converts a packet load of `size` bytes at
+/// `k`, or `X + k` when `indirect`, to: 8, or 9 for an indirect one with a
+/// `k`, through its helper; one at a constant offset from the start has 4
+/// more, 2 more again past what an `off` holds, one more for a `k` that is
+/// not 0, and one more for more than a byte.
+fn packet_length(size: u16, indirect: bool, k: u32) -> usize {
+    if indirect || (k as i32) < 0 {
+        return 8 + usize::from(indirect && k != 0);
+    }
+    let far = i16::try_from(k).is_err();
+    12 + usize::from(k != 0) + 2 * usize::from(far) + usize::from(size != B)
+}
+
+/// How many instructions Linux converts the ancillary load `which` (from
+/// [`AD_OFF`]) to.
+fn ancillary_length(which: u32) -> usize {
     match which {
+        ad::PROTOCOL | ad::VLAN_TPID | ad::PKTTYPE => 2,
+        ad::VLAN_TAG_PRESENT => 3,
+        ad::IFINDEX | ad::HATYPE => 4,
+        ad::PAY_OFFSET | ad::NLATTR | ad::NLATTR_NEST | ad::CPU | ad::RANDOM => 4,
+        _ => 1,
+    }
+}
+
+/// How many instructions Linux converts the classic instruction `f`,
+/// which is `op`, to: the converted program's length, which the socket is
+/// charged for and which decides whether a jump reaches, is theirs sum.
+fn length(op: Op, f: SockFilter) -> usize {
+    match op {
+        Op::Packet {
+            indirect: false, ..
+        } if ancillary(f.k) => ancillary_length(f.k.wrapping_sub(AD_OFF)),
+        Op::Packet { size, indirect } => packet_length(size, indirect, f.k),
+        Op::HeaderLength => 6 + packet_length(B, false, f.k),
+        Op::Alu {
+            op: DIV | MOD,
+            x: true,
+        } => 5,
+        Op::Return { a: false } => 2,
+        Op::Conditional { op: o, x } => {
+            let constant = usize::from(!x && (f.k as i32) < 0);
+            let one = f.jf == 0 || f.jt == 0 && o != JSET;
+            constant + if one { 1 } else { 2 }
+        }
+        _ => 1,
+    }
+}
+
+/// The ancillary load `which` (from [`AD_OFF`]) into A. The protocol and
+/// the VLAN protocol are in network order in the `sk_buff`; the packet
+/// type is its 3 bits; the interface's index and type come from its
+/// device, and without one the program returns A as it is; whether there
+/// is a VLAN tag is 0 or 1; the netlink attribute searches take the
+/// context, A and X, the payload offset the context, and the CPU and a
+/// random number nothing.
+fn ancillary_load(which: u32) -> Vec<Insn> {
+    let field = |size, at| vec![ldx(size, reg::A, reg::CTX, at)];
+    match which {
+        ad::MARK => field(op::W, field::MARK),
+        ad::QUEUE => field(op::H, field::QUEUE_MAPPING),
+        ad::VLAN_TAG => field(op::H, field::VLAN_TCI),
+        ad::RXHASH => field(op::W, field::HASH),
         ad::PROTOCOL | ad::VLAN_TPID => {
             let at = if which == ad::PROTOCOL {
                 field::PROTOCOL
             } else {
                 field::VLAN_PROTO
             };
-            out.push(ldx(op::H, reg::A, reg::CTX, at));
-            out.push(from_be(reg::A, 16));
+            vec![ldx(op::H, reg::A, reg::CTX, at), from_be(reg::A, 16)]
         }
-        ad::PKTTYPE | ad::MARK | ad::QUEUE | ad::VLAN_TAG | ad::VLAN_TAG_PRESENT => {
-            skb_access(which, out);
-        }
+        ad::PKTTYPE => vec![
+            ldx(op::B, reg::A, reg::CTX, field::PKT_TYPE),
+            alu32_imm(op::AND, reg::A, 7),
+        ],
+        ad::VLAN_TAG_PRESENT => vec![
+            ldx(op::W, reg::A, reg::CTX, field::VLAN_ALL),
+            jmp32_imm(op::JEQ, reg::A, 0, 1),
+            mov32_imm(reg::A, 1),
+        ],
         ad::IFINDEX | ad::HATYPE => {
-            out.push(ldx(op::DW, reg::TMP, reg::CTX, field::DEV));
-            out.push(jmp_imm(op::JNE, reg::TMP, 0, 1));
-            out.push(exit());
-            // `dev->ifindex` and `dev->type`.
+            // `dev->ifindex` is the device's first word.
             let (size, at) = if which == ad::IFINDEX {
                 (op::W, 0)
             } else {
                 (op::H, field::DEV_TYPE)
             };
-            out.push(ldx(size, reg::A, reg::TMP, at));
+            vec![
+                ldx(op::DW, reg::TMP, reg::CTX, field::DEV),
+                // The device's address is 64 bits.
+                insn(op::JMP | op::JNE, reg::TMP, 0, 1, 0),
+                exit(),
+                ldx(size, reg::A, reg::TMP, at),
+            ]
         }
-        ad::RXHASH => out.push(ldx(op::W, reg::A, reg::CTX, field::HASH)),
-        ad::ALU_XOR_X => out.push(alu32_reg(op::XOR, reg::A, reg::X)),
-        _ => {
-            let id = match which {
-                ad::PAY_OFFSET => helper::PAY_OFFSET,
-                ad::NLATTR => helper::NLATTR,
-                ad::NLATTR_NEST => helper::NLATTR_NEST,
-                ad::CPU => helper::CPU,
-                ad::RANDOM => helper::RANDOM,
-                _ => return false,
+        ad::ALU_XOR_X => vec![insn(op::ALU32 | op::XOR | op::X, reg::A, reg::X, 0, 0)],
+        ad::NLATTR | ad::NLATTR_NEST => {
+            let id = if which == ad::NLATTR {
+                helper::NLATTR
+            } else {
+                helper::NLATTR_NEST
             };
-            out.push(mov64_reg(reg::ARG1, reg::CTX));
-            out.push(mov64_reg(reg::ARG2, reg::A));
-            out.push(mov64_reg(reg::ARG3, reg::X));
-            out.push(call(id));
+            vec![
+                mov64_reg(reg::ARG1, reg::CTX),
+                mov32_reg(reg::ARG2, reg::A),
+                mov32_reg(reg::ARG3, reg::X),
+                call(id),
+            ]
         }
+        ad::PAY_OFFSET => vec![mov64_reg(reg::ARG1, reg::CTX), call(helper::PAY_OFFSET)],
+        ad::CPU => vec![call(helper::CPU)],
+        ad::RANDOM => vec![call(helper::RANDOM)],
+        // [`ancillary`] takes no other.
+        _ => Vec::new(),
     }
-    true
 }
 
-/// `convert_bpf_ld_abs`: a load of the packet's `size` bytes at `k`, or at
-/// `X + k` when `indirect`, through the data when it is in the linear part
-/// and else through a helper; the program returns 0 where neither has the
-/// bytes.
-fn ld_abs(size: u16, indirect: bool, k: u32, out: &mut Vec<Insn>) {
-    let (bytes, width, helper) = match size {
-        W => (4, op::W, helper::LOAD_WORD),
-        H => (2, op::H, helper::LOAD_HALF),
-        _ => (1, op::B, helper::LOAD_BYTE),
+/// A load of the packet's `size` bytes at `k`, or at `X + k` (in 32 bits)
+/// when `indirect`, into A: eBPF's own packet load, which does what a
+/// classic one does.
+fn packet_load(size: u16, indirect: bool, k: u32) -> Insn {
+    let width = match size {
+        W => op::W,
+        H => op::H,
+        _ => op::B,
     };
-    let endian = size != B;
-    let offset = k as i32;
-    // An x86-64 kernel has efficient unaligned access.
-    if !indirect && offset >= 0 {
-        let off_ok = offset <= i32::from(i16::MAX);
-        out.push(mov64_reg(reg::TMP, reg::H));
-        if offset != 0 {
-            out.push(insn(op::ALU64 | op::SUB, reg::TMP, 0, 0, offset));
-        }
-        let skip = 2 + i16::from(endian) + i16::from(!off_ok) * 2;
-        out.push(jmp_imm(op::JSLT, reg::TMP, bytes, skip));
-        if off_ok {
-            out.push(ldx(width, reg::A, reg::D, offset as i16));
-        } else {
-            out.push(mov64_reg(reg::TMP, reg::D));
-            out.push(insn(op::ALU64 | op::ADD, reg::TMP, 0, 0, offset));
-            out.push(ldx(width, reg::A, reg::TMP, 0));
-        }
-        if endian {
-            out.push(from_be(reg::A, bytes * 8));
-        }
-        out.push(jmp_imm(op::JA, 0, 0, 8));
-    }
-    out.push(mov64_reg(reg::ARG1, reg::CTX));
-    out.push(mov64_reg(reg::ARG2, reg::D));
-    out.push(mov64_reg(reg::ARG3, reg::H));
     if indirect {
-        out.push(mov64_reg(reg::ARG4, reg::X));
-        if k != 0 {
-            out.push(insn(op::ALU64 | op::ADD, reg::ARG4, 0, 0, offset));
-        }
+        insn(op::LD_IND | width, 0, reg::X, 0, k as i32)
     } else {
-        out.push(insn(op::ALU64 | op::MOV, reg::ARG4, 0, 0, offset));
+        insn(op::LD_ABS | width, 0, 0, 0, k as i32)
     }
-    out.push(call(helper));
-    out.push(jmp_imm(op::JSGE, reg::A, 0, 2));
-    out.push(alu32_reg(op::XOR, reg::A, reg::A));
-    out.push(exit());
 }
 
-/// One pass of `bpf_convert_filter`. Without `addrs` it only counts, and
-/// every jump goes nowhere; with them it writes the program, each
-/// instruction's place in `addrs`, and a jump goes to its target's place as
-/// the previous pass left it, 0 on the first, as Linux's zeroed array has
-/// it. EINVAL for a jump that goes further than an `off` reaches.
-fn pass(
-    filter: &[SockFilter],
-    mut addrs: Option<&mut [i32]>,
-    seen_ld_abs: &mut bool,
-) -> Result<Vec<Insn>, Errno> {
-    let len = filter.len();
-    let mut program = Vec::new();
-    if addrs.is_some() {
-        program.push(alu32_reg(op::XOR, reg::A, reg::A));
-        program.push(alu32_reg(op::XOR, reg::X, reg::X));
-        program.push(mov64_reg(reg::CTX, reg::ARG1));
-        if *seen_ld_abs {
-            program.push(ldx(op::DW, reg::D, reg::CTX, field::DATA));
-            program.push(ldx(op::W, reg::H, reg::CTX, field::LEN));
-            program.push(ldx(op::W, reg::TMP, reg::CTX, field::DATA_LEN));
-            program.push(alu32_reg(op::SUB, reg::H, reg::TMP));
+/// The converted block of the classic instruction `f` at `pc`, which is
+/// `op`: its instructions, and no-ops after them up to [`length`].
+fn block(pc: usize, op: Op, f: SockFilter) -> Block {
+    let mut out = Block::default();
+    let k = f.k as i32;
+    match op {
+        Op::Packet {
+            indirect: false, ..
+        } if ancillary(f.k) => {
+            out.extend(ancillary_load(f.k.wrapping_sub(AD_OFF)));
         }
-    } else {
-        program.resize(3, exit());
+        Op::Packet { size, indirect } => out.push(packet_load(size, indirect, f.k)),
+        Op::HeaderLength => out.extend([
+            mov64_reg(reg::SAVED, reg::A),
+            packet_load(B, false, f.k),
+            alu32_imm(op::AND, reg::A, 0xf),
+            alu32_imm(op::LSH, reg::A, 2),
+            mov32_reg(reg::X, reg::A),
+            mov32_reg(reg::A, reg::SAVED),
+        ]),
+        Op::Immediate(to) => out.push(mov32_imm(register(to), k)),
+        Op::Scratch(to) => out.push(ldx(op::W, register(to), reg::FP, scratch(f.k))),
+        Op::Length(to) => out.push(ldx(op::W, register(to), reg::CTX, field::LEN)),
+        Op::Store(from) => out.push(insn(
+            op::STX_MEM | op::W,
+            reg::FP,
+            register(from),
+            scratch(f.k),
+            0,
+        )),
+        Op::Alu { op: o, x } => {
+            if x && (o == DIV || o == MOD) {
+                // A division by 0 returns 0.
+                out.extend([
+                    jmp32_imm(op::JNE, reg::X, 0, 2),
+                    mov32_imm(reg::A, 0),
+                    exit(),
+                ]);
+            }
+            // A classic operation's code is eBPF's 32-bit one.
+            let src = if x { reg::X } else { 0 };
+            out.push(insn(f.code as u8, reg::A, src, 0, k));
+        }
+        Op::Neg => out.push(insn(f.code as u8, reg::A, 0, 0, 0)),
+        Op::Always => out.jump(insn(op::JMP | op::JA, 0, 0, 0, 0), pc + 1 + f.k as usize),
+        Op::Conditional { op: o, x } => {
+            let (jt, jf) = (pc + 1 + usize::from(f.jt), pc + 1 + usize::from(f.jf));
+            // A 32-bit jump compares as a classic one does, a k above
+            // i32::MAX too; Linux has one more instruction there.
+            if !x && k < 0 {
+                out.push(nop());
+            }
+            let source = if x { op::X } else { 0 };
+            let src = if x { reg::X } else { 0 };
+            let jump = |o: u8| {
+                insn(
+                    op::JMP32 | o | source,
+                    reg::A,
+                    src,
+                    0,
+                    if x { 0 } else { k },
+                )
+            };
+            // A true case that is the next instruction takes the opposite
+            // jump to the false one, where there is one.
+            let opposite = match o {
+                JEQ => Some(op::JNE),
+                JGT => Some(op::JLE),
+                JGE => Some(op::JLT),
+                _ => None,
+            };
+            match (f.jt, f.jf, opposite) {
+                (_, 0, _) => out.jump(jump(o as u8), jt),
+                (0, _, Some(opposite)) => out.jump(jump(opposite), jf),
+                _ => {
+                    out.jump(jump(o as u8), jt);
+                    out.jump(insn(op::JMP | op::JA, 0, 0, 0, 0), jf);
+                }
+            }
+        }
+        Op::Return { a } => {
+            if !a {
+                out.push(mov32_imm(reg::A, k));
+            }
+            out.push(exit());
+        }
+        Op::Tax => out.push(mov32_reg(reg::X, reg::A)),
+        Op::Txa => out.push(mov32_reg(reg::A, reg::X)),
     }
-    for (i, f) in filter.iter().enumerate() {
-        let here = program.len() as i32;
-        if let Some(addrs) = addrs.as_deref_mut() {
-            addrs[i] = here;
-        }
-        let mut out = Vec::new();
-        // BPF_EMIT_JMP: the next instruction of `out` jumps to `target`.
-        let jump = |out: &mut Vec<Insn>, mut j: Insn, target: usize, addrs: Option<&[i32]>| {
-            if target >= len {
-                return Err(Errno::EINVAL);
+    out.pad(length(op, f));
+    out
+}
+
+/// Where scratch word `k` is on the converted program's stack.
+const fn scratch(k: u32) -> i16 {
+    -(k as i16 * 4 + 4)
+}
+
+/// Whether `op` with `k` reads the packet, which gives Linux's converted
+/// program 4 more instructions at its start.
+fn reads_packet(op: Op, k: u32) -> bool {
+    match op {
+        Op::Packet { indirect, .. } => indirect || !ancillary(k),
+        Op::HeaderLength => true,
+        _ => false,
+    }
+}
+
+/// The eBPF program a checked classic one runs as. Its instructions are
+/// this file's own, but each classic instruction's block has as many as
+/// Linux's, and the jumps to other instructions are where Linux has them:
+/// the program's length is what the socket is charged for, and it and
+/// the jumps' places decide whether a jump reaches. It starts by clearing
+/// A and X and keeping the context, with no-ops for Linux's 4 more when
+/// the program reads the packet; then each classic instruction's block
+/// follows.
+///
+/// EINVAL for a jump an `off` cannot hold, and for any jump placed past
+/// 32,767, however near it goes: Linux places the jumps once with every
+/// target taken to be at 0 before it places them where they go.
+pub(crate) fn convert(filter: &[SockFilter]) -> Result<Vec<Insn>, Errno> {
+    let ops = filter
+        .iter()
+        .map(|f| decode(f.code).ok_or(Errno::EINVAL))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut program = vec![
+        mov32_imm(reg::A, 0),
+        mov32_imm(reg::X, 0),
+        mov64_reg(reg::CTX, reg::ARG1),
+    ];
+    if ops.iter().zip(filter).any(|(&op, f)| reads_packet(op, f.k)) {
+        program.extend([nop(); 4]);
+    }
+    let blocks: Vec<Block> = ops
+        .iter()
+        .zip(filter)
+        .enumerate()
+        .map(|(pc, (&op, &f))| block(pc, op, f))
+        .collect();
+    let mut starts = Vec::with_capacity(blocks.len());
+    let mut at = program.len();
+    for b in &blocks {
+        starts.push(at);
+        at += b.0.len();
+    }
+    for piece in blocks.iter().flat_map(|b| &b.0) {
+        let i = match *piece {
+            Piece::Insn(i) => i,
+            Piece::Jump(mut j, target) => {
+                let here = program.len();
+                let to = *starts.get(target).ok_or(Errno::EINVAL)?;
+                if i16::try_from(here).is_err() {
+                    return Err(Errno::EINVAL);
+                }
+                j.off = i16::try_from(to as i64 - here as i64 - 1).map_err(|_| Errno::EINVAL)?;
+                j
             }
-            let mut off = addrs.map_or(0, |a| a[target] - a[i] - 1);
-            off -= out.len() as i32;
-            j.off = i16::try_from(off).map_err(|_| Errno::EINVAL)?;
-            out.push(j);
-            Ok(())
         };
-        let a = addrs.as_deref();
-        match f.code {
-            c if c & 0x07 == ALU || c & 0x07 == LD && (c & 0xe0 == ABS || c & 0xe0 == IND) => {
-                let class = c & 0x07;
-                let extended = class == LD && c & 0xe0 == ABS && extension(f.k, &mut out);
-                if extended {
-                    // An ancillary load.
-                } else if class == LD {
-                    ld_abs(c & 0x18, c & 0xe0 == IND, f.k, &mut out);
-                    *seen_ld_abs = true;
-                } else {
-                    if c == ALU | DIV | X || c == ALU | MOD | X {
-                        out.push(insn(op::ALU32 | op::MOV | op::X, reg::X, reg::X, 0, 0));
-                        out.push(jmp_imm(op::JNE, reg::X, 0, 2));
-                        out.push(alu32_reg(op::XOR, reg::A, reg::A));
-                        out.push(exit());
-                    }
-                    out.push(insn(c as u8, reg::A, reg::X, 0, f.k as i32));
-                }
-            }
-            c if c == JMP | JA => {
-                jump(
-                    &mut out,
-                    insn(op::JMP | op::JA, 0, 0, 0, 0),
-                    i + f.k as usize + 1,
-                    a,
-                )?;
-            }
-            c if conditional(c) => {
-                let o = (c & 0xf0) as u8;
-                let mut j = insn(0, reg::A, 0, 0, 0);
-                let src = if c & X == K && (f.k as i32) < 0 {
-                    // Immediates are signed: the constant goes into TMP,
-                    // zero-extended.
-                    out.push(mov32_imm(reg::TMP, f.k as i32));
-                    j.src = reg::TMP;
-                    op::X
-                } else {
-                    j.imm = f.k as i32;
-                    if c & X != 0 {
-                        j.src = reg::X;
-                    }
-                    (c & X) as u8
-                };
-                let (jt, jf) = (i + usize::from(f.jt) + 1, i + usize::from(f.jf) + 1);
-                // When the true case is next, the inverse jump, which jset
-                // has none of.
-                let inverse = match u16::from(o) {
-                    JEQ => Some(op::JNE),
-                    JGT => Some(op::JLE),
-                    JGE => Some(op::JLT),
-                    _ => None,
-                };
-                if f.jf == 0 {
-                    j.code = op::JMP | o | src;
-                    jump(&mut out, j, jt, a)?;
-                } else if let (0, Some(inverse)) = (f.jt, inverse) {
-                    j.code = op::JMP | inverse | src;
-                    jump(&mut out, j, jf, a)?;
-                } else {
-                    j.code = op::JMP | o | src;
-                    jump(&mut out, j, jt, a)?;
-                    jump(&mut out, insn(op::JMP | op::JA, 0, 0, 0, 0), jf, a)?;
-                }
-            }
-            c if c == LDX | B | MSH => {
-                *seen_ld_abs = true;
-                out.push(mov64_reg(reg::X, reg::A));
-                ld_abs(B, false, f.k, &mut out);
-                out.push(alu32_imm(op::AND, reg::A, 0xf));
-                out.push(alu32_imm(op::LSH, reg::A, 2));
-                out.push(mov64_reg(reg::TMP, reg::X));
-                out.push(mov64_reg(reg::X, reg::A));
-                out.push(mov64_reg(reg::A, reg::TMP));
-            }
-            c if c == RET | K || c == RET | RET_A => {
-                if c == RET | K {
-                    out.push(mov32_imm(reg::A, f.k as i32));
-                }
-                out.push(exit());
-            }
-            c if c == ST || c == STX => {
-                let from = if c == ST { reg::A } else { reg::X };
-                let at = -(f.k as i16 * 4 + 4);
-                out.push(insn(op::STX_MEM | op::W, reg::FP, from, at, 0));
-            }
-            c if c == LD | MEM || c == LDX | MEM => {
-                let to = if c == LD | MEM { reg::A } else { reg::X };
-                out.push(ldx(op::W, to, reg::FP, -(f.k as i16 * 4 + 4)));
-            }
-            c if c == LD | IMM || c == LDX | IMM => {
-                let to = if c == LD | IMM { reg::A } else { reg::X };
-                out.push(mov32_imm(to, f.k as i32));
-            }
-            c if c == MISC | TAX => out.push(mov64_reg(reg::X, reg::A)),
-            c if c == MISC | TXA => out.push(mov64_reg(reg::A, reg::X)),
-            c if c == LD | W | LEN || c == LDX | W | LEN => {
-                let to = if c == LD | W | LEN { reg::A } else { reg::X };
-                out.push(ldx(op::W, to, reg::CTX, field::LEN));
-            }
-            _ => return Err(Errno::EINVAL),
-        }
-        program.append(&mut out);
+        program.push(i);
     }
     Ok(program)
-}
-
-/// `bpf_convert_filter`, as `bpf_migrate_filter` calls it: a pass that
-/// counts, and then passes that write the program until two in a row give
-/// it the same length, three at most. EINVAL for a jump that an `off`
-/// cannot hold, which on the first of them is any jump placed past 32,767,
-/// since that pass takes every target to be at 0.
-pub(crate) fn convert(filter: &[SockFilter]) -> Result<Vec<Insn>, Errno> {
-    let mut seen_ld_abs = false;
-    let counted = pass(filter, None, &mut seen_ld_abs)?.len() + if seen_ld_abs { 4 } else { 0 };
-    let mut addrs = vec![0; filter.len()];
-    let mut length = 0;
-    for round in 1.. {
-        let program = pass(filter, Some(&mut addrs), &mut seen_ld_abs)?;
-        if program.len() == length {
-            debug_assert_eq!(program.len(), counted);
-            return Ok(program);
-        }
-        length = program.len();
-        if round > 2 {
-            break;
-        }
-    }
-    Err(Errno::EINVAL)
 }
 
 /// A classic socket filter as `SO_ATTACH_FILTER` attaches it: the program
@@ -786,6 +902,246 @@ mod tests {
         assert!(taken >= 8_000, "{taken}");
     }
 
+    /// FNV-1a over `bytes`, folded into `hash`.
+    fn fnv(hash: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *hash ^= u64::from(b);
+            *hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    /// `count` programs of up to `max_len` instructions from `seed`, most of
+    /// them ones the checks take: every code, each with a `k` that is valid
+    /// for it, jumps that stay in the program, scratch words that are often
+    /// read and, in seven programs of eight, written first, and, `far` times
+    /// in eight, a load that converts to 16 instructions, so that jumps go
+    /// far. One program in eight has one instruction that may be refused.
+    fn programs(seed: u64, count: usize, max_len: usize, far: u64) -> Vec<Vec<SockFilter>> {
+        let mut seed = seed;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let codes: Vec<u16> = (0..=u16::from(u8::MAX)).filter(|&c| allowed(c)).collect();
+        const EDGES: [u32; 16] = [
+            0,
+            1,
+            2,
+            3,
+            4,
+            15,
+            16,
+            31,
+            32,
+            39,
+            40,
+            0x7fff,
+            0x8000,
+            0xffef_ffff,
+            0x8000_0000,
+            u32::MAX,
+        ];
+        (0..count)
+            .map(|_| {
+                let len = 1 + next() as usize % max_len;
+                let shape = next();
+                let wild_at = shape.is_multiple_of(8).then(|| (shape >> 8) as usize % len);
+                let stores = shape >> 4 & 7 != 0;
+                (0..len)
+                    .map(|i| {
+                        let r = next();
+                        let left = (len - i - 1) as u64;
+                        let wild = wild_at == Some(i);
+                        if stores && i < 4 && i + 1 < len {
+                            return f(ST, 0, 0, i as u32);
+                        }
+                        let mut code = codes[r as usize % codes.len()];
+                        if wild && r & 0x100 != 0 {
+                            code = (r >> 16) as u16 & 0xff;
+                        } else if r >> 56 & 7 < 2 {
+                            code = [ST, STX, LD | MEM, LDX | MEM][(r >> 4) as usize % 4];
+                        } else if (r >> 20) % 8 < far {
+                            return f(LD | W | ABS, 0, 0, 40_000);
+                        }
+                        if i == len - 1 && !wild {
+                            code = if r & 1 == 0 { RET | K } else { RET | RET_A };
+                        }
+                        let any = (r >> 24) as u32;
+                        let k = if wild {
+                            EDGES[(r >> 24) as usize % EDGES.len()]
+                        } else {
+                            match code {
+                                c if c == ST || c == STX || c == LD | MEM || c == LDX | MEM => {
+                                    any % 4
+                                }
+                                c if c == ALU | DIV | K || c == ALU | MOD | K => any | 1,
+                                c if c == ALU | LSH | K || c == ALU | RSH | K => any % 32,
+                                c if c == JMP | JA => (any as u64 % (left.min(300) + 1)) as u32,
+                                c if c & 0x07 == LD && (c & 0xe0 == ABS || c & 0xe0 == IND) => {
+                                    match any % 4 {
+                                        0 => AD_OFF + any / 4 % 16 * 4,
+                                        1 => EDGES[(any / 4) as usize % (EDGES.len() - 1)],
+                                        _ => any % 64,
+                                    }
+                                }
+                                _ if any.is_multiple_of(3) => {
+                                    EDGES[(any / 3) as usize % EDGES.len()]
+                                }
+                                _ => any,
+                            }
+                        };
+                        let reach = left.clamp(1, 256);
+                        let (jt, jf) = ((r >> 40) % reach, (r >> 48) % reach);
+                        let (jt, jf) = if wild { (jt + 1, jf) } else { (jt, jf) };
+                        f(code, jt as u8, jf as u8, k)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Digests of what a guest can see of `programs`: what [`check`]
+    /// decides; for the programs it takes, each instruction's block length
+    /// and where its jumps to other instructions are in it, and the
+    /// converted length or the conversion's error; and what the converted
+    /// programs return on a linear packet, a paged one and an empty one.
+    /// With how many the checks take and how many convert.
+    fn conversion_digests(programs: &[Vec<SockFilter>]) -> ([u64; 3], [usize; 2]) {
+        let mut digests = [0xcbf2_9ce4_8422_2325u64; 3];
+        let mut counts = [0; 2];
+        let data: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(7)).collect();
+        for filter in programs {
+            let checked = check(filter);
+            let len = (filter.len() as u16).to_le_bytes();
+            fnv(&mut digests[0], &len);
+            fnv(
+                &mut digests[0],
+                &[checked.map_or_else(|e| 100 + e.0 as u8, |()| 0)],
+            );
+            if checked.is_err() {
+                continue;
+            }
+            counts[0] += 1;
+            for (pc, &f) in filter.iter().enumerate() {
+                let Some(op) = decode(f.code) else {
+                    continue;
+                };
+                let pieces = block(pc, op, f).0;
+                fnv(&mut digests[1], &(pieces.len() as u16).to_le_bytes());
+                for (at, piece) in pieces.iter().enumerate() {
+                    if let Piece::Jump(..) = piece {
+                        fnv(&mut digests[1], &[0xaa, at as u8]);
+                    }
+                }
+            }
+            let insns = match convert(filter) {
+                Ok(insns) => insns,
+                Err(e) => {
+                    fnv(&mut digests[1], &[0xff, e.0 as u8]);
+                    continue;
+                }
+            };
+            counts[1] += 1;
+            fnv(&mut digests[1], &(insns.len() as u32).to_le_bytes());
+            let program = crate::bpf_interp::Program {
+                insns: &insns,
+                maps: &[],
+                loads: &BTreeMap::new(),
+            };
+            for (bytes, linear) in [(&data[..], 40), (&data[..], 20), (&[][..], 0)] {
+                let packet = Packet::message(bytes, linear);
+                match crate::bpf_interp::run(&program, &packet, &mut Quiet) {
+                    Ok(r) => fnv(&mut digests[2], &r.to_le_bytes()),
+                    Err(_) => fnv(&mut digests[2], &[0xfa]),
+                }
+            }
+        }
+        (digests, counts)
+    }
+
+    #[test]
+    fn checks_and_conversions_give_what_they_did() {
+        // Digests of what a guest sees of the checks and the converted
+        // programs, made before the blocks' instructions were written anew:
+        // it must change none of them.
+        // A seed, how many programs, their longest, `far`, and the digests
+        // and counts.
+        type Case = (u64, usize, usize, u64, [u64; 3], [usize; 2]);
+        let cases: [Case; 5] = [
+            (
+                0x2545_f491_4f6c_dd1d,
+                40_000,
+                12,
+                0,
+                [
+                    0x93ae_fd66_3e5b_0f9a,
+                    0x80a9_d1bb_6001_9afe,
+                    0xf9d3_2d19_e23d_ae96,
+                ],
+                [35_225, 35_225],
+            ),
+            (
+                0x9e37_79b9_7f4a_7c15,
+                20_000,
+                60,
+                0,
+                [
+                    0xbf80_2ed8_ef94_b283,
+                    0xe5bd_ae8f_0a0c_2df7,
+                    0x56e8_0945_78e1_d741,
+                ],
+                [16_386, 16_386],
+            ),
+            (
+                0xd1b5_4a32_d192_ed03,
+                1_000,
+                600,
+                0,
+                [
+                    0xcdd7_f1ae_52a9_ac49,
+                    0x62be_01c1_16f4_c69a,
+                    0xb84b_f427_58e4_2bd8,
+                ],
+                [738, 738],
+            ),
+            (
+                0x6a09_e667_f3bc_c909,
+                300,
+                MAX_INSNS,
+                4,
+                [
+                    0x0aec_efeb_423c_668f,
+                    0x79c8_280e_73cc_ccf8,
+                    0x25c2_a163_e090_5856,
+                ],
+                [128, 128],
+            ),
+            (
+                0x510e_527f_ade6_82d1,
+                300,
+                MAX_INSNS,
+                6,
+                [
+                    0xd5d0_1baf_752d_8944,
+                    0x9974_442b_073a_b3f0,
+                    0x73be_dd9e_a6a9_a825,
+                ],
+                [101, 88],
+            ),
+        ];
+        for (seed, count, max_len, far, digests, counts) in cases {
+            let got = conversion_digests(&programs(seed, count, max_len, far));
+            assert_eq!(got, (digests, counts), "{seed:#x}");
+        }
+    }
+
+    /// Whether Linux takes the classic `code` at all.
+    fn allowed(code: u16) -> bool {
+        decode(code).is_some()
+    }
+
     fn f(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
         SockFilter { code, jt, jf, k }
     }
@@ -844,6 +1200,21 @@ mod tests {
         assert_eq!(check(&one_path), Err(Errno::EINVAL));
         let both = [store, f(JMP | JEQ | K, 1, 0, 0), store, load, ret];
         assert_eq!(check(&both), Ok(()));
+        // What is known after a return carries into the next instruction,
+        // which only a jump reaches: there, nothing is written.
+        assert_eq!(check(&[ret, load, ret]), Err(Errno::EINVAL));
+        // The path through the return writes nothing; the path that jumps
+        // to the load writes the word.
+        let jumped = [
+            f(JMP | JEQ | K, 0, 1, 0),
+            f(JMP | JA, 0, 0, 2),
+            store,
+            f(JMP | JA, 0, 0, 1),
+            ret,
+            load,
+            ret,
+        ];
+        assert_eq!(check(&jumped), Err(Errno::EINVAL));
     }
 
     #[test]

@@ -1,21 +1,23 @@
 //! io_uring, as Linux 6.12's (`io_uring/`) with these operations:
 //! `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL` (the one libuv batches its
-//! `epoll_ctl` calls with), and the file transfers `IORING_OP_READ`,
-//! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, `IORING_OP_FILES_UPDATE`,
+//! `epoll_ctl` calls with) and `_EPOLL_WAIT`, the file transfers
+//! `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`,
+//! `IORING_OP_FILES_UPDATE`,
 //! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
 //! `IORING_OP_ASYNC_CANCEL` ([`cancel`]), the timeouts `IORING_OP_TIMEOUT`,
 //! `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT` ([`timeout`]), the polls
 //! `IORING_OP_POLL_ADD` and `_POLL_REMOVE` ([`poll`]), the file requests
 //! `IORING_OP_OPENAT`, `_OPENAT2`, `_CLOSE`, `_STATX`, `_FALLOCATE`,
 //! `_FADVISE`, `_MADVISE`, `_RENAMEAT`, `_UNLINKAT`, `_MKDIRAT`,
-//! `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE` ([`fs`]), and the socket
+//! `_SYMLINKAT`, `_LINKAT`, `_FTRUNCATE` and `_PIPE` ([`fs`]), and the socket
 //! requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
 //! `_SEND`, `_RECV`, `_SENDMSG` and `_RECVMSG`, with multishot accepts and
 //! receives ([`net`]), and `IORING_OP_SPLICE` and `_TEE` ([`splice`]). The
 //! others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
-//! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
+//! the buffers `IORING_OP_READ_FIXED`, `_WRITE_FIXED`, `_READV_FIXED` and
+//! `_WRITEV_FIXED` transfer with,
 //! `IORING_REGISTER_FILES` (or `_FILES2`, with tags) the files a request
 //! with `IOSQE_FIXED_FILE` names by their index, and
 //! `IORING_REGISTER_PBUF_RING` a ring of the buffers a read or a receive
@@ -151,8 +153,11 @@ const OP_WRITE: u8 = 23;
 const OP_EPOLL_CTL: u8 = 29;
 const OP_PROVIDE_BUFFERS: u8 = 31;
 const OP_REMOVE_BUFFERS: u8 = 32;
+const OP_EPOLL_WAIT: u8 = 59;
+const OP_READV_FIXED: u8 = 60;
+const OP_WRITEV_FIXED: u8 = 61;
 /// The operations implemented.
-const OPS: [u8; 28] = [
+const OPS: [u8; 31] = [
     OP_NOP,
     OP_READV,
     OP_WRITEV,
@@ -166,6 +171,9 @@ const OPS: [u8; 28] = [
     OP_EPOLL_CTL,
     OP_PROVIDE_BUFFERS,
     OP_REMOVE_BUFFERS,
+    OP_EPOLL_WAIT,
+    OP_READV_FIXED,
+    OP_WRITEV_FIXED,
     net::OP_ACCEPT,
     net::OP_CONNECT,
     net::OP_SEND,
@@ -188,6 +196,9 @@ fn supported(opcode: u8) -> bool {
 }
 /// `IORING_OP_LAST` of Linux 7.0, after `IORING_OP_URING_CMD128`.
 const OP_LAST: u8 = 65;
+/// `KMALLOC_MAX_SIZE` on x86-64: the most `kmalloc` gives at once, 4 MiB
+/// (`MAX_PAGE_ORDER` 10).
+const MAX_KMALLOC: u64 = 4 << 20;
 
 /// `IOSQE_*`: what every operation takes, then what only some do.
 const IOSQE_FIXED_FILE: u8 = 1 << 0;
@@ -815,8 +826,8 @@ impl Files {
 /// ([`Ring::registered`]).
 struct Registered {
     pages: Arc<paludarium_mmu::Pinned>,
-    at: usize,
-    len: usize,
+    /// Each piece's offset into the pages, and its length.
+    pieces: Vec<(u64, usize)>,
 }
 
 /// A ring's registered buffers (`ctx->buf_table`): each slot's buffer, or
@@ -885,6 +896,15 @@ enum Work {
         fd: i32,
         event: (u32, u64),
     },
+    /// `IORING_OP_EPOLL_WAIT`: the epoll of `fd`, and where at most `max`
+    /// of its events go; then the file it found before it waited for it.
+    EpollWait {
+        fd: i32,
+        fixed: bool,
+        at: u64,
+        max: i32,
+        found: Option<crate::files::Descriptor>,
+    },
     Transfer(Box<Transfer>),
     /// A socket request ([`net`]).
     Net(Box<net::Net>),
@@ -931,15 +951,16 @@ enum Work {
     None,
 }
 
-/// An `IORING_OP_READ`, `_WRITE`, `_READV` or `_WRITEV`: the entry's
-/// fields, then what its preparation found.
+/// An `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, or one of their
+/// registered forms: the entry's fields, then what its preparation found.
 struct Transfer {
     fd: i32,
     /// `IOSQE_FIXED_FILE`: `fd` indexes the registered files.
     fixed: bool,
     write: bool,
     vectored: bool,
-    /// `IORING_OP_READ_FIXED` or `_WRITE_FIXED`: the buffer is within the
+    /// `IORING_OP_READ_FIXED` or `_WRITE_FIXED`, or with `vectored`
+    /// `_READV_FIXED` or `_WRITEV_FIXED`: the buffers are within the
     /// registered one of index `buf_index`.
     registered: bool,
     buf_index: u16,
@@ -953,8 +974,13 @@ struct Transfer {
     ioprio: u16,
     attr_ptr: u64,
     attr_type_mask: u64,
-    /// The buffers, as `io_import_rw_buffer` imported them.
+    /// The buffers, as `io_import_rw_buffer` imported them; for a vector
+    /// in a registered buffer, its entries as they were read, a length past
+    /// `MAX_RW_COUNT` cut to one past it.
     segments: Vec<(u64, usize)>,
+    /// For a vector in a registered buffer, the most pieces of pages its
+    /// entries may take, from their whole lengths ([`within_vector`]).
+    page_pieces: u64,
     /// Protection information came with it (`REQ_F_HAS_METADATA`), which
     /// no file here takes.
     metadata: bool,
@@ -1227,7 +1253,14 @@ impl Ring {
         }
         let transfer = matches!(
             opcode,
-            OP_READ | OP_WRITE | OP_READV | OP_WRITEV | OP_READ_FIXED | OP_WRITE_FIXED
+            OP_READ
+                | OP_WRITE
+                | OP_READV
+                | OP_WRITEV
+                | OP_READ_FIXED
+                | OP_WRITE_FIXED
+                | OP_READV_FIXED
+                | OP_WRITEV_FIXED
         );
         // Only the transfers take a priority, and an accept, a send and a
         // receive their flags there (`ioprio`).
@@ -1252,9 +1285,18 @@ impl Ring {
             _ if transfer => Work::Transfer(Box::new(Transfer {
                 fd: int_at(4),
                 fixed,
-                write: matches!(opcode, OP_WRITE | OP_WRITEV | OP_WRITE_FIXED),
-                vectored: matches!(opcode, OP_READV | OP_WRITEV),
-                registered: matches!(opcode, OP_READ_FIXED | OP_WRITE_FIXED),
+                write: matches!(
+                    opcode,
+                    OP_WRITE | OP_WRITEV | OP_WRITE_FIXED | OP_WRITEV_FIXED
+                ),
+                vectored: matches!(
+                    opcode,
+                    OP_READV | OP_WRITEV | OP_READV_FIXED | OP_WRITEV_FIXED
+                ),
+                registered: matches!(
+                    opcode,
+                    OP_READ_FIXED | OP_WRITE_FIXED | OP_READV_FIXED | OP_WRITEV_FIXED
+                ),
                 buf_index: u16::from_le_bytes([sqe[40], sqe[41]]),
                 select: flags & IOSQE_BUFFER_SELECT != 0,
                 offset: u64_at(sqe, 8),
@@ -1265,6 +1307,7 @@ impl Ring {
                 attr_ptr: u64_at(sqe, 48),
                 attr_type_mask: u64_at(sqe, 56),
                 segments: Vec::new(),
+                page_pieces: 0,
                 metadata: false,
                 kept: None,
                 found: None,
@@ -1354,6 +1397,23 @@ impl Ring {
                     op: int_at(24),
                     fd: u64_at(sqe, 8) as i32,
                     event: (0, 0),
+                }
+            }
+            // `io_epoll_wait_prep`.
+            OP_EPOLL_WAIT => {
+                if u64_at(sqe, 8) != 0
+                    || u32_at(sqe, 28) != 0
+                    || u16::from_le_bytes([sqe[40], sqe[41]]) != 0
+                    || int_at(44) != 0
+                {
+                    return fail(request, Errno::EINVAL);
+                }
+                Work::EpollWait {
+                    fd: int_at(4),
+                    fixed,
+                    at: u64_at(sqe, 16),
+                    max: int_at(24),
+                    found: None,
                 }
             }
             net::OP_SHUTDOWN
@@ -1479,7 +1539,10 @@ fn prepare_memory(c: &Context<'_>, ring: &Ring, request: &mut Request, addr: u64
 /// user half, `EFAULT`) or vector (`__import_iovec`: `EINVAL`, `EFAULT`).
 /// A request that selects a buffer imports none, but a vectored one must
 /// have one vector (`EINVAL`) that can be read (`EFAULT`), and one in a
-/// registered buffer is looked for at issue (`io_prep_read_fixed`).
+/// registered buffer is looked for at issue (`io_prep_read_fixed`); a
+/// vector in one is only read (`io_prep_reg_iovec`): more entries than
+/// `kmalloc` gives room for at once (4 MiB of them) are `ENOMEM`, then as
+/// [`crate::files::iovec_entries`] reads them.
 ///
 /// The attributes are Linux 6.14's, which the kernel the differential
 /// tests run on has; Linux 6.12 does not look at those fields.
@@ -1509,6 +1572,23 @@ fn prepare_transfer(c: &Context<'_>, transfer: &mut Transfer) -> Result<(), Errn
         _ => return Err(Errno::EINVAL),
     }
     if transfer.registered {
+        if transfer.vectored {
+            if u64::from(transfer.len) * 16 > MAX_KMALLOC {
+                return Err(Errno::ENOMEM);
+            }
+            let entries =
+                crate::files::iovec_entries(c.mem, transfer.addr, u64::from(transfer.len))?;
+            // `io_estimate_bvec_size`: two more than the 4 KiB pages of
+            // each.
+            transfer.page_pieces = entries.iter().fold(0u64, |pieces, &(_, len)| {
+                pieces.saturating_add((len >> 12) + 2)
+            });
+            let most = crate::files::MAX_RW_COUNT as u64 + 1;
+            transfer.segments = entries
+                .into_iter()
+                .map(|(base, len)| (base, len.min(most) as usize))
+                .collect();
+        }
         return Ok(());
     }
     if transfer.select {
@@ -1630,16 +1710,18 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
         })
     };
     if transfer.registered {
-        let within = buffer
-            .as_ref()
-            .ok_or(Errno::EFAULT)
-            .and_then(|node| within(node, transfer.addr, transfer.len));
-        let wanted = within.as_ref().map_or(0, |within| within.len as u64);
+        let within = buffer.as_ref().ok_or(Errno::EFAULT).and_then(|node| {
+            if transfer.vectored {
+                within_vector(node, &transfer.segments, transfer.page_pieces)
+            } else {
+                within(node, transfer.addr, transfer.len)
+            }
+        });
+        let wanted = within.as_ref().map_or(0, |within| asked(&within.pieces));
         let result = within.and_then(|within| {
             let memory = crate::files::Memory::Pinned {
                 pages: &within.pages,
-                at: within.at,
-                len: within.len,
+                pieces: &within.pieces,
             };
             issue(c, transfer, &opened, memory)
         });
@@ -1966,6 +2048,13 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
     match work {
         Work::Net(net) => return net::run(c, ring, net),
         Work::Splice(splice) => return splice::run(c, ring, splice),
+        &mut Work::EpollWait {
+            fd,
+            fixed,
+            at,
+            max,
+            ref found,
+        } => return epoll_wait(c, ring, (fd, fixed, found), at, max),
         Work::Fs(fs) => {
             let (res, failed) = fs::run(c, ring, fs);
             return (res, 0, failed, None);
@@ -2051,6 +2140,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
         } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
         Work::Fs(_)
         | Work::Splice(_)
+        | Work::EpollWait { .. }
         | Work::Fsync { .. }
         | Work::Transfer(_)
         | Work::Net(_)
@@ -2249,6 +2339,7 @@ fn issue_link(
                 net.polled = true;
                 net.found = Some(waits.found.0.clone());
             }
+            Work::EpollWait { found, .. } => *found = Some(waits.found.0.clone()),
             _ => {}
         }
         chain.insert(0, request);
@@ -4618,9 +4709,82 @@ fn within(node: &Node, addr: u64, len: u32) -> Result<Registered, Errno> {
     }
     Ok(Registered {
         pages,
-        at: (addr - base) as usize,
-        len: len as usize,
+        pieces: vec![(addr - base, len as usize)],
     })
+}
+
+/// The pieces of the registered buffer `node` that a vector's entries name,
+/// in order, as `io_import_reg_vec` finds them. Before any entry is looked
+/// at, room is made for the pieces of pages they may take (`page_pieces`,
+/// 16 bytes each): more than `INT_MAX` of them are `EOVERFLOW`, and more
+/// than `kmalloc` gives at once `ENOMEM`. Then each entry is found as
+/// [`within`] finds one, but one of no bytes is `EFAULT` too, and more than
+/// `MAX_RW_COUNT` in all is `EINVAL`.
+fn within_vector(
+    node: &Node,
+    entries: &[(u64, usize)],
+    page_pieces: u64,
+) -> Result<Registered, Errno> {
+    if page_pieces > i32::MAX as u64 {
+        return Err(EOVERFLOW);
+    }
+    if page_pieces * 16 > MAX_KMALLOC {
+        return Err(Errno::ENOMEM);
+    }
+    let mut pieces = Vec::with_capacity(entries.len());
+    let mut pages = None;
+    for &(addr, len) in entries {
+        let len = u32::try_from(len).map_err(|_| Errno::EFAULT)?;
+        let mut piece = within(node, addr, len)?;
+        if len == 0 {
+            return Err(Errno::EFAULT);
+        }
+        pieces.append(&mut piece.pieces);
+        pages = Some(piece.pages);
+    }
+    if pieces.iter().map(|&(_, len)| len as u64).sum::<u64>() > crate::files::MAX_RW_COUNT as u64 {
+        return Err(Errno::EINVAL);
+    }
+    let pages = match pages {
+        Some(pages) => pages,
+        None => Arc::clone(&node.buffer().ok_or(Errno::EFAULT)?.pages),
+    };
+    Ok(Registered { pages, pieces })
+}
+
+/// `io_epoll_wait`: the file (`EBADF`), then the events as
+/// [`crate::epoll::send_events`] takes them; with none ready it waits for
+/// the epoll to be readable (`pollin`) and looks again. A negative result
+/// fails its link.
+fn epoll_wait(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    (fd, fixed, found): (i32, bool, &Option<crate::files::Descriptor>),
+    at: u64,
+    max: i32,
+) -> (i32, u32, bool, Option<Waits>) {
+    let opened = match found {
+        Some(opened) => opened.clone(),
+        None => match file_of(c, ring, fd, fixed) {
+            Ok(opened) => opened,
+            Err(e) => return (-e.0, 0, true, None),
+        },
+    };
+    match crate::epoll::send_events(c, &opened.file, at, max) {
+        Ok(Some(count)) => (count as i32, 0, false, None),
+        Err(e) => (-e.0, 0, true, None),
+        Ok(None) => (
+            0,
+            0,
+            false,
+            Some(Waits {
+                file: Arc::clone(&opened.file),
+                mask: POLL_UNMASK | POLL_IN_EVENTS,
+                kept: None,
+                found: (opened, None),
+            }),
+        ),
+    }
 }
 
 /// `IORING_REGISTER_PROBE`: what each operation is, and whether it runs.

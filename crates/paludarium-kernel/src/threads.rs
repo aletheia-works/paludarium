@@ -3050,6 +3050,11 @@ impl Kernel {
             .sched(parent.tid)
             .forked(self.group.nice(parent.tid).unwrap_or(0))?;
         let task = self.processes.charge_task()?;
+        // copy_files: a copy of the table fails when `fs.nr_open` no longer
+        // lets one hold its numbers (`EMFILE`).
+        let files = self
+            .files
+            .for_clone(flags & 0x400 != 0, flags & 0x200 != 0)?;
         // copy_namespaces; CLONE_NEWIPC leaves the semaphore undo list,
         // which CLONE_SYSVSEM would share.
         crate::namespaces::check(namespaces, parent.state.credentials.administers_own())?;
@@ -3118,7 +3123,7 @@ impl Kernel {
             host: self.host.clone(),
             process: self.process.clone(),
             table: crate::SyscallTable::u1(),
-            files: self.files.for_clone(flags & 0x400 != 0, flags & 0x200 != 0),
+            files,
             cancellation: inbox.wake_token(),
             inbox: inbox.clone(),
             group: self.group.clone(),

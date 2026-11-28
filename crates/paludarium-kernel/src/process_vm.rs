@@ -6,8 +6,6 @@ use paludarium_mmu::{AddressSpace, MemoryView};
 use paludarium_types::{Errno, GuestAddr};
 
 const PAGE: u64 = 4096;
-/// Linux's `UIO_MAXIOV`.
-const MAX_SEGMENTS: u64 = 1024;
 /// Linux's `PVM_MAX_USER_PAGES`: the pages pinned at once.
 const MAX_PINNED: u64 = 1024;
 
@@ -28,25 +26,7 @@ pub(crate) fn segments(mem: &AddressSpace, a: [u64; 6]) -> Result<Option<Segment
     if local.iter().all(|&(_, length)| length == 0) {
         return Ok(None);
     }
-    let (at, count) = (a[3], a[4]);
-    let mut remote = Vec::new();
-    if count > MAX_SEGMENTS {
-        return Err(Errno::EINVAL);
-    }
-    if count != 0 {
-        crate::sockets::access_ok(at, (count * 16) as usize)?;
-    }
-    for index in 0..count {
-        let addr = GuestAddr(at + index * 16);
-        let base = mem.read_u64(addr).map_err(|_| Errno::EFAULT)?;
-        let length = mem
-            .read_u64(GuestAddr(addr.0 + 8))
-            .map_err(|_| Errno::EFAULT)?;
-        if (length as i64) < 0 {
-            return Err(Errno::EINVAL);
-        }
-        remote.push((base, length));
-    }
+    let remote = crate::files::iovec_entries(mem, a[3], a[4])?;
     if remote.iter().all(|&(_, length)| length == 0) {
         return Ok(None);
     }

@@ -942,123 +942,119 @@ fn jmp_fields(insn: Insn) -> Checked<()> {
     Ok(())
 }
 
-/// `check_cfg`: a depth-first walk of the instructions' edges, which
-/// finds jumps out of the program, back-edges, instructions no path
-/// reaches and jumps into the middle of a BPF_LD_IMM64.
+/// The check of the program's shape, before any path is walked: from the
+/// first instruction, every instruction is reached by following jumps,
+/// calls and fall-throughs; none is reached again while the way to it is
+/// still being followed (a loop, which is refused here; Linux takes a
+/// bounded one from a privileged loader); no jump lands on the second half
+/// of a BPF_LD_IMM64; and every instruction but those second halves is
+/// reached.
+///
+/// The ways out of an instruction are followed one at a time and each to
+/// its end before the next, the fall-through first (after a call, the
+/// instructions that follow it before the function): which loop is named
+/// when there are several follows from that order, and a loop is named
+/// before an instruction no way reaches.
 fn cfg(insns: &[Insn]) -> Checked<()> {
-    const DISCOVERED: u8 = 0x10;
-    const EXPLORED: u8 = 0x20;
-    const FALLTHROUGH: u8 = 1;
-    const BRANCH: u8 = 2;
-    enum Next {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Seen {
+        Not,
+        /// On the way being followed.
+        Open,
+        /// Every way out of it followed.
         Done,
-        Keep,
     }
-    let n = insns.len();
-    let mut state = vec![0u8; n];
-    let mut stack = vec![0usize];
-    state[0] = DISCOVERED;
-    // A call's edge to its function may reach one the walk is in: that is
-    // recursion, which the walk refuses as it goes 9 frames deep.
-    let push = |state: &mut Vec<u8>,
-                stack: &mut Vec<usize>,
-                t: usize,
-                w: i64,
-                e: u8,
-                call: bool|
-     -> Checked<Next> {
-        if state[t] >= DISCOVERED | e {
-            return Ok(Next::Done);
+    /// A way out of an instruction: where it leads, and whether it is a
+    /// call, whose function may be one the way is in (recursion, which the
+    /// walk refuses as it goes 9 frames deep).
+    #[derive(Clone, Copy)]
+    struct Way {
+        to: i64,
+        call: bool,
+    }
+    /// An instruction on the way being followed, with its ways out and how
+    /// many of them have been taken.
+    struct Step {
+        at: usize,
+        ways: [Option<Way>; 2],
+        taken: usize,
+    }
+    let ways = |at: usize| -> Checked<[Option<Way>; 2]> {
+        let insn = insns[at];
+        let here = at as i64;
+        let plain = |to: i64| Some(Way { to, call: false });
+        if !insn.jumps() {
+            let width = if insn.ldimm64() { 2 } else { 1 };
+            return Ok([plain(here + width), None]);
         }
-        if w < 0 || w >= n as i64 {
+        Ok(match insn.op() {
+            jmp::EXIT => [None, None],
+            jmp::CALL if insn.src == pseudo::CALL => [
+                plain(here + 1),
+                Some(Way {
+                    to: here + i64::from(insn.imm) + 1,
+                    call: true,
+                }),
+            ],
+            jmp::CALL => [plain(here + 1), None],
+            jmp::JA if insn.x() => return gap("indirect jumps"),
+            jmp::JA => [plain(here + insn.jump() + 1), None],
+            _ => [plain(here + 1), plain(here + i64::from(insn.off) + 1)],
+        })
+    };
+    let n = insns.len();
+    let mut seen = vec![Seen::Not; n];
+    seen[0] = Seen::Open;
+    let mut path = vec![Step {
+        at: 0,
+        ways: ways(0)?,
+        taken: 0,
+    }];
+    while let Some(step) = path.last_mut() {
+        let from = step.at;
+        let Some(way) = step.ways.get(step.taken).copied().flatten() else {
+            seen[from] = Seen::Done;
+            path.pop();
+            continue;
+        };
+        step.taken += 1;
+        // The earlier checks keep jumps and calls in the program.
+        let Some(to) = usize::try_from(way.to).ok().filter(|&to| to < n) else {
             return refuse(
                 Errno::EINVAL,
-                format!("jump out of range from insn {t} to {w}"),
+                format!("jump out of range from insn {from} to {}", way.to),
             );
-        }
-        let w = w as usize;
-        if state[w] == 0 {
-            state[t] = DISCOVERED | e;
-            state[w] = DISCOVERED;
-            stack.push(w);
-            Ok(Next::Keep)
-        } else if state[w] & 0xf0 == DISCOVERED && call {
-            Ok(Next::Done)
-        } else if state[w] & 0xf0 == DISCOVERED {
-            // Linux takes the back-edge from a privileged loader and checks
-            // the loop as it walks it; it is not walked here.
-            refuse(Errno::EINVAL, format!("back-edge from insn {t} to {w}"))
-        } else {
-            state[t] = DISCOVERED | e;
-            Ok(Next::Done)
-        }
-    };
-    while let Some(&t) = stack.last() {
-        let insn = insns[t];
-        let t64 = t as i64;
-        let next = if !insn.jumps() {
-            let width = if insn.ldimm64() { 2 } else { 1 };
-            push(&mut state, &mut stack, t, t64 + width, FALLTHROUGH, false)?
-        } else {
-            match insn.op() {
-                jmp::EXIT => Next::Done,
-                // visit_func_call_insn: after the call, then the function.
-                jmp::CALL if insn.src == pseudo::CALL => {
-                    match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)? {
-                        Next::Keep => Next::Keep,
-                        Next::Done => push(
-                            &mut state,
-                            &mut stack,
-                            t,
-                            t64 + i64::from(insn.imm) + 1,
-                            BRANCH,
-                            true,
-                        )?,
-                    }
-                }
-                jmp::CALL => push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)?,
-                jmp::JA if insn.x() => return gap("indirect jumps"),
-                jmp::JA => push(
-                    &mut state,
-                    &mut stack,
-                    t,
-                    t64 + insn.jump() + 1,
-                    FALLTHROUGH,
-                    false,
-                )?,
-                _ => match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)? {
-                    Next::Keep => Next::Keep,
-                    Next::Done => push(
-                        &mut state,
-                        &mut stack,
-                        t,
-                        t64 + i64::from(insn.off) + 1,
-                        BRANCH,
-                        false,
-                    )?,
-                },
-            }
         };
-        if let Next::Done = next {
-            state[t] = EXPLORED;
-            stack.pop();
+        match seen[to] {
+            Seen::Not => {
+                seen[to] = Seen::Open;
+                path.push(Step {
+                    at: to,
+                    ways: ways(to)?,
+                    taken: 0,
+                });
+            }
+            Seen::Open if !way.call => {
+                return refuse(Errno::EINVAL, format!("back-edge from insn {from} to {to}"));
+            }
+            Seen::Open | Seen::Done => {}
         }
     }
-    let mut i = 0;
-    while i < n {
-        if state[i] != EXPLORED {
-            return refuse(Errno::EINVAL, format!("unreachable insn {i}"));
+    let mut at = 0;
+    while at < n {
+        if seen[at] != Seen::Done {
+            return refuse(Errno::EINVAL, format!("unreachable insn {at}"));
         }
-        if insns[i].ldimm64() {
-            if state[i + 1] != 0 {
+        if insns[at].ldimm64() {
+            if seen[at + 1] != Seen::Not {
                 return refuse(
                     Errno::EINVAL,
-                    format!("jump into the middle of ldimm64 insn {i}"),
+                    format!("jump into the middle of ldimm64 insn {at}"),
                 );
             }
-            i += 1;
+            at += 1;
         }
-        i += 1;
+        at += 1;
     }
     Ok(())
 }
@@ -4199,6 +4195,59 @@ mod tests {
             refused(&[mov(0, 0), i(0x05, 0, 0, -2, 0), exit()]),
             einval("back-edge from insn 1 to 0")
         );
+    }
+
+    #[test]
+    fn the_jumps_are_followed_depth_first_from_the_first_insn() {
+        let einval = |line: &str| (Errno::EINVAL, line.to_string());
+        let ja = |off: i16| i(0x05, 0, 0, off, 0);
+        let jeq = |off: i16| i(0x15, 0, 0, off, 0);
+        // A jump to an insn already followed to its end, forward or back,
+        // is no back-edge, and one to the insn itself is. (R0 is not known
+        // in the second, so that both sides of each jump are walked.)
+        ok(&[mov(0, 0), jeq(1), mov(0, 1), exit()]);
+        let unknown = i(0x79, 0, 10, -8, 0);
+        ok(&[unknown, jeq(1), exit(), jeq(-2), exit()]);
+        assert_eq!(
+            refused(&[mov(0, 0), ja(-1)]),
+            einval("back-edge from insn 1 to 1")
+        );
+        // Of two back-edges, the one on the path that falls through is
+        // found first; a back-edge is found before code no path reaches.
+        assert_eq!(
+            refused(&[mov(0, 0), jeq(1), ja(-3), ja(-4), exit()]),
+            einval("back-edge from insn 2 to 0")
+        );
+        assert_eq!(
+            refused(&[mov(0, 0), jeq(1), exit(), ja(-4)]),
+            einval("back-edge from insn 3 to 0")
+        );
+        assert_eq!(
+            refused(&[mov(0, 0), ja(-2), exit()]),
+            einval("back-edge from insn 1 to 0")
+        );
+        // After a call, the insns that follow it come before the function.
+        assert_eq!(
+            refused(&[call_by(2), ja(-2), exit(), ja(-1)]),
+            einval("back-edge from insn 1 to 0")
+        );
+        assert_eq!(
+            refused(&[call_by(2), mov(0, 0), exit(), ja(-1)]),
+            einval("back-edge from insn 3 to 3")
+        );
+        // A jump back into a 64-bit constant follows its second half as an
+        // insn, which leads back to the jump (Linux, which takes the loop,
+        // says "jump into the middle of ldimm64 insn 1").
+        assert_eq!(
+            refused(&[mov(0, 0), i(0x18, 1, 0, 0, 0), i(0, 0, 0, 0, 0), ja(-2)]),
+            einval("back-edge from insn 2 to 3")
+        );
+        // A 32-bit BPF_JA jumps by its imm.
+        assert_eq!(
+            refused(&[mov(0, 0), i(0x06, 0, 0, 0, 1), mov(0, 1), exit()]),
+            einval("unreachable insn 2")
+        );
+        ok(&[mov(0, 0), i(0x06, 0, 0, 0, 0), exit()]);
     }
 
     #[test]

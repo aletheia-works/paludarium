@@ -181,7 +181,7 @@ mod pipe_tests {
             id: 7,
             ..FileOwner::default()
         };
-        r.set_file_owner(owner);
+        r.set_file_owner(owner.clone());
         r.set_async(Some(Registration {
             processes: Weak::new(),
             fd: 3,
@@ -459,7 +459,7 @@ impl PipeEnd {
     }
     /// `F_GETOWN`: who this description's signals go to.
     pub(crate) fn file_owner(&self) -> FileOwner {
-        self.signalling().owner
+        self.signalling().owner.clone()
     }
     /// `F_SETOWN` and `F_SETSIG`, for this description.
     pub(crate) fn set_file_owner(&self, owner: FileOwner) {
@@ -496,16 +496,31 @@ impl PipeEnd {
         let _held = self.hold();
         self.endpoint.pair.window() as u64
     }
+    /// Gives a new pipe of a maker without `CAP_SYS_RESOURCE` (`resource`)
+    /// no more room than `fs.pipe-max-size` (`max_size`), as Linux's
+    /// `alloc_pipe_info` does.
+    pub(crate) fn start_within(&self, max_size: u32, resource: bool) {
+        if PIPE_DEFAULT > max_size as usize && !resource {
+            self.endpoint
+                .pair
+                .window
+                .store(max_size as usize, Ordering::SeqCst);
+        }
+    }
     /// `F_SETPIPE_SZ`, as Linux's `pipe_set_size`: the size rounds up to a
-    /// power of two of at least a page (`EINVAL` past 2^31), and may not drop
-    /// below the pages the unread data fills (`EBUSY`). The guest is root,
-    /// so no limit applies. Returns the new size.
-    pub(crate) fn set_size(&self, size: u32) -> Result<u64, Errno> {
+    /// power of two of at least a page (`EINVAL` past 2^31), may grow past
+    /// `fs.pipe-max-size` (`max_size`) only with `CAP_SYS_RESOURCE`
+    /// (`resource`, else `EPERM`), and may not drop below the pages the
+    /// unread data fills (`EBUSY`). Returns the new size.
+    pub(crate) fn set_size(&self, size: u32, max_size: u32, resource: bool) -> Result<u64, Errno> {
         if size > 1 << 31 {
             return Err(Errno::EINVAL);
         }
         let size = size.max(4096).next_power_of_two() as usize;
         let _held = self.hold();
+        if size > self.endpoint.pair.window() && size > max_size as usize && !resource {
+            return Err(Errno::EPERM);
+        }
         let sides = self
             .endpoint
             .pair
@@ -1757,7 +1772,7 @@ fn control_messages(c: &Context<'_>, control: &[u8]) -> Result<(Passed, Option<U
             let owner = FileOwner {
                 kind: crate::fasync::OwnerKind::Process,
                 id: pid,
-                signal: 0,
+                ..FileOwner::default()
             };
             // scm_check_creds takes the IDs in the sender's user namespace,
             // and refuses one it does not map (`-1` too) first.
@@ -1776,7 +1791,7 @@ fn control_messages(c: &Context<'_>, control: &[u8]) -> Result<(Passed, Option<U
             ) {
                 return Err(Errno::EPERM);
             }
-            if number.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
+            if number.cast_signed() <= 0 || !c.processes.owner_exists(&owner) {
                 return Err(Errno(3));
             }
             credentials = Some(Ucred { pid, uid, gid });
@@ -2139,7 +2154,7 @@ fn send_bytes(
     // `sk_send_sigurg`.
     let owner = socket.peer_owner();
     if urgent != 0 && owner.id != 0 {
-        c.processes.send_urgent(owner);
+        c.processes.send_urgent(&owner);
     }
     Ok(sent + urgent)
 }
@@ -4074,6 +4089,7 @@ impl SocketPairEnd {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)[self.side]
             .owner
+            .clone()
     }
     /// `F_SETOWN` and `F_SETSIG`.
     pub(crate) fn set_file_owner(&self, owner: FileOwner) {
@@ -4090,6 +4106,7 @@ impl SocketPairEnd {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)[1 - self.side]
             .owner
+            .clone()
     }
     /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off.
     pub(crate) fn set_async(&self, registration: Option<Registration>) {
@@ -4110,7 +4127,7 @@ impl SocketPairEnd {
         if side.closed {
             return Vec::new();
         }
-        let own = side.registration.clone().map(|to| (to, side.owner));
+        let own = side.registration.clone().map(|to| (to, side.owner.clone()));
         // The descriptions' latest registration first, as `kill_fasync`.
         let mut descriptions: Vec<_> = side
             .descriptions
@@ -4121,7 +4138,7 @@ impl SocketPairEnd {
                 Some((
                     description.since,
                     description.registration.clone()?,
-                    description.owner,
+                    description.owner.clone(),
                 ))
             })
             .collect();

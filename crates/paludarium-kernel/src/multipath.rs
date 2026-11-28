@@ -70,7 +70,7 @@ pub(crate) struct Flow {
     pub dport: u16,
     pub label: u32,
     pub packet: bool,
-    pub l4_hash: u32,
+    pub socket_hash: u32,
 }
 
 impl Flow {
@@ -110,7 +110,8 @@ impl Flow {
     }
 }
 
-/// The keys [`Seed::hash`] takes, as `struct flow_keys` holds them.
+/// What a hash may take of a flow: the fields `fib_multipath_hash_fields`
+/// names, each address, the protocol, the flow label and each port.
 #[derive(Clone, Copy, Default)]
 struct Keys<A> {
     proto: u8,
@@ -121,61 +122,107 @@ struct Keys<A> {
     dst: A,
 }
 
+/// Where the hash reads each key: the bytes of Linux's `struct flow_keys`
+/// on x86-64 from its `basic` member on, which the hash must read alike to
+/// choose as Linux does, the same as an ABI. Everything else is 0.
+const AT_PROTO: usize = 2;
+const AT_LABEL: usize = 4;
+const AT_PORTS: usize = 28;
+const AT_ADDRESSES: usize = 36;
+
+impl<A: Copy + Default + AsRef<[u8]>> Keys<A> {
+    /// Only the fields `fields` names, the others 0.
+    fn only(self, fields: u32) -> Self {
+        let keep = |field: u32| fields & field != 0;
+        Self {
+            proto: if keep(IP_PROTO) { self.proto } else { 0 },
+            label: if keep(FLOWLABEL) { self.label } else { 0 },
+            sport: if keep(SRC_PORT) { self.sport } else { 0 },
+            dport: if keep(DST_PORT) { self.dport } else { 0 },
+            src: if keep(SRC_IP) { self.src } else { A::default() },
+            dst: if keep(DST_IP) { self.dst } else { A::default() },
+        }
+    }
+    /// The keys the same way round for a flow and its answer: the lower
+    /// address first, as `lower` compares them, and the lower port first,
+    /// each as the machine reads its bytes in network order.
+    fn either_way(mut self, lower: impl Fn(&A, &A) -> bool) -> Self {
+        if lower(&self.dst, &self.src) {
+            core::mem::swap(&mut self.src, &mut self.dst);
+        }
+        if self.dport.swap_bytes() < self.sport.swap_bytes() {
+            core::mem::swap(&mut self.sport, &mut self.dport);
+        }
+        self
+    }
+    /// The bytes the hash reads, written into `out`: their length, padded
+    /// to whole 8-byte words.
+    fn write(self, out: &mut [u8; 72]) -> usize {
+        let (src, dst) = (self.src.as_ref(), self.dst.as_ref());
+        out[AT_PROTO] = self.proto;
+        out[AT_LABEL..AT_LABEL + 4].copy_from_slice(&self.label.to_be_bytes());
+        out[AT_PORTS..AT_PORTS + 2].copy_from_slice(&self.sport.to_be_bytes());
+        out[AT_PORTS + 2..AT_PORTS + 4].copy_from_slice(&self.dport.to_be_bytes());
+        let end = AT_ADDRESSES + src.len();
+        out[AT_ADDRESSES..end].copy_from_slice(src);
+        out[end..end + dst.len()].copy_from_slice(dst);
+        (end + dst.len()).next_multiple_of(8)
+    }
+}
+
+/// The outer fields a family's `policy` hashes, as ip-sysctl tells of
+/// `fib_multipath_hash_policy`: layer 3 (0, and 2, which only a packet's
+/// inner headers set apart), for IPv6 with its flow label and next header;
+/// layer 4, the addresses, protocol and ports (1); or the outer fields
+/// `fib_multipath_hash_fields` names (3).
+fn hashed(policy: Policy, v6: bool) -> u32 {
+    const LAYER_3: u32 = SRC_IP | DST_IP;
+    const LAYER_4: u32 = LAYER_3 | IP_PROTO | SRC_PORT | DST_PORT;
+    match policy.policy {
+        1 => LAYER_4,
+        3 => policy.fields & OUTER,
+        _ if v6 => LAYER_3 | FLOWLABEL | IP_PROTO,
+        _ => LAYER_3,
+    }
+}
+
 impl Seed {
-    /// `flow_hash_from_keys_seed` of `keys`, with both halves of both words
-    /// of the key the seed (`fib_multipath_hash_construct_key`). The keys are
-    /// `struct flow_keys` from `basic` on, on x86-64: 2 bytes of a protocol
-    /// (0), `ip_proto`, a byte, the flow label in network order, 8 of each
-    /// VLAN (0), 4 of a key ID (0), 2 of each port in network order, 4 of
-    /// ICMP (0), then the addresses, with the structure's padding to 8
-    /// bytes at its end (`flow_keys_hash_length`). First the addresses and
-    /// then the ports go in order, each pair as the machine reads it
-    /// (`__flow_hash_consistentify`).
-    fn hash<const N: usize>(
-        self,
-        keys: Keys<[u8; N]>,
-        before: impl Fn(&[u8; N], &[u8; N]) -> bool,
-    ) -> u32 {
-        let (mut src, mut dst) = (keys.src, keys.dst);
-        if before(&dst, &src) {
-            core::mem::swap(&mut src, &mut dst);
-        }
-        let (mut sport, mut dport) = (keys.sport.to_be_bytes(), keys.dport.to_be_bytes());
-        if u16::from_le_bytes(dport) < u16::from_le_bytes(sport) {
-            core::mem::swap(&mut sport, &mut dport);
-        }
-        let mut bytes = [0u8; 72];
-        bytes[2] = keys.proto;
-        bytes[4..8].copy_from_slice(&keys.label.to_be_bytes());
-        bytes[28..30].copy_from_slice(&sport);
-        bytes[30..32].copy_from_slice(&dport);
-        bytes[36..36 + N].copy_from_slice(&src);
-        bytes[36 + N..36 + 2 * N].copy_from_slice(&dst);
-        let len = (36 + 2 * N).next_multiple_of(8);
+    /// The key of SipHash: the namespace's seed where it has one, else the
+    /// machine's, in both halves of both words.
+    fn key(self) -> [u64; 2] {
         let seed = u64::from(if self.user == 0 {
             self.machine
         } else {
             self.user
         });
-        let word = seed << 32 | seed;
-        match (siphash([word, word], &bytes[..len]) & 0xffff_ffff) as u32 {
-            0 => 1,
-            hash => hash,
-        }
+        [seed << 32 | seed; 2]
     }
-    /// `fib_multipath_hash` of `flow` from `src` to `dst`, as `policy`
-    /// takes it: the addresses (0 and 2, which only a packet's inner
-    /// headers set apart); those, the protocol and the ports (1), or the
-    /// hash a packet carries, if it has one; or the fields `fields` names
-    /// (3), of a packet then mixed with no inner hash
-    /// (`fib_multipath_custom_hash_skb`).
-    pub(crate) fn hash4(self, policy: Policy, src: Ipv4Addr, dst: Ipv4Addr, flow: Flow) -> u32 {
-        if policy.policy == 1 && flow.packet && flow.l4_hash != 0 {
-            return flow.l4_hash >> 1;
+    /// The hash of the fields `fields` names of `keys`, alike for a flow and
+    /// its answer and never 0; 0 where none is named.
+    fn of<A: Copy + Default + AsRef<[u8]>>(
+        self,
+        fields: u32,
+        keys: Keys<A>,
+        lower: impl Fn(&A, &A) -> bool,
+    ) -> u32 {
+        if fields == 0 {
+            return 0;
         }
-        let before = |a: &[u8; 4], b: &[u8; 4]| u32::from_le_bytes(*a) < u32::from_le_bytes(*b);
+        let mut bytes = [0u8; 72];
+        let len = keys.only(fields).either_way(lower).write(&mut bytes);
+        ((siphash(self.key(), &bytes[..len]) & 0xffff_ffff) as u32).max(1)
+    }
+    /// The hash that chooses an IPv4 hop for `flow` from `src` to `dst`
+    /// (`fib_multipath_hash`), of the fields `policy` takes ([`hashed`]).
+    /// Under policy 1 a packet that carries its socket's hash is hashed by
+    /// that alone; under 3 a packet's hash of its outer headers is mixed
+    /// with that of its inner ones, which none here has.
+    pub(crate) fn hash4(self, policy: Policy, src: Ipv4Addr, dst: Ipv4Addr, flow: Flow) -> u32 {
+        if policy.policy == 1 && flow.packet && flow.socket_hash != 0 {
+            return flow.socket_hash >> 1;
+        }
         let (sport, dport) = flow.ports();
-        let all = Keys {
+        let keys = Keys {
             proto: flow.proto,
             label: 0,
             sport,
@@ -183,33 +230,18 @@ impl Seed {
             src: src.octets(),
             dst: dst.octets(),
         };
-        let hash = match policy.policy {
-            1 => self.hash(all, before),
-            3 => {
-                let outer = self.custom(policy.fields, all, before);
-                if flow.packet {
-                    jhash_2words(outer, 0, 0)
-                } else {
-                    outer
-                }
-            }
-            _ => self.hash(
-                Keys {
-                    src: all.src,
-                    dst: all.dst,
-                    ..Keys::default()
-                },
-                before,
-            ),
-        };
-        hash >> 1
+        let lower = |a: &[u8; 4], b: &[u8; 4]| u32::from_le_bytes(*a) < u32::from_le_bytes(*b);
+        let hash = self.of(hashed(policy, false), keys, lower);
+        if policy.policy == 3 && flow.packet {
+            mix(hash, 0) >> 1
+        } else {
+            hash >> 1
+        }
     }
-    /// `rt6_multipath_hash` of `flow` from `src` to `dst`, as `policy`
-    /// takes it: the addresses, flow label and protocol (0 and 2); the
-    /// addresses, protocol and ports (1); or the fields named (3).
+    /// The hash that chooses an IPv6 hop for `flow` from `src` to `dst`
+    /// (`rt6_multipath_hash`), of the fields `policy` takes ([`hashed`]).
     pub(crate) fn hash6(self, policy: Policy, src: Ipv6Addr, dst: Ipv6Addr, flow: Flow) -> u32 {
-        let before = |a: &[u8; 16], b: &[u8; 16]| a < b;
-        let all = Keys {
+        let keys = Keys {
             proto: flow.proto,
             label: flow.label,
             sport: flow.sport,
@@ -217,64 +249,23 @@ impl Seed {
             src: src.octets(),
             dst: dst.octets(),
         };
-        let hash = match policy.policy {
-            1 => self.hash(Keys { label: 0, ..all }, before),
-            3 => self.custom(policy.fields, all, before),
-            _ => self.hash(
-                Keys {
-                    sport: 0,
-                    dport: 0,
-                    ..all
-                },
-                before,
-            ),
-        };
-        hash >> 1
-    }
-    /// The hash of the outer fields `fields` names of `keys`, 0 for none
-    /// (`fib_multipath_custom_hash_fl4`, `rt6_multipath_custom_hash_fl6`).
-    fn custom<const N: usize>(
-        self,
-        fields: u32,
-        keys: Keys<[u8; N]>,
-        before: impl Fn(&[u8; N], &[u8; N]) -> bool,
-    ) -> u32 {
-        if fields & OUTER == 0 {
-            return 0;
-        }
-        let has = |field| fields & field != 0;
-        self.hash(
-            Keys {
-                proto: if has(IP_PROTO) { keys.proto } else { 0 },
-                label: if has(FLOWLABEL) { keys.label } else { 0 },
-                sport: if has(SRC_PORT) { keys.sport } else { 0 },
-                dport: if has(DST_PORT) { keys.dport } else { 0 },
-                src: if has(SRC_IP) { keys.src } else { [0; N] },
-                dst: if has(DST_IP) { keys.dst } else { [0; N] },
-            },
-            before,
-        )
+        self.of(hashed(policy, true), keys, |a, b| a < b) >> 1
     }
 }
 
-/// `jhash_2words`: Bob Jenkins' lookup3 final mix of `a`, `b` and 0.
-fn jhash_2words(a: u32, b: u32, initval: u32) -> u32 {
-    let init = initval.wrapping_add(0xdead_beef).wrapping_add(2 << 2);
-    let (mut a, mut b, mut c) = (a.wrapping_add(init), b.wrapping_add(init), init);
-    c ^= b;
-    c = c.wrapping_sub(b.rotate_left(14));
-    a ^= c;
-    a = a.wrapping_sub(c.rotate_left(11));
-    b ^= a;
-    b = b.wrapping_sub(a.rotate_left(25));
-    c ^= b;
-    c = c.wrapping_sub(b.rotate_left(16));
-    a ^= c;
-    a = a.wrapping_sub(c.rotate_left(4));
-    b ^= a;
-    b = b.wrapping_sub(a.rotate_left(14));
-    c ^= b;
-    c.wrapping_sub(b.rotate_left(24))
+/// Bob Jenkins' lookup3 hash of the two words `first` and `second` with no
+/// initial value: its three words start at 0xdeadbeef and the length in
+/// bytes, the two added in, then its final mix, which turns each word into
+/// the next by the one before it, seven times.
+fn mix(first: u32, second: u32) -> u32 {
+    let start = 0xdead_beef_u32.wrapping_add(8);
+    let mut words = [start.wrapping_add(first), start.wrapping_add(second), start];
+    for (step, turn) in [14, 11, 25, 16, 4, 14, 24].into_iter().enumerate() {
+        let (into, by) = ((step + 2) % 3, (step + 1) % 3);
+        words[into] ^= words[by];
+        words[into] = words[into].wrapping_sub(words[by].rotate_left(turn));
+    }
+    words[2]
 }
 
 /// SipHash-2-4 of `data` by `key`.
@@ -366,7 +357,7 @@ mod tests {
             dport,
             label: 0,
             packet,
-            l4_hash: 0,
+            socket_hash: 0,
         };
         let h = |p, f| seed.hash4(p, a, b, f);
         // 0 and 2 take the addresses alone, 1 the ports too, either way.
@@ -400,10 +391,7 @@ mod tests {
         // 3: the fields named; none of the outer ones hashes to 0, a
         // packet's mixed with its inner hash.
         assert_eq!(h(policy(3, 0x40), udp(1, 2, false)), 0);
-        assert_eq!(
-            h(policy(3, 0x40), udp(1, 2, true)),
-            jhash_2words(0, 0, 0) >> 1
-        );
+        assert_eq!(h(policy(3, 0x40), udp(1, 2, true)), mix(0, 0) >> 1);
         assert_eq!(
             h(policy(3, SRC_IP | DST_IP), udp(1, 2, false)),
             h(policy(0, 0), udp(1, 2, false))
@@ -434,10 +422,10 @@ mod tests {
             ..Flow::socket(17, 7100, 9)
         };
         let carried = Flow {
-            l4_hash: 0x8765_4321,
+            socket_hash: 0x8765_4321,
             ..packet
         };
-        // `skb_get_hash_raw(skb) >> 1`, before all else.
+        // The hash the packet carries, halved, whatever its keys.
         assert_eq!(seed.hash4(policy(1), a, b, carried), 0x8765_4321 >> 1);
         assert_ne!(
             seed.hash4(policy(1), a, b, packet),
@@ -489,6 +477,122 @@ mod tests {
         assert_eq!(
             seed.hash6(ports, a, b, flow),
             seed.hash6(ports, b, a, flow.reversed())
+        );
+    }
+    /// Every hash as it stood before the hash was rewritten in a
+    /// structure of its own: the rewrite keeps each bit.
+    fn pinned_hashes() -> Vec<u32> {
+        let seeds = [
+            Seed {
+                machine: 5,
+                user: 0,
+            },
+            Seed {
+                machine: 5,
+                user: 0x1234_5678,
+            },
+            Seed {
+                machine: 0xdead_beef,
+                user: 0,
+            },
+        ];
+        let v4 = [
+            (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 2, 0, 7)),
+            (Ipv4Addr::new(192, 168, 9, 200), Ipv4Addr::new(10, 0, 0, 1)),
+        ];
+        let v6: [(Ipv6Addr, Ipv6Addr); 2] = [
+            (
+                "2001:db8::1".parse().unwrap(),
+                "2001:db8:2::7".parse().unwrap(),
+            ),
+            ("fe80::9".parse().unwrap(), "2001:db8::1".parse().unwrap()),
+        ];
+        let flows = [
+            Flow::default(),
+            Flow::socket(17, 7100, 9),
+            Flow::socket(6, 40000, 80),
+            Flow {
+                packet: true,
+                ..Flow::socket(17, 7100, 9)
+            },
+            Flow {
+                packet: true,
+                socket_hash: 0x8765_4321,
+                ..Flow::socket(17, 7100, 9)
+            },
+            Flow {
+                packet: true,
+                ..Flow::socket(1, 3, 4)
+            },
+            Flow {
+                label: 0xabcde,
+                ..Flow::socket(58, 0, 0)
+            },
+            Flow {
+                label: 0x12345,
+                ..Flow::socket(6, 1, 65535)
+            },
+        ];
+        let mut policies = vec![
+            Policy {
+                policy: 0,
+                fields: 0,
+            },
+            Policy {
+                policy: 1,
+                fields: 0,
+            },
+            Policy {
+                policy: 2,
+                fields: 0,
+            },
+        ];
+        for fields in [
+            0, 0x40, 0x7, 0x3f, 0x10, 0x20, 0x8, 0x37, 0x3, 0x30, FIELDS_ALL,
+        ] {
+            policies.push(Policy { policy: 3, fields });
+        }
+        let mut all = Vec::new();
+        for seed in seeds {
+            for policy in &policies {
+                for flow in flows {
+                    for (a, b) in v4 {
+                        all.push(seed.hash4(*policy, a, b, flow));
+                    }
+                    for (a, b) in v6 {
+                        all.push(seed.hash6(*policy, a, b, flow));
+                    }
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn the_hashes_keep_their_bits() {
+        let all = pinned_hashes();
+        let digest = all.iter().fold(0xcbf2_9ce4_8422_2325u64, |d, &h| {
+            (d ^ u64::from(h)).wrapping_mul(0x0100_0000_01b3)
+        });
+        assert_eq!(
+            (all.len(), digest),
+            (1344, 5_159_730_338_909_324_338),
+            "{:x?}",
+            &all[..16]
+        );
+        let mixed: Vec<u32> = [0, 1, 0x8000_0000, 0x1234_5678, u32::MAX]
+            .into_iter()
+            .map(|a| mix(a, 0))
+            .collect();
+        assert_eq!(
+            mixed,
+            [
+                0x58c1_84bf,
+                0x5543_253f,
+                0xfefd_f3e7,
+                0xd134_ea9a,
+                0x05e7_a47a
+            ]
         );
     }
 }

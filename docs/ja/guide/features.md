@@ -578,10 +578,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/sys/fs/lease-break-time`（最初は 45）は root のモード 0644 のファイルで、どの `int`
   も受け取ります（`proc_dointvec`）。
 
+- `/proc/sys/fs/nr_open` と `/proc/sys/fs/pipe-max-size`（どちらも最初は 1048576）は
+  マシン全体のもので、`unsigned int` を受け取る root のモード 0644 のファイルです
+  （`proc_douintvec_minmax`）。`nr_open` は 64 から 2147483584 まで（それ以外は `EINVAL`）、
+  `pipe-max-size` は 32 ビットに切ってから、`round_pipe_size` と同じく 1 ページ以上の
+  2 のべき乗に切り上げ、2³¹ を超えると `EINVAL` です。`nr_open` は、ハードの
+  `RLIMIT_NOFILE`（超えると `EPERM`）と、Linux の表と同じように伸びる記述子の表を
+  縛ります。表は最初 64 個の記述子の場所を持ち、場所を超える番号は、その番号の入る
+  いちばん小さい 2 のべき乗まで表を伸ばします。ただし `nr_open`（64 の倍数に切り下げた
+  もの）も 2²⁷ 個も超えません。伸ばせない番号は `EMFILE`（`dup2` と `dup3` では
+  `EBADF`）です。伸びた表は、`nr_open` が下がっても場所を保ちます。表の写し（`fork`、
+  `CLONE_FILES` のない `clone`、`unshare(CLONE_FILES)`、`CLOSE_RANGE_UNSHARE`、表を
+  共有するスレッドの exec）は、使っているいちばん大きい番号の分の場所を 64 刻みで持ち、
+  `close_range` が閉じる番号は数えません。`nr_open` がそれだけの場所を許さなくなって
+  いれば `EMFILE` で失敗し、exec は後戻りできない点を過ぎているので `SIGSEGV` で
+  終わります。埋め込む側が決めた開けるファイルの天井は、root が `nr_open` に何を書いても、
+  `nr_open` とは別にハードの上限を縛ります。
+
 - パイプは Linux と同じく 1 ページのバッファーを 16 個（64 KiB）持ちます。`fcntl` の
   `F_SETPIPE_SZ` と `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。
   大きさは 1 ページ以上の 2 のべき乗で、使っているバッファーより少なくすると `EBUSY`、
-  2³¹ を超えると `EINVAL` です。書き込みのうちページに満たない分は、`anon_pipe_write`
+  2³¹ を超えると `EINVAL` です。`CAP_SYS_RESOURCE` がなければ、`alloc_pipe_info` と
+  `pipe_set_size` と同じく、新しいパイプや FIFO は `/proc/sys/fs/pipe-max-size` までしか
+  持たず、`F_SETPIPE_SZ` でそれを超えて伸ばすこともできません（`EPERM`）。書き込みのうちページに満たない分は、`anon_pipe_write`
   と同じく、空きのある最後のバッファーに加わり、残りは新しいバッファーに入ります。
   `splice`、`tee`、`vmsplice` は、書き込みの加わらない自分のバッファーを作ります。
 
@@ -743,6 +762,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベントにまとめたものでは送りません）。`F_SETSIG` があれば代わりにそのシグナルを送り、`si_code`
   （`POLL_IN`、`POLL_OUT`、`POLL_ERR`、`POLL_PRI`、`POLL_HUP`）、`si_band`、`si_fd`（`O_ASYNC` を
   付けたディスクリプタ）を付けます。
+
+  持ち主を決めると、`sigio_perm` が確かめるとおり、決めた側を覚えます。`F_SETOWN`、
+  `F_SETOWN_EX` のほか、持ち主のいないファイルに dnotify、リース、端末の `O_ASYNC` が
+  呼び出した側を持ち主にするときも同じです。ファイルのシグナルとソケットの `SIGURG` が
+  プロセス（`F_OWNER_TID` ではそのスレッド）に届くのは、覚えた実効ユーザー ID が root の
+  ものか、覚えたどちらかのユーザー ID がそのプロセスの実 ID か保存 ID のときだけです。
+  ファイルにシグナルを送らせた側や、後の `F_SETSIG` は関係しません。持ち主を決めた側の
+  Landlock のドメインがシグナルをスコープしていれば、そのドメインの外のプロセスには
+  届きません。ただし、決めた側自身のプロセスには届きます。持ち主を決めた後に入った
+  ドメインは関係しません。
   - **パイプ**：書き込みは、終わるときに読む側へ送ります（いっぱいで書けなかったときも
     送ります）。待つときは、待つたびに、その前にも送ります。読み込みは、データがあってもなくても、
     終わるときに書く側へ送ります。どちらかの端を閉じると、もう一方へ送ります。
@@ -1688,12 +1717,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。知っている操作、登録、setup と
   `io_uring_enter` のフラグも Linux 7.0 のものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
-  `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
-  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
+  `epoll_ctl` をまとめるのに使います）と `_EPOLL_WAIT`、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
+  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`_READV_FIXED`、`_WRITEV_FIXED`、
+  `IORING_OP_FILES_UPDATE`、
   `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、ファイルの要求
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
-  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE` と
+  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`_PIPE`、`IORING_OP_SPLICE` と
   `_TEE`、それにソケットの要求
   `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` はこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
@@ -1957,7 +1987,31 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_NOP_FIXED_BUFFER` の NOP は、完了を投稿するまでバッファーを持ちます。失敗した登録は
   タグを投稿しません。`IORING_OP_READ_FIXED` と `_WRITE_FIXED` は、ファイルを
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
-  範囲がはみ出せば `EFAULT` です。
+  範囲がはみ出せば `EFAULT` です。`IORING_OP_READV_FIXED` と `_WRITEV_FIXED` は、エントリーを
+  準備するときに `iovec` を読みます（`kmalloc` が一度に場所を作れる 4 MiB 分より多ければ `ENOMEM`、
+  次に 1024 より多ければ `EINVAL`、`EFAULT`、負の長さは `EINVAL`）。ファイルと
+  バッファー（`EFAULT`）のあと、それらが取りうるページの断片の場所を作ります。断片はそれぞれの
+  4 KiB ページの数より 2 つ多く、`INT_MAX` を超えれば `EOVERFLOW`、`kmalloc` が一度に作れる
+  場所（16 バイトの断片で 4 MiB 分）を超えれば `ENOMEM` です。そのあと、どのバッファーも登録した
+  ものの中にあって 1 バイト以上なければならず（`EFAULT`）、合計は `MAX_RW_COUNT` までです
+  （`EINVAL`）。バイトは `readv` と `writev` と同じく転送します。
+
+- `IORING_OP_EPOLL_WAIT` は、`fd` が指す epoll のイベントを `len` 個まで `addr` に、
+  タイムアウトなしの `epoll_wait` と同じく取ります。`off`、`rw_flags`、`buf_index`、
+  `splice_fd_in` は 0 でなければならず（`EINVAL`）、次に、Linux の `ep_check_params` と同じく、
+  ファイル（`EBADF`）、1 から `INT_MAX / 12` までの個数（`EINVAL`）、イベントの場所が
+  ユーザー空間にあること（`EFAULT`）、epoll であること（`EINVAL`）を調べます。用意のできた
+  イベントがなければ、epoll が読めるようになるまで待ってから取ります。書けない場所は、
+  イベントの用意ができてから `EFAULT` です。取った個数を返します。
+
+- `IORING_OP_PIPE` は、`pipe_flags`（`O_CLOEXEC`、`O_NONBLOCK`、`O_DIRECT`。ほかのフラグや、
+  `fd`、`off`、`addr3` は `EINVAL`）で `pipe2` と同じくパイプを作り、両端の番号を `addr` に
+  書きます。`file_index` がなければ、空いている最も小さい 2 つの記述子です（`EMFILE`）。
+  あれば登録したスロットで、`O_CLOEXEC` は取れません（`EINVAL`）。
+  `IORING_FILE_INDEX_ALLOC` は、最後に取ったところから探して空いた 2 つを取り（`ENFILE`）、
+  スロットを指せばそれとその次を、それぞれ `IORING_OP_OPENAT` と同じく埋めます（`ENXIO`、
+  `EINVAL`）。2 つ目のスロットが失敗するか、番号を書けなければ（`EFAULT`）、記述子を返すか
+  スロットを空にします。
 
 - `IORING_SETUP_R_DISABLED` で作ったリングは、`IORING_REGISTER_ENABLE_RINGS` で有効にするまで
   `io_uring_enter` を断ります（`EBADFD`）。`IORING_SETUP_SINGLE_ISSUER` なら、有効にした
@@ -3638,7 +3692,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`getcpu`）は `emulate_vsyscall` と同じ動きをします。seccomp には入口のアドレスで
   その呼び出しが見え、トレーサーには `PTRACE_EVENT_SECCOMP` が届きますが、システム
   コールでの停止はありません。そのあと結果が `rax` に入り、スレッドは呼び出し元へ戻り、
-  ほかのレジスターは変わりません。ページのほかのアドレス、読めないスタック、呼び出しが
+  ほかのレジスターは変わりません。トレーサーがそこで呼び出しの番号を変えるか、スレッドを
+  動かすと、スレッドは `SIGSYS` で終わり、その動作は既定のまま `SA_IMMUTABLE` になります
+  （`force_exit_sig`）。ページのほかのアドレス、読めないスタック、呼び出しが
   書けないポインターはカーネルからの `SIGSEGV`（`SI_KERNEL`）で、ユーザー空間の外の
   ポインターはそのアドレスの `SEGV_MAPERR` です。外から読むと `EFAULT`
   （`process_vm_readv`）か `EIO`（`/proc/<pid>/mem`、`PTRACE_PEEKDATA`）です。
@@ -3910,6 +3966,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザーは `EACCES` です。`/proc` と `/dev` 自身はルートのディレクトリにあるマウント
   ポイントで、その `rmdir` と `rename` は `EBUSY`、`unlink` は `EISDIR`、それを作る呼び出しは
   `EEXIST` です。
+
+- `/proc` や `/dev` のディレクトリでないファイルの先へ、末尾のスラッシュやその後の名前で進む
+  パス（`/proc/self/status/`、`/proc/mounts/x`、`/dev/null/`、`/dev/stdin/x`）は、Linux の
+  パスの探索と同じく、それを探すどの呼び出しでも `ENOTDIR` です。途中のリンクはたどるので、
+  ディレクトリへのリンクの先へは進めます。最後の名前を作る、消す呼び出しはその前の名前だけを
+  調べ、上のその呼び出し自身のエラーはそのあとです。
 
 - `/proc` は、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。ファイルシステムがそこに持つもの
@@ -4281,8 +4343,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ポーリングが、`POLLOUT` のない `POLLIN`、`POLLRDNORM`、`POLLERR`、`POLLPRI` を返します。
   見たかどうかは `dup` と子で共有します。それを見張る epoll のポーリングも、見たことになります。
 
-- `/proc/sys/vm` にあるのは `drop_caches` と `unprivileged_userfaultfd` だけなので、
-  ほかの `vm` の sysctl もある Linux とは一覧が違います。`unprivileged_userfaultfd` は
+- `/proc/sys/vm` にあるのは `drop_caches`、`max_map_count`、`unprivileged_userfaultfd`
+  だけなので、ほかの `vm` の sysctl もある Linux とは一覧が違います。`max_map_count` は
+  マシンの 65530（`DEFAULT_MAX_MAP_COUNT`）で、root のモード 0444 のファイルです。ここでは
+  プロセスのマッピングをこれで縛らないので、誰も書くために開けません（`EACCES`）。
+  `unprivileged_userfaultfd` は
   マシンのもので、初めは 0、root のモード 0644 のファイルで、書くために開けるのは root
   だけです。0 か 1 を受け付けます（`proc_dointvec_minmax`、ほかは `EINVAL`）。Linux の `fs/drop_caches.c` と同じく、このファイルは root の
   もので、モードは 0200 です。読むためには root でも開けず（`EACCES`。`test_perm` は root
@@ -5165,6 +5230,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スレッドのものを）、`execve`（`PERF_RECORD_MISC_COMM_EXEC`）で書き、`execve` はそのあと新しい
   プログラムのスタックとマッピングを書きます。`PERF_RECORD_FORK` と `EXIT`
   （`task`、またはほかのどれか）は、スレッドが作られたときと終わったときに書きます。
+  `namespaces`（`CAP_PERFMON` が要ります）では、スレッドの名前空間の
+  `PERF_RECORD_NAMESPACES` を書きます。net、uts、ipc、pid、user、mnt、cgroup の
+  `/proc/<pid>/ns` のファイルそれぞれのデバイスと inode を含みます。新しいスレッドや子のものは
+  作ったスレッドが書きます。スレッドのものは、成功した `unshare` のたびに（新しい名前空間が
+  なくても）、また `setns` のたびに書きます。
   `cpu-clock` と `task-clock` のイベントは、ティックの割り込みが
   `perf_event_max_sample_rate` を `HZ` で割った数に届くと次のティックまで抑えられ、
   そのあいだは数えません。グループのリーダーの `PERF_RECORD_THROTTLE` と `UNTHROTTLE`
@@ -5495,6 +5565,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変えられます。回の間にシグナルが来ると終わります（`EINTR`）。`retval` は結果、`duration` は
   1 回にかかった時間、`data_out` は Ethernet ヘッダーをゼロにしたパケットで、`data_size_out`
   に入る分だけ、リニア部から書きます（入らなければ大きさを書いたあとで `ENOSPC`）。
+  書き出しが呼び出し側の書けないページに当たると、そのページの手前まで書いて `EFAULT` になり、
+  その後は何も書きません。
   コンテキスト（`struct __sk_buff`、入出力）は `mark`、`priority`、`ingress_ifindex`、
   `ifindex`、`cb[]`、`wire_len`、`gso_segs`、`gso_size` を渡し、ほかの場所は 0 でなければ
   ならず（`EINVAL`）、192 バイトより後ろも 0 でなければなりません（`E2BIG`）。返ってくるのは
@@ -5627,8 +5699,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     消します。1 時間たったものは初めからやり直します。
 
 - 古典的なフィルター（`SO_ATTACH_FILTER`、`struct sock_fprog`。ほかの大きさは `EINVAL`）は、
-  Linux の `bpf_check_classic` と同じく確かめ、`bpf_convert_filter` と同じく命令ごとに
-  変換し、変換したものをインタープリタが動かします。
+  Linux の `bpf_check_classic` と同じく確かめ、eBPF に変換し、変換したものをインタープリタが
+  動かします。変換した命令は paludarium 独自のものですが、古典的な命令 1 つから
+  `bpf_convert_filter` と同じ数の命令になり、ジャンプの位置も同じです。プログラムの長さは
+  ソケットに課される大きさで、ジャンプの位置と合わせて、長すぎて変換できないプログラムを
+  決めるからです。
   - 命令がないか 4096 より多いとき、Linux が知らないコード、定数 0 による除算か剰余、32 以上の
     定数のシフト、16 番目より後のスクラッチワード、どこかの経路で書いていないスクラッチワードの
     読み込み、終わりを越えるジャンプ、Linux が知らない補助ロード、返さない最後の命令は
@@ -6032,8 +6107,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
   8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ハードの
-  `RLIMIT_NOFILE` は 1048576（Linux の `fs.nr_open`）まで、埋め込む側がそれより低い
-  天井を決めたときはその値まで上げられます。ハードの上限を上げるには
+  `RLIMIT_NOFILE` は `fs.nr_open`（最初は 1048576 で、root が `/proc/sys/fs/nr_open` で
+  変えられます）まで、埋め込む側がそれより低い天井を決めたときはその値まで上げられます。ハードの上限を上げるには
   `CAP_SYS_RESOURCE` が必要です（`EPERM`）。ほかのスレッドへの `prlimit64` は、読むにも
   書くにも、`CAP_SYS_RESOURCE` があるか、呼んだ側の実ユーザー ID と実グループ ID が相手の
   実、実効、保存の ID すべてと同じであることが必要です（`EPERM`。知らない資源より先に

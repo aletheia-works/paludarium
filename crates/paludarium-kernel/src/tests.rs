@@ -1573,7 +1573,7 @@ fn close_range_marks_closes_and_unshares_the_table() {
     let fd = f.ret(2, &[DATA, 66, 0o600]);
     let (a, b) = (f.ret(32, &[fd]), f.ret(32, &[fd]));
     // A CLONE_FILES sibling, which sees every change to a shared table.
-    let sibling = f.kernel.files.for_clone(true, false);
+    let sibling = f.kernel.files.for_clone(true, false).unwrap();
     assert_eq!(f.ret(436, &[b, b, 4]), 0); // CLOSE_RANGE_CLOEXEC
     assert_eq!((f.ret(72, &[b, 1]), f.ret(72, &[a, 1])), (1, 0)); // F_GETFD
     // CLOSE_RANGE_UNSHARE: the copy loses `a`, the sibling's table keeps it,
@@ -5623,7 +5623,8 @@ mod io_uring {
             supported,
             [
                 0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 45, 55
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 45, 55, 59, 60, 61,
+                62
             ]
         );
         // A probe that is not zeroed, buffers without an argument, another
@@ -5871,6 +5872,204 @@ mod io_uring {
         assert_eq!(f.ret(427, &[r.fd, 1, 0, 1]), errno(Errno::EINVAL));
         assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
         assert_eq!(one(&mut f, &r, &rd), -14);
+    }
+
+    const READV_FIXED: u8 = 60;
+    const WRITEV_FIXED: u8 = 61;
+
+    #[test]
+    fn vectors_in_a_registered_buffer_transfer_as_linux_7_0s_do() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (vec, list, buf) = (DATA + 0x100, DATA + 0x300, DATA + 0x800);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        iovecs(&f, vec, &[(buf, 0x100), (0, 0)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 2]), 0);
+        // Two pieces go as one, and come back cut another way.
+        f.mem.write(GuestAddr(buf), b"abc").unwrap();
+        f.mem.write(GuestAddr(buf + 0x40), b"de").unwrap();
+        iovecs(&f, list, &[(buf, 3), (buf + 0x40, 2)]);
+        assert_eq!(one(&mut f, &r, &fixed(WRITEV_FIXED, fd, 0, list, 2, 0)), 5);
+        iovecs(&f, list, &[(buf + 0x80, 1), (buf + 0xc0, 4)]);
+        assert_eq!(one(&mut f, &r, &fixed(READV_FIXED, fd, 0, list, 2, 0)), 5);
+        assert_eq!(bytes(&f, buf + 0x80, 1), b"a");
+        assert_eq!(bytes(&f, buf + 0xc0, 4), b"bcde");
+        // A short read fills what it has, in order.
+        iovecs(&f, list, &[(buf + 0x10, 2), (buf + 0x20, 8)]);
+        assert_eq!(one(&mut f, &r, &fixed(READV_FIXED, fd, 2, list, 2, 0)), 3);
+        assert_eq!(bytes(&f, buf + 0x10, 2), b"cd");
+        assert_eq!(bytes(&f, buf + 0x20, 1), b"e");
+        // No entries move nothing.
+        assert_eq!(one(&mut f, &r, &fixed(READV_FIXED, fd, 0, list, 0, 0)), 0);
+        // The vector is read first: more than `UIO_MAXIOV` entries, more
+        // than `kmalloc` has room for, one it cannot read, a negative length.
+        for (addr, count, e) in [
+            (list, 1025, -22),
+            (list, (1 << 18) + 1, -12),
+            (1 << 63, 1, -14),
+        ] {
+            let entry = fixed(READV_FIXED, fd, 0, addr, count, 0);
+            assert_eq!(one(&mut f, &r, &entry), e, "{addr:x} {count}");
+        }
+        iovecs(&f, list, &[(buf, -1i64 as u64)]);
+        assert_eq!(one(&mut f, &r, &fixed(READV_FIXED, 99, 0, list, 1, 0)), -22);
+        // Then the file, then the buffer and each entry in it, of some bytes.
+        iovecs(&f, list, &[(buf, 1)]);
+        assert_eq!(one(&mut f, &r, &fixed(READV_FIXED, 99, 0, list, 1, 0)), -9);
+        for (entries, index) in [
+            (&[(buf, 1)][..], 1),
+            (&[(buf, 1)], 2),
+            (&[(buf, 1), (buf - 1, 1)], 0),
+            (&[(buf + 0xff, 2)], 0),
+            (&[(buf, 1), (buf + 4, 0)], 0),
+            (&[(buf, 1 << 20)], 0),
+        ] {
+            iovecs(&f, list, entries);
+            let count = entries.len() as u32;
+            let entry = fixed(WRITEV_FIXED, fd, 0, list, count, index);
+            assert_eq!(one(&mut f, &r, &entry), -14, "{entries:x?} {index}");
+        }
+        // Before them, room for the pages they may take: more than 4 MiB
+        // of pieces, more than `INT_MAX`. An empty slot comes first.
+        for (entries, index, e) in [
+            (&[(buf, 1u64 << 31)][..], 0, -12),
+            (&[(buf, 1 << 29), (buf, 1 << 29)], 0, -12),
+            (&[(buf, 1 << 43)], 0, -75),
+            (&[(buf, 1 << 43)], 1, -14),
+        ] {
+            iovecs(&f, list, entries);
+            let count = entries.len() as u32;
+            let entry = fixed(WRITEV_FIXED, fd, 0, list, count, index);
+            assert_eq!(one(&mut f, &r, &entry), e, "{entries:x?} {index}");
+        }
+        // No buffer is selected.
+        let mut select = fixed(READV_FIXED, fd, 0, list, 1, 0);
+        select[1] = 1 << 5;
+        assert_eq!(one(&mut f, &r, &select), -95);
+    }
+
+    const EPOLL_WAIT: u8 = 59;
+
+    #[test]
+    fn an_epoll_wait_request_waits_for_events_as_linux_7_0s_does() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (events, buf) = (DATA + 0x100, DATA + 0x200);
+        let epfd = f.ret(291, &[0]);
+        assert_eq!(f.ret(22, &[DATA + 0x500]), 0);
+        let ends = bytes(&f, DATA + 0x500, 8);
+        let reader = u64::from(u32::from_le_bytes(ends[..4].try_into().unwrap()));
+        let writer = u64::from(u32::from_le_bytes(ends[4..].try_into().unwrap()));
+        let mut event = [0; 12];
+        event[..4].copy_from_slice(&1u32.to_le_bytes());
+        event[4..].copy_from_slice(&7u64.to_le_bytes());
+        f.mem.write(GuestAddr(DATA + 0x600), &event).unwrap();
+        assert_eq!(f.ret(233, &[epfd, 1, reader, DATA + 0x600]), 0);
+        let wait = |fd: u64, at: u64, max: u32| rw(EPOLL_WAIT, fd, 0, at, max);
+        // Its entry's checks, then the file's, then `ep_check_params`.
+        let mut off = wait(epfd, events, 1);
+        off[8] = 1;
+        let mut index = wait(epfd, events, 1);
+        index[40] = 1;
+        let mut flags = wait(epfd, events, 1);
+        flags[28] = 1;
+        let mut ioprio = wait(epfd, events, 1);
+        ioprio[2] = 1;
+        for (entry, e) in [
+            (off, -22),
+            (index, -22),
+            (flags, -22),
+            (ioprio, -22),
+            (wait(99, events, 1), -9),
+            (wait(epfd, events, 0), -22),
+            (wait(epfd, events, u32::MAX), -22),
+            (wait(epfd, events, (i32::MAX / 12) as u32 + 1), -22),
+            (wait(epfd, 1 << 63, 1), -14),
+            (wait(reader, events, 1), -22),
+        ] {
+            assert_eq!(one(&mut f, &r, &entry), e, "{:x?}", &entry[..32]);
+        }
+        // None ready: it waits, and goes on once the pipe has bytes.
+        assert_eq!(batch(&mut f, &r, &[wait(epfd, events, 4)]), []);
+        f.mem.write(GuestAddr(buf), b"x").unwrap();
+        assert_eq!(
+            batch(&mut f, &r, &[rw(WRITE, writer, HERE, buf, 1)]),
+            [(1, 1), (1, 1)]
+        );
+        assert_eq!(bytes(&f, events, 12), event);
+        // Ready, it ends at once; where it can write none of them, `EFAULT`.
+        assert_eq!(one(&mut f, &r, &wait(epfd, events, 4)), 1);
+        assert_eq!(one(&mut f, &r, &wait(epfd, 0x40_0000, 1)), -14);
+    }
+
+    const PIPE: u8 = 62;
+
+    #[test]
+    fn a_pipe_request_opens_both_ends_in_descriptors_or_slots() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (fds, buf, files) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+        let pipe = |at: u64, flags: u32, slot: u32| {
+            let mut e = rw(PIPE, 0, 0, at, 0);
+            e[28..32].copy_from_slice(&flags.to_le_bytes());
+            e[44..48].copy_from_slice(&slot.to_le_bytes());
+            e
+        };
+        // `io_pipe_prep`.
+        let mut fd = pipe(fds, 0, 0);
+        fd[4] = 1;
+        let mut off = pipe(fds, 0, 0);
+        off[8] = 1;
+        let mut addr3 = pipe(fds, 0, 0);
+        addr3[48] = 1;
+        for entry in [fd, off, addr3, pipe(fds, 1, 0)] {
+            assert_eq!(one(&mut f, &r, &entry), -22, "{:x?}", &entry[..56]);
+        }
+        // A notification pipe is not there.
+        assert_eq!(one(&mut f, &r, &pipe(fds, 0o200, 0)), -22);
+        // Two descriptors, which the numbers name.
+        assert_eq!(one(&mut f, &r, &pipe(fds, 0o2004000, 0)), 0);
+        let ends = bytes(&f, fds, 8);
+        let reader = u64::from(u32::from_le_bytes(ends[..4].try_into().unwrap()));
+        let writer = u64::from(u32::from_le_bytes(ends[4..].try_into().unwrap()));
+        assert_eq!(writer, reader + 1);
+        f.mem.write(GuestAddr(buf), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[writer, buf, 2]), 2);
+        assert_eq!(f.ret(0, &[reader, buf + 8, 4]), 2);
+        assert_eq!(bytes(&f, buf + 8, 2), b"ab");
+        // `O_NONBLOCK` and `O_CLOEXEC`, on both.
+        assert_eq!(f.ret(0, &[reader, buf, 1]), errno(Errno(11)));
+        assert_eq!(f.ret(72, &[writer, 1]), 1);
+        // Numbers it cannot write take the descriptors back.
+        assert_eq!(one(&mut f, &r, &pipe(0x40_0000, 0, 0)), -14);
+        assert_eq!(f.ret(72, &[writer + 1, 1]), errno(Errno::EBADF));
+        // Slots: none registered, then from slot 2 (index 1), then from the
+        // last, where the second fails and empties the first again, then two
+        // free ones, found from the last one set (`alloc_hint`).
+        assert_eq!(one(&mut f, &r, &pipe(fds, 0, 1)), -6);
+        let none = [-1i32 as u8; 4].repeat(4);
+        f.mem.write(GuestAddr(files), &none).unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 2, files, 4]), 0);
+        assert_eq!(one(&mut f, &r, &pipe(fds, 0o2000000, 2)), -22);
+        assert_eq!(one(&mut f, &r, &pipe(fds, 0, 2)), 0);
+        assert_eq!(bytes(&f, fds, 8), [1, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(one(&mut f, &r, &pipe(fds, 0, 4)), -22);
+        let mut nop = rw(0, 3, 0, 0, 0);
+        nop[1] = 1;
+        nop[28] = 1 << 1;
+        assert_eq!(one(&mut f, &r, &nop), -9);
+        let alloc = u32::MAX;
+        assert_eq!(one(&mut f, &r, &pipe(fds, 0, alloc)), 0);
+        assert_eq!(bytes(&f, fds, 8), [3, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(one(&mut f, &r, &nop), 0);
+        // No free slot is left; numbers it cannot write empty the slots.
+        assert_eq!(one(&mut f, &r, &pipe(fds, 0, alloc)), -23);
+        assert_eq!(one(&mut f, &r, &pipe(0x40_0000, 0, 1)), -14);
+        for slot in [0u32, 1] {
+            nop[4..8].copy_from_slice(&slot.to_le_bytes());
+            assert_eq!(one(&mut f, &r, &nop), -9, "{slot}");
+        }
     }
 
     /// A `struct io_uring_rsrc_register` at `at`.
@@ -11704,7 +11903,7 @@ mod inotify {
         let wd = f.ret(ADD, &[fd, home, 0x400]) as i32;
         // A copy of the working directory, as a child without CLONE_FS
         // gets, holds it too.
-        let child = f.kernel.files.for_clone(true, false);
+        let child = f.kernel.files.for_clone(true, false).unwrap();
         assert_eq!(f.ret(84, &[home]), 0);
         assert_eq!(masks(&events(&mut f, fd)), []);
         assert_eq!(f.ret(80, &[tmp]), 0);
@@ -15935,6 +16134,90 @@ fn a_recursive_bind_of_dev_is_made_over_its_locked_shm() {
     let fd = f.ret(2, &[null, 2, 0]);
     assert!(fd < 1024, "{fd:#x}");
     assert_eq!(f.ret(3, &[fd]), 0);
+}
+
+/// A path that goes on past a file the kernel generates that is not a
+/// directory, by a trailing slash or a name after it, is `ENOTDIR` for
+/// every call that looks it up, as Linux's walk finds; a directory, or a
+/// link to one, is gone on in.
+#[test]
+fn a_path_past_a_generated_non_directory_is_enotdir() {
+    let mut f = fixture();
+    for p in [
+        &b"/proc/self/status/"[..],
+        b"/proc/self/status/x",
+        b"/proc/thread-self/status/",
+        b"/proc/self/mountinfo/",
+        b"/proc/self/mounts/x",
+        b"/proc/mounts/",
+        b"/proc/self/net/dev/",
+        b"/proc/net/dev/x",
+        b"/proc/self/fdinfo/0/",
+        b"/proc/self/fd/0/",
+        b"/proc/self/ns/net/",
+        b"/proc/sys/kernel/ostype/",
+        b"/proc/uptime/x",
+        b"/dev/null/",
+        b"/dev/null/x",
+        b"/dev/stdin/",
+        b"/dev/fd/0/x",
+    ] {
+        let at = put(&mut f, 0, p);
+        let name = String::from_utf8_lossy(p);
+        for (call, args) in [
+            (4, [at, DATA + 0x1000, 0]),
+            (6, [at, DATA + 0x1000, 0]),
+            (2, [at, 0, 0]),
+            (21, [at, 0, 0]),
+            (89, [at, DATA + 0x1000, 256]),
+            (80, [at, 0, 0]),
+            (137, [at, DATA + 0x1000, 0]),
+            // lchown and utimensat with AT_SYMLINK_NOFOLLOW: a trailing
+            // slash follows the last name all the same.
+            (94, [at, 0xffff_ffff, 0xffff_ffff]),
+        ] {
+            assert_eq!(f.ret(call, &args), errno(Errno::ENOTDIR), "{call} {name}");
+        }
+        assert_eq!(
+            f.ret(280, &[(-100i64) as u64, at, 0, 0x100]),
+            errno(Errno::ENOTDIR),
+            "utimensat {name}"
+        );
+    }
+    // `mkdir` makes the last name, which its own lookup finds there
+    // (`EEXIST`); only a name before it is gone on from.
+    for (p, expected) in [
+        (&b"/proc/self/status/"[..], Errno::EEXIST),
+        (b"/proc/mounts/", Errno::EEXIST),
+        (b"/dev/null/", Errno::EEXIST),
+        (b"/proc/self/status/x", Errno::ENOTDIR),
+        (b"/dev/null/x", Errno::ENOTDIR),
+        (b"/proc/uptime/x", Errno::ENOTDIR),
+    ] {
+        let at = put(&mut f, 0, p);
+        assert_eq!(
+            f.ret(83, &[at, 0o700]),
+            errno(expected),
+            "{}",
+            String::from_utf8_lossy(p)
+        );
+    }
+    for p in [
+        &b"/proc/self/"[..],
+        b"/proc/self/fd/",
+        b"/proc/self/net/",
+        b"/proc/self/root/",
+        b"/proc/sysvipc/",
+        b"/dev/pts/",
+    ] {
+        let at = put(&mut f, 0, p);
+        assert_eq!(
+            f.ret(4, &[at, DATA + 0x1000]),
+            0,
+            "{}",
+            String::from_utf8_lossy(p)
+        );
+    }
 }
 
 /// `readlink` of a file the kernel generates that is no link is `EINVAL`,

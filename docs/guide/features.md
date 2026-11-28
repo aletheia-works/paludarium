@@ -4322,8 +4322,9 @@ kernel.
   entry's address, and a tracer its `PTRACE_EVENT_SECCOMP`, but no system
   call's stop is made; then the result is in `rax` and the thread at its
   caller, with no other register changed. A tracer that changes the call's
-  number there, or moves the thread, ends it with `SIGSYS`, whose action is
-  then left at its default and `SA_IMMUTABLE` (`force_exit_sig`). Any other
+  number there to one the filters allow, or moves the thread, ends it with
+  `SIGSYS`, whose action is then left at its default and `SA_IMMUTABLE`
+  (`force_exit_sig`); a number the filters deny gets their action. Any other
   address there, a stack that cannot be read and a pointer the call cannot
   write are `SIGSEGV` from the kernel (`SI_KERNEL`); a pointer past user
   space is `SEGV_MAPERR` at it. Reads from outside give `EFAULT`

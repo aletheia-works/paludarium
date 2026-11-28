@@ -993,12 +993,16 @@ mod tests {
             .collect()
     }
 
-    /// Digests of what [`check`] decides on `programs`, and of what
-    /// [`convert`] makes of those it takes, with how many it takes and
-    /// converts.
-    fn conversion_digests(programs: &[Vec<SockFilter>]) -> ([u64; 2], [usize; 2]) {
-        let mut digests = [0xcbf2_9ce4_8422_2325u64; 2];
+    /// Digests of what a guest can see of `programs`: what [`check`]
+    /// decides; for the programs it takes, each instruction's block length
+    /// and where its jumps to other instructions are in it, and the
+    /// converted length or the conversion's error; and what the converted
+    /// programs return on a linear packet, a paged one and an empty one.
+    /// With how many the checks take and how many convert.
+    fn conversion_digests(programs: &[Vec<SockFilter>]) -> ([u64; 3], [usize; 2]) {
+        let mut digests = [0xcbf2_9ce4_8422_2325u64; 3];
         let mut counts = [0; 2];
+        let data: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(7)).collect();
         for filter in programs {
             let checked = check(filter);
             let len = (filter.len() as u16).to_le_bytes();
@@ -1011,17 +1015,38 @@ mod tests {
                 continue;
             }
             counts[0] += 1;
-            match convert(filter) {
-                Ok(insns) => {
-                    counts[1] += 1;
-                    for i in insns {
-                        fnv(&mut digests[1], &[i.code, i.dst, i.src]);
-                        fnv(&mut digests[1], &i.off.to_le_bytes());
-                        fnv(&mut digests[1], &i.imm.to_le_bytes());
+            for (pc, &f) in filter.iter().enumerate() {
+                let Some(op) = decode(f.code) else {
+                    continue;
+                };
+                let pieces = block(pc, op, f).0;
+                fnv(&mut digests[1], &(pieces.len() as u16).to_le_bytes());
+                for (at, piece) in pieces.iter().enumerate() {
+                    if let Piece::Jump(..) = piece {
+                        fnv(&mut digests[1], &[0xaa, at as u8]);
                     }
-                    fnv(&mut digests[1], &[0xee]);
                 }
-                Err(e) => fnv(&mut digests[1], &[0xff, e.0 as u8]),
+            }
+            let insns = match convert(filter) {
+                Ok(insns) => insns,
+                Err(e) => {
+                    fnv(&mut digests[1], &[0xff, e.0 as u8]);
+                    continue;
+                }
+            };
+            counts[1] += 1;
+            fnv(&mut digests[1], &(insns.len() as u32).to_le_bytes());
+            let program = crate::bpf_interp::Program {
+                insns: &insns,
+                maps: &[],
+                loads: &BTreeMap::new(),
+            };
+            for (bytes, linear) in [(&data[..], 40), (&data[..], 20), (&[][..], 0)] {
+                let packet = Packet::message(bytes, linear);
+                match crate::bpf_interp::run(&program, &packet, &mut Quiet) {
+                    Ok(r) => fnv(&mut digests[2], &r.to_le_bytes()),
+                    Err(_) => fnv(&mut digests[2], &[0xfa]),
+                }
             }
         }
         (digests, counts)
@@ -1029,18 +1054,23 @@ mod tests {
 
     #[test]
     fn checks_and_conversions_give_what_they_did() {
-        // Digests of the checks' decisions and the converted programs, made
-        // before the conversion was written anew: it must change neither.
+        // Digests of what a guest sees of the checks and the converted
+        // programs, made before the blocks' instructions were written anew:
+        // it must change none of them.
         // A seed, how many programs, their longest, `far`, and the digests
         // and counts.
-        type Case = (u64, usize, usize, u64, [u64; 2], [usize; 2]);
+        type Case = (u64, usize, usize, u64, [u64; 3], [usize; 2]);
         let cases: [Case; 5] = [
             (
                 0x2545_f491_4f6c_dd1d,
                 40_000,
                 12,
                 0,
-                [0x93ae_fd66_3e5b_0f9a, 0x6da3_d6e0_217e_966d],
+                [
+                    0x93ae_fd66_3e5b_0f9a,
+                    0x80a9_d1bb_6001_9afe,
+                    0xf9d3_2d19_e23d_ae96,
+                ],
                 [35_225, 35_225],
             ),
             (
@@ -1048,7 +1078,11 @@ mod tests {
                 20_000,
                 60,
                 0,
-                [0xbf80_2ed8_ef94_b283, 0xcac4_1dc0_6efa_30a3],
+                [
+                    0xbf80_2ed8_ef94_b283,
+                    0xe5bd_ae8f_0a0c_2df7,
+                    0x56e8_0945_78e1_d741,
+                ],
                 [16_386, 16_386],
             ),
             (
@@ -1056,7 +1090,11 @@ mod tests {
                 1_000,
                 600,
                 0,
-                [0xcdd7_f1ae_52a9_ac49, 0xe8bd_9316_b5a6_957b],
+                [
+                    0xcdd7_f1ae_52a9_ac49,
+                    0x62be_01c1_16f4_c69a,
+                    0xb84b_f427_58e4_2bd8,
+                ],
                 [738, 738],
             ),
             (
@@ -1064,7 +1102,11 @@ mod tests {
                 300,
                 MAX_INSNS,
                 4,
-                [0x0aec_efeb_423c_668f, 0xe4a9_0c3d_9b49_ac9d],
+                [
+                    0x0aec_efeb_423c_668f,
+                    0x79c8_280e_73cc_ccf8,
+                    0x25c2_a163_e090_5856,
+                ],
                 [128, 128],
             ),
             (
@@ -1072,7 +1114,11 @@ mod tests {
                 300,
                 MAX_INSNS,
                 6,
-                [0xd5d0_1baf_752d_8944, 0x72cd_0b98_c45b_7b64],
+                [
+                    0xd5d0_1baf_752d_8944,
+                    0x9974_442b_073a_b3f0,
+                    0x73be_dd9e_a6a9_a825,
+                ],
                 [101, 88],
             ),
         ];

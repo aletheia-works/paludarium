@@ -3535,8 +3535,11 @@ kernel.
     the protocol (0 and 2); the addresses, the protocol and the ports (1);
     or the fields `fib_multipath_hash_fields` names (3), of the flow
     `RTM_GETROUTE` asks for too; a socket's packets hash as it is bound,
-    `::` unbound, with no flow label, and one unbound takes the source of the hop that gives
-    (`ip6_dst_lookup_tail`). An answer goes back by a lookup of its own,
+    `::` unbound, with no flow label, and one unbound takes the source of
+    the hop that gives (`ip6_dst_lookup_tail`). ICMPv6's port unreachable is
+    looked up with the datagram it tells of (`icmp6_send`), hashed as IPv4's
+    is: under policy 1 by the flow hash of a connected socket, and under
+    policy 3 mixed with no inner hash. An answer goes back by a lookup of its own,
     through whichever end that takes: the one its listener is bound to, or
     to a link-local address the one the packet came in on
     (`inet6_csk_route_req`, `icmp6_send`). Turning `disable_ipv6` on for an end

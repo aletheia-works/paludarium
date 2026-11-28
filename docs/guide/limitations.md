@@ -448,7 +448,7 @@ verified.
   start-up) as if its pages were all cached, where Linux gives none for a
   page it has not read or has evicted; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
-  failed `clone` writes neither; and `NAMESPACES`, `CGROUP`,
+  failed `clone` writes neither; and `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
   written. When `REFRESH`'s last overflow disables the event, its count
   stops there, but its times (a clock's apart) and its group's other
@@ -652,14 +652,15 @@ verified.
   Linux reloads them in every thread of the address space. A null selector
   clears the `%fs` or `%gs` base, where AMD's CPUs before Zen 2 keep it.
 - **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
-  `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`,
-  `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS`,
+  `_EPOLL_WAIT`, `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`,
+  `_READ_FIXED`, `_WRITE_FIXED`, `_READV_FIXED`, `_WRITEV_FIXED`,
+  `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS`,
   `_REMOVE_BUFFERS`, `IORING_OP_ASYNC_CANCEL`, `IORING_OP_TIMEOUT`,
   `_TIMEOUT_REMOVE`, `_LINK_TIMEOUT`, `IORING_OP_POLL_ADD`,
   `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
-  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
-  `IORING_OP_SPLICE` and `_TEE`, and the socket requests
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT`, `_FTRUNCATE` and
+  `_PIPE`, `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
   Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
@@ -1106,8 +1107,7 @@ verified.
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the
   kernel, where Linux waits until they all have. Signals to them meet it at
-  once, and `/proc` shows it after each one's next system call. `SIGIO` and
-  `SIGURG` from `F_SETOWN` are not scoped, as `F_SETOWN` records no sender. A
+  once, and `/proc` shows it after each one's next system call. A
   rename's Landlock check comes after its permission checks, where Linux's
   comes before them, which shows only when both refuse. A rule on a file under
   `/proc` does not count for `execve`. An open checks the file its path
@@ -1121,9 +1121,7 @@ verified.
   thread's new filter only after its next system call.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
-  files but nowhere else yet. `F_SETOWN` records no sender's credentials, so
-  `SIGIO` and `SIGURG` reach their owner whoever set it, where Linux's
-  `sigio_perm` checks.
+  files but nowhere else yet.
   Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
@@ -1159,6 +1157,10 @@ verified.
   in the emulator itself, so whether it came ignored can't be told. On Linux
   a program started with `SIGPIPE` ignored keeps it ignored. In WebAssembly
   no signal starts ignored.
+- **Notification pipes**: there are no watch queues, so `pipe2` and
+  io_uring's `IORING_OP_PIPE` with `O_NOTIFICATION_PIPE` give `EINVAL`,
+  where Linux built with `CONFIG_WATCH_QUEUE` makes a pipe that key and
+  device notifications are posted to.
 - **Signal-driven I/O**: the host's standard input, looked at every 10 ms,
   sends `SIGIO` once each time input comes where there was none, where
   Linux's pipe or terminal sends one for every piece of input. Standard

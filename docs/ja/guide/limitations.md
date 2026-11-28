@@ -377,7 +377,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ものとしてビルド ID を読みます。Linux は読んでいないか追い出したページからは与えません。
   ホストが始められなかったスレッドには `FORK` と `EXIT` の記録を書き、
   `EXIT` は CPU 0 のものとします。Linux の失敗した `clone` はどちらも書きません。
-  `NAMESPACES`、`CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、`SWITCH`、
+  `CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、`SWITCH`、
   `AUX` の記録は書きません。
   `REFRESH` の最後のオーバーフローがイベントを無効にするとき、数えるのはそこで止まりますが、
   その時間（時計のものを除きます）と、グループのほかのイベントは、そのときまで
@@ -540,12 +540,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   直すのは呼んだスレッドだけで、Linux はアドレス空間のすべてのスレッドで読み込み直します。
   null のセレクタは `%fs` と `%gs` のベースを消しますが、Zen 2 より前の AMD の CPU は
   ベースを残します。
-- **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
+- **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、`_EPOLL_WAIT`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
-  `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
+  `_READV_FIXED`、`_WRITEV_FIXED`、`IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
-  `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
+  `_LINKAT`、`_FTRUNCATE`、`_PIPE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
   だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、
   受信のバンドル（`IORING_RECVSEND_BUNDLE`）と、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません
   （`EINVAL`）。送信が選ぶバッファーは Linux master に合わせます。差分テストのランナーのカーネルは、
@@ -916,8 +916,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `LANDLOCK_RESTRICT_SELF_TSYNC` では、ほかのスレッドが自分の確認に新しいドメインを
   使うのは、次にカーネルに入るときからです。Linux は、すべてのスレッドが受け取るまで
   待ちます。それらのスレッドへのシグナルにはすぐに効き、`/proc` にはそれぞれの次の
-  システムコールの後から見えます。`F_SETOWN` は送り手を記録しないので、`F_SETOWN` に
-  よる `SIGIO` と `SIGURG` はスコープの対象になりません。名前の変更での Landlock の
+  システムコールの後から見えます。名前の変更での Landlock の
   確認は許可の確認の後で、Linux は前です。違いが出るのは両方が断るときだけです。
   `/proc` の下のファイルへのルールは、`execve` には効きません。開くときは、パスが
   指すファイルを開く前に確かめ（作ったファイルは作った後に確かめ）ます。その間に別の
@@ -932,8 +931,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **資格情報**：スレッドが変えた ID とケーパビリティは、ファイル、シグナル、資源の上限、
   優先度、ソケットの資格情報、コアファイルでは確かめますが、ほかのところではまだ
   確かめていません。
-  `F_SETOWN` は設定した側の資格情報を記録しないので、
-  `SIGIO` と `SIGURG` は、Linux の `sigio_perm` と違い、だれが設定しても持ち主に届きます。
   ファイルのうち、`/proc` と `/dev` の下は確かめません。`fs.protected_hardlinks`、
   `fs.protected_symlinks`、`fs.protected_fifos`、`fs.protected_regular` は、
   カーネルの既定値の 0 として振る舞います。多くのディストリビューションは
@@ -966,6 +963,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Rust のランタイムが `SIGPIPE` を無視するため、無視した状態で渡されたかどうかがわかりません。
   Linux では、`SIGPIPE` を無視して起動したプログラムは無視したままです。WebAssembly では、
   無視した状態で始めるシグナルはありません。
+- **通知パイプ**：ウォッチキューはないので、`O_NOTIFICATION_PIPE` を付けた `pipe2` と
+  io_uring の `IORING_OP_PIPE` は `EINVAL` です。`CONFIG_WATCH_QUEUE` 付きでビルドした Linux は、
+  鍵とデバイスの通知が投稿されるパイプを作ります。
 - **シグナル駆動の入出力**：ホストの標準入力は 10 ms ごとに見るので、何もなかったところに
   入力が来るたびに `SIGIO` を 1 回送ります。Linux のパイプや端末は、入力のひとまとまりごとに
   送ります。標準出力と標準エラーも同じように見て、いっぱいだったところに空きができる

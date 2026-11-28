@@ -125,7 +125,8 @@
    socket (its owner, also where the network namespace's user namespace
    maps no root and once it does, and a cookie that each run has its own
    of); cb[] through repeated runs and a map that counts them; a packet in
-   pages, with data_end and without; and the checks of the call and of its
+   pages, with data_end and without; a packet and a context copied out to
+   memory that ends in an unmapped page; and the checks of the call and of its
    context, in their order. Not printed: the time a run took, and what
    master and the test machines' Linux 7.0 do differently (a short IPv4
    or IPv6 header, IPX, and a packet in pages cut by data_size_out).
@@ -174,6 +175,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
@@ -3395,6 +3397,41 @@ static int case_testrun(void) {
     test_run("20 out", &t);
     say("20 out header zeroed %d rest same %d untouched after %d", run_out[0] == 0 && run_out[13] == 0,
         !memcmp(run_out + 14, run_in + 14, 6), run_out[20] == 0xee);
+    /* A data_out or ctx_out that runs into an unmapped page: the copy
+       writes up to that page and the run is EFAULT, its sizes and result
+       not written. Once in the linear part, and once in the pages: 4000
+       bytes reach past the linear part's 3712 + 14. */
+    unsigned char *pages = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pages != MAP_FAILED && munmap(pages + 4096, 4096) == 0) {
+        static const struct {
+            const char *name;
+            uint32_t size, room;
+        } cuts[] = {{"cut linear", 64, 10}, {"cut pages", 5000, 4000}};
+        for (size_t c = 0; c < sizeof cuts / sizeof cuts[0]; c++) {
+            frame(zero, 0x0800, cuts[c].size);
+            memset(pages, 0xee, 4096);
+            t = run_of(len, cuts[c].size);
+            t.data_out = (uintptr_t)(pages + 4096 - cuts[c].room);
+            t.data_size_out = 0;
+            t.retval = 7;
+            long r = bpf(PROG_TEST_RUN, &t, sizeof t);
+            unsigned char *at = pages + 4096 - cuts[c].room;
+            size_t same = 14 <= cuts[c].room ? !memcmp(at + 14, run_in + 14, cuts[c].room - 14) : 1;
+            say("%s %ld retval %u size out %u header zeroed %d rest same %d before untouched %d", cuts[c].name, r,
+                t.retval, t.data_size_out, at[0] == 0 && at[cuts[c].room < 14 ? cuts[c].room - 1 : 13] == 0,
+                (int)same, at[-1] == 0xee);
+        }
+        frame(zero, 0x0800, 64);
+        memset(pages, 0xee, 4096);
+        memset(ctx_in, 0, sizeof ctx_in);
+        t = with_context(run_of(len, 64));
+        t.ctx_out = (uintptr_t)(pages + 4096 - 100);
+        long r = bpf(PROG_TEST_RUN, &t, sizeof t);
+        uint32_t ifindex;
+        memcpy(&ifindex, pages + 4096 - 100 + 40, 4);
+        say("cut context %ld retval %u ctx size out %u ifindex %u", r, t.retval, t.ctx_size_out, ifindex);
+        munmap(pages, 4096);
+    }
     /* An Ethernet header alone, of a type with no header of its own to
        check (master refuses a short IPv4 or IPv6 one, 7.0 does not). */
     frame(zero, 0x0806, 14);

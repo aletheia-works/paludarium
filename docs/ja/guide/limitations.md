@@ -175,8 +175,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `status` は、それを `voluntary_ctxt_switches` として示し、`nonvoluntary_ctxt_switches` は
   0 です。`getrusage` と wait の rusage も同じく `ru_nvcsw` に示し、`ru_nivcsw` は 0 です。
   ピン留めしたページ（`pinned_vm`）とページテーブルのバイト数は何も数えないので、`status` には
-  `VmPin` と `VmPTE` がありません。ほかのプロセスのスレッドは、どの待ちでも
-  `S (sleeping)` です。Linux は割り込めない待ちの一部を `D (disk sleep)` と見せます。スレッドが
+  `VmPin` と `VmPTE` がありません。ほかのプロセスのスレッドが
+  `D (disk sleep)` になるのは、paludarium にある、Linux が `TASK_KILLABLE` にする待ち（機能を
+  参照）の中だけで、ほかの待ちではすべて `S (sleeping)` です。Linux は割り込めないロック
+  （パイプのミューテックス。ここのスレッドはこれを取る間、眠っていると見せません）や
+  I/O の待ちも `D` と見せます。スレッドが
   ほかのプロセスに見せるのは最後のシステムコールかシグナルの確認で公開したものなので、
   呼び出しの間だけ変えたマスク（`rt_sigsuspend`、`ppoll`）は、スレッドがその中で停止している
   間しか見えません。メモリーの残っていないタスク（ゾンビや、ほかのスレッドより先に
@@ -377,7 +380,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ものとしてビルド ID を読みます。Linux は読んでいないか追い出したページからは与えません。
   ホストが始められなかったスレッドには `FORK` と `EXIT` の記録を書き、
   `EXIT` は CPU 0 のものとします。Linux の失敗した `clone` はどちらも書きません。
-  `CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、`SWITCH`、
+  スレッドが CPU を離れるのは眠るときだけで、横取りされることはありません
+  （`PERF_RECORD_MISC_SWITCH_OUT_PREEMPT`）。眠りの `SWITCH` の記録は二つとも
+  スレッドがふたたび動くときに書き、一つ目の時刻は目覚めたときのものです。Linux は
+  スレッドが眠るときに書きます。眠りは、スレッドが最後にシステムコールを呼んだときか時計を
+  読んだときの CPU のものとします。そのあと眠るまでのあいだにほかのスレッドの
+  `sched_setaffinity` が移しても、CPU を離れる記録は前の CPU に書きます。
+  CPU のイベントが受け取るのはゲストのスレッドの切り替えだけで、
+  代わりに動いたスレッドはどれもアイドルのタスク（0）とします。
+  `CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、
   `AUX` の記録は書きません。
   `REFRESH` の最後のオーバーフローがイベントを無効にするとき、数えるのはそこで止まりますが、
   その時間（時計のものを除きます）と、グループのほかのイベントは、そのときまで
@@ -581,8 +592,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_REGISTER_SYNC_CANCEL`、`IORING_REGISTER_PERSONALITY`、
   `IORING_UNREGISTER_PERSONALITY`、`IORING_REGISTER_RESTRICTIONS`、
   `IORING_REGISTER_ENABLE_RINGS`、`IORING_REGISTER_RING_FDS`、
-  `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。Linux 7.0 にあるタスクの制限は
-  ありません（記述子 -1 は `EBADF`）。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
+  `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。リングなし（記述子 -1）では
+  タスクの `IORING_REGISTER_RESTRICTIONS` だけがあります。`IORING_REGISTER_SEND_MSG_RING`、
+  `_QUERY`、`_BPF_FILTER` は `EINVAL` で、タスクの制限に BPF フィルターはありません。この制限は、
+  Linux 7.0 とテストを走らせるカーネルと同じく、リングなしの登録を制限しません。Linux master は
+  許されていないものをそこで断ります（`EACCES`、4a93427e99a8）。テストを走らせるカーネルが
+  追いつけば master に合わせます。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
   カーネルである Linux 7.0 と同じく、スロットごとに `iovec` をタグより先に読み、
   `IORING_RSRC_UPDATE_EXTENDED` を断ります。Linux master はタグを先に読み、そのフラグの
   `struct io_uring_regbuf_desc` を受け付けます。テストを走らせるカーネルが追いつけば master に

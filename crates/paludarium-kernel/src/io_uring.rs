@@ -62,6 +62,7 @@ mod fs;
 mod net;
 mod poll;
 mod register;
+pub(crate) use register::Restrictions;
 mod splice;
 mod timeout;
 
@@ -362,6 +363,9 @@ pub(crate) struct Ring {
     /// `IORING_SETUP_R_DISABLED`, until it is enabled.
     disabled: std::sync::atomic::AtomicBool,
     restrictions: Mutex<register::Restrictions>,
+    /// Its registrations are restricted by its task's restrictions
+    /// (`IO_RING_F_RESTRICT_INHERITED`), which hold while it is disabled.
+    inherited: bool,
     personalities: Mutex<register::Personalities>,
     /// Held across a submission, as Linux's `uring_lock`: threads that
     /// submit at once take entries one after another, never the same ones.
@@ -3560,7 +3564,8 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
             std::sync::OnceLock::new()
         },
         disabled: (flags & SETUP_R_DISABLED != 0).into(),
-        restrictions: Mutex::default(),
+        restrictions: Mutex::new(register::of_task(c)),
+        inherited: register::of_task(c).restricts_registrations(),
         personalities: Mutex::default(),
         submitting: Mutex::default(),
         state: Mutex::default(),
@@ -3953,6 +3958,16 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if opcode >= REGISTER_LAST {
         return Err(Errno::EINVAL);
     }
+    // Descriptor -1 names no ring (`io_uring_register_blind`): of what Linux
+    // takes there, only a task's restrictions are here.
+    if a[0] as u32 == u32::MAX {
+        return match opcode {
+            register::REGISTER_RESTRICTIONS => {
+                register::register_task_restrictions(c, a[2], a[3] as u32)
+            }
+            _ => Err(Errno::EINVAL),
+        };
+    }
     let file = ring_file(c, a[0], registered)?;
     let ring = downcast(&file)?;
     if ring.others(c.tid) {
@@ -3974,6 +3989,8 @@ fn run_registration(
     a: [u64; 6],
 ) -> Result<u64, Errno> {
     match opcode {
+        // `__io_uring_register`: no argument, or more than 256 entries.
+        REGISTER_PROBE if a[2] == 0 || a[3] as u32 > 256 => Err(Errno::EINVAL),
         REGISTER_PROBE => probe(c, a),
         register::REGISTER_PERSONALITY | register::REGISTER_ENABLE_RINGS
             if a[2] != 0 || a[3] as u32 != 0 =>

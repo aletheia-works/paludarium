@@ -11790,6 +11790,11 @@ static int io_uring_buffers2_case(void) {
     up.nr = 1;
     up.data = (unsigned long)iov;
     uring_show("update-none", ub2_update(&u, &up, sizeof up));
+    /* Linux master's IORING_RSRC_UPDATE_EXTENDED: Linux 7.0 refuses the
+       field (EINVAL) before it looks for buffers, master after (ENXIO). */
+    up.resv = 1 << 1;
+    uring_show("update-none-extended", ub2_update(&u, &up, sizeof up));
+    up.resv = 0;
 
     /* A failed registration posts no tag; a tag on an empty slot fails. */
     iov[0] = (struct iovec){page, 4096};
@@ -12553,6 +12558,70 @@ static int io_uring_restrictions_case(void) {
     uring_show("single-submit", uring_enter(single.fd, 1, 0, 0, NULL, 0));
     uring_show("single-register", ures_register(&single, 9, NULL, 0));
     close(single.fd);
+
+    /* A task's restrictions (descriptor -1), in a child, which keeps them:
+       each ring it sets up after starts with them, and so do its
+       children's. An IORING_OP_FILES_UPDATE of nothing, EINVAL where it is
+       allowed, shows which allow it. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct uring before;
+        if (uring_open(&before, 4)) _exit(85);
+        uring_show("task-unknown", syscall(427, -1, 38, NULL, 0));
+        uring_show("task-probe", syscall(427, -1, 8, NULL, 0));
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) _exit(86);
+        struct {
+            unsigned short flags, nr;
+            unsigned resv[3];
+            struct ures res[2];
+        } task = {0, 2, {0}, {{1, 0, 0, {0}}, {0, 9, 0, {0}}}};
+        uring_show("task-count", syscall(427, -1, 11, &task, 0));
+        uring_show("task-unmapped", syscall(427, -1, 11, (void *)8, 1));
+        task.flags = 1;
+        uring_show("task-flags", syscall(427, -1, 11, &task, 1));
+        task.flags = 0;
+        task.resv[2] = 1;
+        uring_show("task-resv", syscall(427, -1, 11, &task, 1));
+        task.resv[2] = 0;
+        task.res[1].opcode = 9;
+        uring_show("task-unknown-restriction", syscall(427, -1, 11, &task, 1));
+        task.res[1].opcode = 0;
+        uring_show("task", syscall(427, -1, 11, &task, 1));
+        uring_show("task-again", syscall(427, -1, 11, &task, 1));
+        ures_run(&before, 20, 0, "task-before-update");
+        uring_show("task-before-probe", ures_register(&before, 8, NULL, 0));
+        struct uring after;
+        if (uring_open(&after, 4)) _exit(87);
+        ures_run(&after, 0, 0, "task-after-nop");
+        ures_run(&after, 20, 0, "task-after-update");
+        uring_show("task-after-personality", ures_register(&after, 9, NULL, 0));
+        uring_show("task-after-probe", ures_register(&after, 8, NULL, 0));
+        struct uring off;
+        if (uring_open_flags(&off, 4, 1 << 6)) _exit(88);
+        uring_show("task-disabled-restrict", ures_register(&off, 11, list, 4));
+        uring_show("task-disabled-enable", ures_register(&off, 12, NULL, 0));
+        ures_run(&off, 20, 0, "task-disabled-update");
+        uring_show("task-disabled-enable-again", ures_register(&off, 12, NULL, 0));
+        fflush(stdout);
+        pid_t grandchild = fork();
+        if (grandchild == 0) {
+            struct uring inherited;
+            if (uring_open(&inherited, 4)) _exit(89);
+            ures_run(&inherited, 20, 0, "task-child-update");
+            uring_show("task-child-again", syscall(427, -1, 11, &task, 1));
+            fflush(stdout);
+            _exit(0);
+        }
+        int status;
+        waitpid(grandchild, &status, 0);
+        printf("task-child: %d\n", status);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("task: %d\n", status);
     return 0;
 }
 
@@ -19443,6 +19512,41 @@ static int magic_link_names_case(void) {
         _exit(rc);
     }
     printf("status=%d\n", reaped(child));
+    return 0;
+}
+/* The named-fifo-statfs case: fstatfs of a fifo opened by its name is the
+   file system that holds it, the same as statfs of its directory (type,
+   fsid and flags), by a descriptor open for reading and writing and by an
+   O_PATH one, and after the name is removed; a pipe(2)'s is pipefs. Only
+   whether they agree is printed, as /tmp's file system differs. */
+static int nfs_same(const struct statfs *a, const struct statfs *b) {
+    return a->f_type == b->f_type && !memcmp(&a->f_fsid, &b->f_fsid, sizeof a->f_fsid) &&
+           a->f_flags == b->f_flags;
+}
+static int named_fifo_statfs_case(void) {
+    int p[2];
+    if (pipe2(p, O_CLOEXEC)) return 1;
+    struct statfs ps;
+    printf("pipe pipefs=%d\n", !fstatfs(p[0], &ps) && ps.f_type == 0x50495045);
+    close(p[0]);
+    close(p[1]);
+    const char *const dirs[] = {"/tmp", "/dev/shm"};
+    for (unsigned i = 0; i < 2; i++) {
+        char name[96];
+        snprintf(name, sizeof name, "%s/paludarium-fifo-%d", dirs[i], (int)getpid());
+        if (mknod(name, S_IFIFO | 0600, 0)) return 2;
+        int fd = open(name, O_RDWR | O_CLOEXEC);
+        int pathfd = open(name, O_PATH | O_CLOEXEC);
+        struct statfs dir, a, b, c, d;
+        int ok = fd >= 0 && pathfd >= 0 && !statfs(dirs[i], &dir);
+        int r1 = ok && !fstatfs(fd, &a), r2 = ok && !fstatfs(pathfd, &b);
+        unlink(name);
+        int r3 = ok && !fstatfs(fd, &c), r4 = ok && !fstatfs(pathfd, &d);
+        printf("%s opened=%d path=%d removed=%d removed-path=%d\n", dirs[i], r1 && nfs_same(&a, &dir),
+               r2 && nfs_same(&b, &dir), r3 && nfs_same(&c, &dir), r4 && nfs_same(&d, &dir));
+        if (fd >= 0) close(fd);
+        if (pathfd >= 0) close(pathfd);
+    }
     return 0;
 }
 /* Each call's errno, or 0, for a path that goes on past a file the kernel
@@ -32128,6 +32232,59 @@ static int sysctl_constants_case(void) {
     int status = 0;
     waitpid(child, &status, 0);
     printf("not root: child=%d\n", status);
+    return 0;
+}
+
+/* The vfork-state case: what /proc shows of a parent that waits for its
+   vfork child, which Linux's wait_for_vfork_done does TASK_KILLABLE: the
+   state letter of its stat and the State line of its status. The child
+   writes them itself, sharing the parent's memory, so without stdio. */
+static int vfork_state_case(void) {
+    pid_t parent = getpid();
+    pid_t pid = vfork();
+    if (pid < 0) return 93;
+    if (!pid) {
+        char path[64], text[2048], out[160];
+        char stat_state = '?';
+        /* The parent may not be in its wait yet, running still: look again
+           a while. */
+        for (int tries = 0; tries < 2000; tries++) {
+            snprintf(path, sizeof path, "/proc/%d/stat", (int)parent);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            long n = fd < 0 ? -1 : read(fd, text, sizeof text - 1);
+            if (fd >= 0) close(fd);
+            text[n < 0 ? 0 : n] = 0;
+            char *paren = strrchr(text, ')');
+            stat_state = paren && paren[1] == ' ' ? paren[2] : '?';
+            if (stat_state != 'R') break;
+            struct timespec pause = {0, 1000000};
+            nanosleep(&pause, NULL);
+        }
+        int fd;
+        long n;
+        snprintf(path, sizeof path, "/proc/%d/status", (int)parent);
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        n = fd < 0 ? -1 : read(fd, text, sizeof text - 1);
+        if (fd >= 0) close(fd);
+        text[n < 0 ? 0 : n] = 0;
+        char *line = strstr(text, "\nState:\t");
+        char *end = line ? strchr(line + 1, '\n') : NULL;
+        int len = snprintf(out, sizeof out, "parent: stat=%c status=%.*s\n", stat_state,
+                           line && end ? (int)(end - line - 8) : 1, line && end ? line + 8 : "?");
+        if (write(1, out, len) != len) _exit(2);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("child: status=%d\n", status);
+    char path[64], text[2048];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)parent);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    long n = fd < 0 ? -1 : read(fd, text, sizeof text - 1);
+    if (fd >= 0) close(fd);
+    text[n < 0 ? 0 : n] = 0;
+    char *paren = strrchr(text, ')');
+    printf("self after: stat=%c\n", paren && paren[1] == ' ' ? paren[2] : '?');
     return 0;
 }
 
@@ -46252,6 +46409,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "magic-link-names")) return magic_link_names_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
+    if (!strcmp(mode, "named-fifo-statfs")) return named_fifo_statfs_case();
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
@@ -47529,6 +47687,7 @@ int main(int argc, char **argv) {
         result("status", status);
         return 0;
     }
+    if (!strcmp(mode, "vfork-state")) return vfork_state_case();
     int vf = !strcmp(mode, "vfork-exec") || !strcmp(mode, "vfork-exit");
     pid_t pid = vf ? vfork() : child();
     if (pid < 0) return 93;

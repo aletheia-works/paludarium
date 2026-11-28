@@ -4924,9 +4924,10 @@ kernel.
   at its first read and keeps, and `uuid`, a new one at each read
   (`proc_do_uuid`). A string among these is read from where the file is, as
   `proc_dostring` reads it, and an `int` only from the start.
-  `/proc/sys/kernel` lists only these, the six below and `yama`, and each
-  directory of `/proc/sys` lists its entries by name, directories among
-  files, as Linux's tree of them keeps them.
+  `/proc/sys/kernel` lists only these, the six below and the directories
+  `random`, `seccomp` and `yama`, and each directory of `/proc/sys` lists
+  its entries by name, directories among files, as Linux's tree of them
+  keeps them.
 
 - `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
   `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`

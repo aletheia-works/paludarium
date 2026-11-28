@@ -4215,7 +4215,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   バージョン 4 の UUID で、`uuid` は読むたびに新しいものです（`proc_do_uuid`）。これらのうち
   文字列のものは、`proc_dostring` と同じくファイルの今の位置から読め、`int` のものは先頭からしか
   読めません。
-  `/proc/sys/kernel` にあるのはこれらと次の 6 つ、そして `yama` だけで、`/proc/sys` のどの
+  `/proc/sys/kernel` にあるのはこれらと次の 6 つ、そしてディレクトリの `random`、`seccomp`、
+  `yama` だけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、ディレクトリもファイルと混ぜて名前の順に並べます。
 
 - `/proc/sys/kernel` には、Linux の `kernel/utsname_sysctl.c` と同じく、UTS 名前空間の名前も

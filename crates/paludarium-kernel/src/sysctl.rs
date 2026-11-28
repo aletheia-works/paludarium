@@ -2477,6 +2477,41 @@ mod tests {
         assert!(at(b"random") < at(b"seccomp") && at(b"seccomp") < at(b"sem"));
     }
 
+    /// A host whose random bytes are a new count at each call, so that
+    /// draws that should differ do.
+    struct Counting(std::sync::atomic::AtomicU8);
+    impl paludarium_host::Host for Counting {
+        fn read_stdin(&self, _: &mut [u8]) -> Result<usize, Errno> {
+            Ok(0)
+        }
+        fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno> {
+            Ok(buf.len())
+        }
+        fn write_stderr(&self, buf: &[u8]) -> Result<usize, Errno> {
+            Ok(buf.len())
+        }
+        fn random_bytes(&self, buf: &mut [u8]) -> Result<(), paludarium_types::Error> {
+            buf.fill(self.0.fetch_add(1, Ordering::SeqCst));
+            Ok(())
+        }
+    }
+
+    /// `uuid` is drawn anew at each read, `boot_id` once for the machine,
+    /// as `proc_do_uuid` draws them; the differential harness's host gives
+    /// the same bytes at each draw, so only here do they differ.
+    #[test]
+    fn uuid_is_new_at_each_read_and_boot_id_stays() {
+        let host = Counting(std::sync::atomic::AtomicU8::new(1));
+        let machine = Machine::default();
+        let uuid = |host: &Counting| Constant::Uuid.string(&machine, host);
+        let boot = Constant::BootId.string(&machine, &host);
+        let (one, two) = (uuid(&host), uuid(&host));
+        assert_ne!(one, two);
+        assert_ne!(one, boot);
+        assert_eq!(Constant::BootId.string(&machine, &host), boot);
+        assert_eq!(&boot[..], b"01010101-0101-4101-8101-010101010101");
+    }
+
     #[test]
     fn a_uuid_reads_as_percent_pu_prints_it() {
         let uuid: [u8; 16] = std::array::from_fn(|i| (i * 17) as u8);

@@ -3430,7 +3430,23 @@ impl Kernel {
         if flags & crate::namespaces::CLONE_NEWIPC != 0 {
             self.group.leave_shm(thread.tid);
         }
+        // Every unshare that succeeds tells perf the namespaces, new or not.
+        self.namespaces_record(thread);
         Ok(0)
+    }
+    /// `perf_event_namespaces` of the thread, after its `unshare` or `setns`.
+    fn namespaces_record(&self, thread: &Thread) {
+        let events = &self.processes.perf_events;
+        if !crate::perf::wanted(events) {
+            return;
+        }
+        let who = crate::perf::Who {
+            pid: self.process.pid,
+            tid: thread.tid,
+            cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+        };
+        let namespaces = self.group.namespaces(thread.tid);
+        crate::perf::namespaces(events, &self.group, &who, (who.pid, who.tid), &namespaces);
     }
     /// `setpriority(which, who, nice)`: sets the nice value of every thread
     /// the caller may change to `nice`, cut to -20..19, as Linux's
@@ -3680,6 +3696,7 @@ impl Kernel {
             self.group.set_task_ids(thread.tid, credentials.task_ids());
             thread.state.credentials = credentials;
         }
+        self.namespaces_record(thread);
         Ok(0)
     }
     /// `clone` of a new process, `fork` and `vfork` ([`Self::clone_process`]);

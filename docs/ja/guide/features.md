@@ -5156,6 +5156,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スレッドのものを）、`execve`（`PERF_RECORD_MISC_COMM_EXEC`）で書き、`execve` はそのあと新しい
   プログラムのスタックとマッピングを書きます。`PERF_RECORD_FORK` と `EXIT`
   （`task`、またはほかのどれか）は、スレッドが作られたときと終わったときに書きます。
+  `namespaces`（`CAP_PERFMON` が要ります）では、スレッドの名前空間の
+  `PERF_RECORD_NAMESPACES` を書きます。net、uts、ipc、pid、user、mnt、cgroup の
+  `/proc/<pid>/ns` のファイルそれぞれのデバイスと inode を含みます。新しいスレッドや子のものは
+  作ったスレッドが書きます。スレッドのものは、成功した `unshare` のたびに（新しい名前空間が
+  なくても）、また `setns` のたびに書きます。
   `cpu-clock` と `task-clock` のイベントは、ティックの割り込みが
   `perf_event_max_sample_rate` を `HZ` で割った数に届くと次のティックまで抑えられ、
   そのあいだは数えません。グループのリーダーの `PERF_RECORD_THROTTLE` と `UNTHROTTLE`

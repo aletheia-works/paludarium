@@ -436,7 +436,7 @@ verified.
   start-up) as if its pages were all cached, where Linux gives none for a
   page it has not read or has evicted; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
-  failed `clone` writes neither; and `NAMESPACES`, `CGROUP`,
+  failed `clone` writes neither; and `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
   written. When `REFRESH`'s last overflow disables the event, its count
   stops there, but its times (a clock's apart) and its group's other

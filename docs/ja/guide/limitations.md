@@ -369,7 +369,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ものとしてビルド ID を読みます。Linux は読んでいないか追い出したページからは与えません。
   ホストが始められなかったスレッドには `FORK` と `EXIT` の記録を書き、
   `EXIT` は CPU 0 のものとします。Linux の失敗した `clone` はどちらも書きません。
-  `NAMESPACES`、`CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、`SWITCH`、
+  `CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、`SWITCH`、
   `AUX` の記録は書きません。
   `REFRESH` の最後のオーバーフローがイベントを無効にするとき、数えるのはそこで止まりますが、
   その時間（時計のものを除きます）と、グループのほかのイベントは、そのときまで

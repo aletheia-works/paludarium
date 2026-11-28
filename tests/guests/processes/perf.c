@@ -2509,6 +2509,90 @@ static int case_side_band_comm(void) {
     return 0;
 }
 
+#define ATTR_NAMESPACES (1ULL << 28)
+#define RECORD_NAMESPACES 16
+
+/* The /proc/<pid>/ns files a NAMESPACES record gives, in its order. */
+static const char *const ns_names[7] = {"net", "uts", "ipc", "pid", "user", "mnt", "cgroup"};
+
+/* What each NAMESPACES record should give: the task's IDs and its
+   namespace files' devices and inodes, as stat found them. */
+struct ns_expected {
+    pid_t pid, tid, by;
+    uint64_t dev[7], ino[7];
+};
+
+struct ns_records {
+    struct ns_expected want[4];
+    int n, seen, others;
+};
+
+static void ns_stat(struct ns_expected *e, pid_t pid, pid_t tid, pid_t by) {
+    e->pid = pid;
+    e->tid = tid;
+    e->by = by;
+    for (int i = 0; i < 7; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "/proc/self/ns/%s", ns_names[i]);
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            e->dev[i] = st.st_dev;
+            e->ino[i] = st.st_ino;
+        }
+    }
+}
+
+static void say_namespaces(const uint64_t *record, void *with) {
+    struct ns_records *r = with;
+    uint64_t size = record[0] >> 48;
+    if ((uint32_t)record[0] != RECORD_NAMESPACES || r->seen >= r->n) {
+        r->others++;
+        return;
+    }
+    const struct ns_expected *e = &r->want[r->seen++];
+    const uint32_t *ids = (const uint32_t *)(record + 1);
+    const uint32_t *writer = (const uint32_t *)((const char *)record + size - 8);
+    char same[8] = {0};
+    for (int i = 0; i < 7 && record[2] == 7; i++)
+        same[i] = record[3 + 2 * i] == e->dev[i] && record[4 + 2 * i] == e->ino[i] ? '1' : '0';
+    say("namespaces size %llu nr %llu task %d by %d links %s", (unsigned long long)size,
+        (unsigned long long)record[2], ids[0] == (uint32_t)e->pid && ids[1] == (uint32_t)e->tid,
+        writer[0] == (uint32_t)getpid() && writer[1] == (uint32_t)e->by, same);
+}
+
+/* PERF_RECORD_NAMESPACES (namespaces, which takes CAP_PERFMON): of the
+   thread at every unshare, new namespaces or not, and at setns, and of a
+   child at fork, which its parent writes. */
+static int case_side_band_namespaces(void) {
+    void *page;
+    int fd = open_side_band(0, -1, ATTR_NAMESPACES, &page);
+    say("open %d", fd >= 0);
+    if (fd < 0) return 1;
+    pid_t pid = getpid(), tid = (pid_t)syscall(SYS_gettid);
+    struct ns_records r = {.n = 4};
+    int old_uts = open("/proc/self/ns/uts", O_RDONLY);
+    ioctl(fd, IOC_ENABLE, 0);
+    say("unshare nothing %d", unshare(0));
+    ns_stat(&r.want[0], pid, tid, tid);
+    say("unshare uts %d", unshare(CLONE_NEWUTS));
+    ns_stat(&r.want[1], pid, tid, tid);
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    ns_stat(&r.want[2], child, child, tid);
+    int status;
+    waitpid(child, &status, 0);
+    say("setns uts %d", setns(old_uts, CLONE_NEWUTS));
+    ns_stat(&r.want[3], pid, tid, tid);
+    /* A failed unshare writes none. */
+    say("unshare bad %d", unshare(CLONE_PTRACE) == -1 ? -errno : 0);
+    ioctl(fd, IOC_DISABLE, 0);
+    say("uts changed %d back %d", r.want[1].ino[1] != r.want[0].ino[1], r.want[3].ino[1] == r.want[0].ino[1]);
+    uint64_t tail = 0;
+    each_record(page, &tail, say_namespaces, &r);
+    say("records %d others %d", r.seen, r.others);
+    return 0;
+}
+
 static int case_side_band_exec(const char *self) {
     struct expected e;
     memset(&e, 0, sizeof e);
@@ -2623,6 +2707,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-throttle")) return case_throttle();
     if (!strcmp(mode, "perf-clock-samples")) return case_clock_samples();
     if (!strcmp(mode, "perf-fault-signals")) return case_fault_signals();
+    if (!strcmp(mode, "perf-side-band-namespaces")) return case_side_band_namespaces();
     if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {

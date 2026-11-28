@@ -358,6 +358,7 @@ mod linux {
                     | "perf-clock-samples"
                     | "perf-fault-signals"
                     | "perf-side-band-exec"
+                    | "perf-side-band-namespaces"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -854,6 +855,7 @@ mod linux {
         perf_clock_samples => ("perf-clock-samples","perf"),
         perf_fault_signals => ("perf-fault-signals","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
+        perf_side_band_namespaces => ("perf-side-band-namespaces","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),

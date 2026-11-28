@@ -6037,7 +6037,12 @@ kernel.
   (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack
   and mappings; and
   `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
-  that is made or ends. A `cpu-clock` or `task-clock` event whose
+  that is made or ends; and with `namespaces` (which takes `CAP_PERFMON`),
+  `PERF_RECORD_NAMESPACES` of a thread's namespaces, the device and inode
+  of each of its `/proc/<pid>/ns` files of net, uts, ipc, pid, user, mnt
+  and cgroup: of a new thread or child, written by its creator, and of a
+  thread after each `unshare` that succeeds, new namespaces or not, and
+  each `setns`. A `cpu-clock` or `task-clock` event whose
   interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
   throttled until the next tick, its count stopped meanwhile, with
   `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,

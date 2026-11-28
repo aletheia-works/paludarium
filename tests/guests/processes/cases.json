@@ -200,6 +200,7 @@
     {"name":"perf-clock-samples","binary":"perf"},
     {"name":"perf-fault-signals","binary":"perf"},
     {"name":"perf-side-band-exec","binary":"perf"},
+    {"name":"perf-side-band-namespaces","binary":"perf"},
     {"name":"bpf-calls","binary":"bpf"},
     {"name":"bpf-elements","binary":"bpf"},
     {"name":"bpf-batch","binary":"bpf"},

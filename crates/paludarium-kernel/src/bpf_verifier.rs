@@ -4202,10 +4202,12 @@ mod tests {
         let einval = |line: &str| (Errno::EINVAL, line.to_string());
         let ja = |off: i16| i(0x05, 0, 0, off, 0);
         let jeq = |off: i16| i(0x15, 0, 0, off, 0);
-        // A jump to an insn already followed to its end is no back-edge,
-        // and one to the insn itself is.
+        // A jump to an insn already followed to its end, forward or back,
+        // is no back-edge, and one to the insn itself is. (R0 is not known
+        // in the second, so that both sides of each jump are walked.)
+        ok(&[mov(0, 0), jeq(1), mov(0, 1), exit()]);
         let unknown = i(0x79, 0, 10, -8, 0);
-        ok(&[unknown, ja(1), exit(), jeq(-2), exit()]);
+        ok(&[unknown, jeq(1), exit(), jeq(-2), exit()]);
         assert_eq!(
             refused(&[mov(0, 0), ja(-1)]),
             einval("back-edge from insn 1 to 1")

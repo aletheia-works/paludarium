@@ -17,7 +17,7 @@ const CAP_SETUID: u64 = 1 << 7;
 const CAP_SETPCAP: u64 = 1 << 8;
 /// `CAP_LAST_CAP`, the highest capability `prctl` takes.
 pub(crate) const CAP_LAST_CAP: u64 = 40;
-const CAP_SYS_RAWIO: u64 = 1 << 17;
+pub(crate) const CAP_SYS_RAWIO: u64 = 1 << 17;
 const CAP_SYS_CHROOT: u64 = 1 << 18;
 pub(crate) const CAP_SYS_PTRACE: u64 = 1 << 19;
 const CAP_SYS_PACCT: u64 = 1 << 20;

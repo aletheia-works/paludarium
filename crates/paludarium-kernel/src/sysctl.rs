@@ -73,6 +73,17 @@
 //! `round_pipe_size` rounds it, which bounds the pipes of a user without
 //! `CAP_SYS_RESOURCE` ([`crate::sockets::PipeEnd::set_size`]).
 //!
+//! `/proc/sys/fs/suid_dumpable` is the machine's `int` from 0 to 2
+//! (`proc_dointvec_minmax`), root's of mode 0644, 0 at first: how dumpable
+//! a process becomes when its credentials change or it runs a program that
+//! it may not read or that sets its IDs ([`crate::processes::Dumpable`]).
+//! `/proc/sys/vm/mmap_min_addr` is the machine's `unsigned long`
+//! (`proc_doulongvec_minmax`), root's of mode 0644, 65536 at first, below
+//! which nothing is mapped without a fixed address, nor with one without
+//! `CAP_SYS_RAWIO` ([`paludarium_mmu::MinAddr`]); a write needs
+//! `CAP_SYS_RAWIO` (`EPERM`, before anything else), as
+//! `mmap_min_addr_handler` asks.
+//!
 //! `/proc/sys/kernel` also shows the names of the UTS namespace of who
 //! reads or writes ([`Uts`]), as `kernel/utsname_sysctl.c` has them: strings
 //! (`proc_dostring`), of which only root may write `hostname` and
@@ -448,6 +459,14 @@ pub(crate) enum Kernel {
     /// `unsigned int`s.
     NrOpen,
     PipeMaxSize,
+    /// `/proc/sys/fs/suid_dumpable` (`fs/exec.c`), the machine's `int`: how
+    /// dumpable a process becomes when its credentials change or its exec
+    /// is not of the same IDs ([`crate::processes::Dumpable`]).
+    SuidDumpable,
+    /// `/proc/sys/vm/mmap_min_addr` (`security/min_addr.c`), the machine's
+    /// `unsigned long`, which every address space looks at
+    /// ([`paludarium_mmu::MinAddr`]).
+    MmapMinAddr,
 }
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
@@ -619,6 +638,8 @@ impl Kernel {
                 | Self::PtraceScope
                 | Self::NrOpen
                 | Self::PipeMaxSize
+                | Self::SuidDumpable
+                | Self::MmapMinAddr
         )
     }
     /// Whether it is one of the IPC namespace's next IDs.
@@ -648,6 +669,11 @@ pub(crate) struct Machine {
     /// ([`crate::files::Files`]).
     pub(crate) nr_open: Arc<AtomicU32>,
     pipe_max_size: AtomicU32,
+    /// `fs.suid_dumpable`, 0 at first (`SUID_DUMP_DISABLE`).
+    suid_dumpable: AtomicI32,
+    /// `vm.mmap_min_addr`, which each address space of the machine shares
+    /// ([`paludarium_mmu::AddressSpace::with_min_addr`]).
+    pub(crate) mmap_min_addr: paludarium_mmu::MinAddr,
     /// `kernel.random.boot_id` once drawn (`sysctl_bootid`).
     boot_id: std::sync::OnceLock<[u8; 16]>,
     /// How often `kernel.hostname` and `kernel.domainname` changed, in any
@@ -671,6 +697,8 @@ impl Default for Machine {
             dir_notify_enable: AtomicI32::new(1),
             nr_open: Arc::new(AtomicU32::new(NR_OPEN)),
             pipe_max_size: AtomicU32::new(PIPE_MAX_SIZE),
+            suid_dumpable: AtomicI32::new(0),
+            mmap_min_addr: Arc::new(AtomicU64::new(paludarium_mmu::MMAP_MIN_ADDR)),
             boot_id: std::sync::OnceLock::new(),
             uts_events: Default::default(),
         }
@@ -736,6 +764,11 @@ impl Machine {
     pub(crate) fn pipe_max_size(&self) -> u32 {
         self.pipe_max_size.load(Ordering::SeqCst)
     }
+    /// How dumpable a process becomes when its credentials change or its
+    /// exec is not of the same IDs (`suid_dumpable`): 0, 1 or 2.
+    pub(crate) fn suid_dumpable(&self) -> i32 {
+        self.suid_dumpable.load(Ordering::SeqCst)
+    }
     /// Whether `F_NOTIFY` may be used (`dir_notify_enable`).
     pub(crate) fn dir_notify_enable(&self) -> bool {
         self.dir_notify_enable.load(Ordering::SeqCst) != 0
@@ -760,9 +793,13 @@ impl Machine {
         match file {
             Kernel::NrOpen => return format!("{}\n", self.nr_open()).into_bytes(),
             Kernel::PipeMaxSize => return format!("{}\n", self.pipe_max_size()).into_bytes(),
+            Kernel::MmapMinAddr => {
+                return format!("{}\n", self.mmap_min_addr.load(Ordering::SeqCst)).into_bytes();
+            }
             _ => {}
         }
         line(match file {
+            Kernel::SuidDumpable => self.suid_dumpable(),
             Kernel::PtraceScope => self.ptrace_scope(),
             Kernel::UnprivilegedUserfaultfd => self.unprivileged_userfaultfd.load(Ordering::SeqCst),
             Kernel::PerfCpuTimeMaxPercent => self.perf_cpu_time_max_percent.load(Ordering::SeqCst),
@@ -780,7 +817,7 @@ impl Machine {
     /// Takes a value written at the start of the file. Its writer has what
     /// the file asks for, which [`SettingFile::write_by`] checked:
     /// `CAP_SYS_PTRACE` for `ptrace_scope`, `CAP_SYS_ADMIN` for
-    /// `unprivileged_bpf_disabled`.
+    /// `unprivileged_bpf_disabled`, `CAP_SYS_RAWIO` for `mmap_min_addr`.
     fn write(&self, file: Kernel, buf: &[u8]) -> Result<usize, Errno> {
         // These take any `int` (`proc_dointvec`).
         if let Some(sysctl) = match file {
@@ -803,6 +840,24 @@ impl Machine {
                     return Err(Errno::EINVAL);
                 }
                 self.nr_open.store(value, Ordering::SeqCst);
+                return Ok(consumed);
+            }
+            // `proc_dointvec_minmax_coredump`: 0 to 2. Linux then only logs
+            // that 2 wants an absolute or pipe `core_pattern`, which the
+            // emulator's `core` never is (`validate_coredump_safety`).
+            Kernel::SuidDumpable => {
+                let (value, consumed) = parse(buf, Some((0, 2)))?;
+                self.suid_dumpable.store(value, Ordering::SeqCst);
+                return Ok(consumed);
+            }
+            // `mmap_min_addr_handler`: `proc_doulongvec_minmax` with no
+            // bounds.
+            Kernel::MmapMinAddr => {
+                let (negative, value, consumed) = scan(buf)?;
+                if negative {
+                    return Err(Errno::EINVAL);
+                }
+                self.mmap_min_addr.store(value, Ordering::SeqCst);
                 return Ok(consumed);
             }
             // `proc_dopipe_max_size`: the value, cut to an `unsigned int`,
@@ -966,6 +1021,7 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/fs/leases-enable" => Some(Entry::Kernel(Kernel::LeasesEnable)),
         b"/fs/nr_open" => Some(Entry::Kernel(Kernel::NrOpen)),
         b"/fs/pipe-max-size" => Some(Entry::Kernel(Kernel::PipeMaxSize)),
+        b"/fs/suid_dumpable" => Some(Entry::Kernel(Kernel::SuidDumpable)),
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
         b"/kernel/yama" => Some(Entry::Directory(Directory::Yama)),
         b"/kernel/yama/ptrace_scope" => Some(Entry::Kernel(Kernel::PtraceScope)),
@@ -975,6 +1031,7 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/vm" => Some(Entry::Directory(Directory::Vm)),
         b"/vm/drop_caches" => Some(Entry::DropCaches),
         b"/vm/max_map_count" => Some(Entry::Constant(Constant::MaxMapCount)),
+        b"/vm/mmap_min_addr" => Some(Entry::Kernel(Kernel::MmapMinAddr)),
         b"/vm/unprivileged_userfaultfd" => Some(Entry::Kernel(Kernel::UnprivilegedUserfaultfd)),
         _ => {
             if let Some(rest) = rest.strip_prefix(b"/net")
@@ -1039,6 +1096,7 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
         Directory::Vm => vec![
             (b"drop_caches", DT_REG),
             (b"max_map_count", DT_REG),
+            (b"mmap_min_addr", DT_REG),
             (b"unprivileged_userfaultfd", DT_REG),
         ],
         Directory::Net => vec![(b"ipv4", DT_DIR), (b"ipv6", DT_DIR)],
@@ -1072,6 +1130,7 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
             (b"mqueue", DT_DIR),
             (b"nr_open", DT_REG),
             (b"pipe-max-size", DT_REG),
+            (b"suid_dumpable", DT_REG),
         ],
         Directory::Mqueue => SETTINGS.iter().map(|&(name, _)| (name, DT_REG)).collect(),
         Directory::Inotify => INOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
@@ -1154,6 +1213,7 @@ fn child(
         Directory::Vm => match name {
             b"drop_caches" => Some(Entry::DropCaches),
             b"max_map_count" => Some(Entry::Constant(Constant::MaxMapCount)),
+            b"mmap_min_addr" => Some(Entry::Kernel(Kernel::MmapMinAddr)),
             b"unprivileged_userfaultfd" => Some(Entry::Kernel(Kernel::UnprivilegedUserfaultfd)),
             _ => None,
         },
@@ -1211,6 +1271,7 @@ fn child(
             b"mqueue" => dir(Directory::Mqueue),
             b"nr_open" => Some(Entry::Kernel(Kernel::NrOpen)),
             b"pipe-max-size" => Some(Entry::Kernel(Kernel::PipeMaxSize)),
+            b"suid_dumpable" => Some(Entry::Kernel(Kernel::SuidDumpable)),
             _ => None,
         },
         Directory::Mqueue => find(&SETTINGS.map(|(n, s)| (n, Entry::Setting(s)))),
@@ -1291,7 +1352,9 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         | Kernel::UnprivilegedUserfaultfd
         | Kernel::PtraceScope
         | Kernel::NrOpen
-        | Kernel::PipeMaxSize => Vec::new(),
+        | Kernel::PipeMaxSize
+        | Kernel::SuidDumpable
+        | Kernel::MmapMinAddr => Vec::new(),
     }
 }
 
@@ -1376,7 +1439,9 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
         | Kernel::UnprivilegedUserfaultfd
         | Kernel::PtraceScope
         | Kernel::NrOpen
-        | Kernel::PipeMaxSize => Err(Errno::EINVAL),
+        | Kernel::PipeMaxSize
+        | Kernel::SuidDumpable
+        | Kernel::MmapMinAddr => Err(Errno::EINVAL),
     }
 }
 
@@ -1701,6 +1766,7 @@ pub(crate) fn open(
         value,
         admin: credentials.capable(crate::credentials::CAP_SYS_ADMIN),
         ptrace: credentials.capable(crate::credentials::CAP_SYS_PTRACE),
+        rawio: credentials.may_map_low(),
         net_admin,
         writers,
         stat: stat(c, entry),
@@ -2148,6 +2214,9 @@ struct SettingFile {
     /// Whether the opener had `CAP_SYS_PTRACE`, which `ptrace_scope` asks
     /// of a write that does not say who makes it.
     ptrace: bool,
+    /// Whether the opener had `CAP_SYS_RAWIO`, which `mmap_min_addr` asks
+    /// of a write that does not say who makes it.
+    rawio: bool,
     /// Whether the opener had `CAP_NET_ADMIN` over the network namespace,
     /// for a write of `/proc/sys/net` that does not say who makes it.
     net_admin: bool,
@@ -2172,7 +2241,7 @@ impl SettingFile {
         if self.flags & 3 == 0 {
             return Err(Errno::EBADF);
         }
-        let (admin, ptrace, net_admin) = match writer {
+        let (admin, ptrace, rawio, net_admin) = match writer {
             Some(credentials) => {
                 if !self.writers.allow(credentials) {
                     return Err(Errno::EPERM);
@@ -2180,15 +2249,18 @@ impl SettingFile {
                 (
                     credentials.capable(crate::credentials::CAP_SYS_ADMIN),
                     credentials.capable(crate::credentials::CAP_SYS_PTRACE),
+                    credentials.may_map_low(),
                     self.writers.net_admin(credentials),
                 )
             }
-            None => (self.admin, self.ptrace, self.net_admin),
+            None => (self.admin, self.ptrace, self.rawio, self.net_admin),
         };
-        // `yama_dointvec_minmax` and `bpf_unpriv_handler` ask before
-        // `proc_dointvec_minmax` looks at what is written or where.
+        // `yama_dointvec_minmax`, `bpf_unpriv_handler` and
+        // `mmap_min_addr_handler` ask before the value's handler looks at
+        // what is written or where.
         match self.value {
             Value::Machine(_, Kernel::PtraceScope) if !ptrace => return Err(Errno::EPERM),
+            Value::Machine(_, Kernel::MmapMinAddr) if !rawio => return Err(Errno::EPERM),
             Value::Machine(_, Kernel::UnprivilegedBpfDisabled) if !admin => {
                 return Err(Errno::EPERM);
             }
@@ -2517,7 +2589,15 @@ mod tests {
             lookup(b"/proc/sys/fs/dir-notify-enable", None),
             Some(Entry::Kernel(Kernel::DirNotifyEnable))
         );
-        assert_eq!(entries_of(Directory::Fs, None).len(), 12);
+        assert_eq!(entries_of(Directory::Fs, None).len(), 13);
+        assert_eq!(
+            lookup(b"/proc/sys/fs/suid_dumpable", None),
+            Some(Entry::Kernel(Kernel::SuidDumpable))
+        );
+        assert_eq!(
+            lookup(b"/proc/sys/vm/mmap_min_addr", None),
+            Some(Entry::Kernel(Kernel::MmapMinAddr))
+        );
         assert_eq!(
             lookup(b"/proc/sys/fs/nr_open", None),
             Some(Entry::Kernel(Kernel::NrOpen))
@@ -2556,7 +2636,7 @@ mod tests {
             lookup(b"/proc/sys/vm/drop_caches", None),
             Some(Entry::DropCaches)
         );
-        assert_eq!(entries_of(Directory::Vm, None).len(), 5);
+        assert_eq!(entries_of(Directory::Vm, None).len(), 6);
         assert_eq!(
             lookup(b"/proc/sys/vm/max_map_count", None),
             Some(Entry::Constant(Constant::MaxMapCount))

@@ -448,7 +448,8 @@ impl Session {
         let mut mem = match self.config.limits.memory {
             Some(max) => AddressSpace::new().with_memory_meter(Arc::new(MemoryMeter::new(max))),
             None => AddressSpace::new(),
-        };
+        }
+        .with_min_addr(kernel.mmap_min_addr());
         // As `load` finds an interpreter, whose mappings hold its file.
         let image = load_with(&*fs, &loaded, &start, &mut mem, &mut |name| {
             let path = paludarium_vfs::normalize_path(name)?;

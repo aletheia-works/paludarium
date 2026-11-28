@@ -712,6 +712,7 @@ mod linux {
         processes_dev_tty_node => ("dev-tty-node", "process"),
         processes_dgram => ("dgram", "process"),
         processes_dontneed_read_only_segment => ("dontneed-read-only-segment", "process"),
+        processes_dump_min_sysctls => ("dump-min-sysctls", "process"),
         processes_dynamic => ("dynamic", "dynamic"),
         processes_dynamic_exec => ("dynamic-exec", "process", root),
         processes_dynamic_glibc => ("dynamic-glibc", "dynamic-glibc"),
@@ -840,6 +841,8 @@ mod linux {
         processes_madvise_fork => ("madvise-fork", "process"),
         processes_madvise_guard => ("madvise-guard", "process"),
         processes_madvise_remove => ("madvise-remove", "process"),
+        // Becomes nobody for its names.
+        processes_magic_link_names => ("magic-link-names", "process", root),
         processes_map_count => ("map-count", "process", root),
         // Reads maps across a chroot.
         processes_maps_root => ("maps-root", "process", root),

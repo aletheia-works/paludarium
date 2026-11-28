@@ -1466,6 +1466,39 @@ pub(crate) fn named_at(c: &Context<'_>, name: u64) -> Result<FileStat, Errno> {
 pub(crate) fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     through_magic_links(c, string(c, addr)?)
 }
+/// [`path`] for a call that makes or removes the last name (or, for
+/// `rename`, takes it away): only the magic links before it are jumped
+/// through. A trailing slash does not make the last name one to go on
+/// from, as Linux's walk to the parent leaves it to the call's own lookup,
+/// which finds the link itself there (`EEXIST`, `EISDIR`, `ENOTDIR`).
+fn name_path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
+    let p = string(c, addr)?;
+    let end = p
+        .iter()
+        .rposition(|&b| b != b'/')
+        .map_or(p.len(), |at| at + 1);
+    let through = through_magic_links(c, p[..end].to_vec())?;
+    // A link of `/dev` on the way (`/dev/fd/3`) is followed too, so the
+    // name is one of the directory it leads to (`/proc/self/fd`); under a
+    // root of its own, `/dev` is whatever that root holds.
+    let mut through = if c.files.root() == b"/" {
+        crate::devices::through_link(&through).unwrap_or(through)
+    } else {
+        through
+    };
+    through.extend_from_slice(&p[end..]);
+    Ok(through)
+}
+/// [`path`], or [`name_path`] for an open that may make the file
+/// (`O_CREAT`).
+fn open_path_at(c: &Context<'_>, addr: u64, flags: u64) -> Result<Vec<u8>, Errno> {
+    const O_CREAT: u64 = 0o100;
+    if flags & O_CREAT != 0 {
+        name_path(c, addr)
+    } else {
+        path(c, addr)
+    }
+}
 /// Path `p` with each magic link it goes through, a link in a process's
 /// `fd` directory, its `cwd` or `exe`, which Linux's walk (`nd_jump_link`)
 /// does not read but jumps to the file of, replaced by that file's path: a
@@ -2757,7 +2790,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     let follow = flags & AT_SYMLINK_FOLLOW != 0;
     let old_raw = path(c, old_ptr)?;
     if !(old_raw.is_empty() && flags & AT_EMPTY_PATH != 0) {
-        let new_raw = path(c, new_ptr)?;
+        let new_raw = name_path(c, new_ptr)?;
         let old_name = queue_name(&c.files.path(old_dir, old_raw.clone())?);
         let new_name = queue_name(&c.files.named_parent_linked(new_dir, new_raw.clone())?);
         if old_name.is_some() || new_name.is_some() {
@@ -2774,7 +2807,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     if old_raw.is_empty() && flags & AT_EMPTY_PATH != 0 && old_dir as i32 != -100 {
         let d = c.files.descriptor(old_dir)?;
         if crate::mqueue::is_queue(&*d.file) {
-            let new_raw = path(c, new_ptr)?;
+            let new_raw = name_path(c, new_ptr)?;
             let new = c.files.named_parent_linked(new_dir, new_raw.clone())?;
             let name = queue_name(&new);
             match &name {
@@ -2815,7 +2848,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
             },
         }
     };
-    let new_raw = path(c, new_ptr)?;
+    let new_raw = name_path(c, new_ptr)?;
     let new = c.files.named_parent_linked(new_dir, new_raw.clone())?;
     if let Followed::Path { path, .. } = &target
         && let Some(found) = generated_names::link_from(c, &old_raw, path, follow)
@@ -5988,9 +6021,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         2 | 85 | 257 => {
             let (dir, raw, flags, mode) = match n {
-                2 => ((-100i32) as u64, path(c, a[0])?, a[1], a[2]),
-                85 => ((-100i32) as u64, path(c, a[0])?, 577, a[1]),
-                _ => (a[0], path(c, a[1])?, a[2], a[3]),
+                2 => ((-100i32) as u64, open_path_at(c, a[0], a[1])?, a[1], a[2]),
+                85 => ((-100i32) as u64, name_path(c, a[0])?, 577, a[1]),
+                _ => (a[0], open_path_at(c, a[1], a[2])?, a[2], a[3]),
             };
             open_at(c, dir, raw, flags, mode as u32, 0)
         }
@@ -6408,11 +6441,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let flags = flags as u32;
             let ((old_dir, old_raw), (new_dir, new_raw)) = if n == 82 {
                 (
-                    ((-100i32) as u64, path(c, a[0])?),
-                    ((-100i32) as u64, path(c, a[1])?),
+                    ((-100i32) as u64, name_path(c, a[0])?),
+                    ((-100i32) as u64, name_path(c, a[1])?),
                 )
             } else {
-                ((a[0], path(c, a[1])?), (a[2], path(c, a[3])?))
+                ((a[0], name_path(c, a[1])?), (a[2], name_path(c, a[3])?))
             };
             let old = c.files.named_parent_linked(old_dir, old_raw.clone())?;
             let new = c.files.named_parent_linked(new_dir, new_raw.clone())?;
@@ -6495,9 +6528,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         83 | 258 => {
             let (dir, raw, mode) = if n == 83 {
-                ((-100i32) as u64, path(c, a[0])?, a[1])
+                ((-100i32) as u64, name_path(c, a[0])?, a[1])
             } else {
-                (a[0], path(c, a[1])?, a[2])
+                (a[0], name_path(c, a[1])?, a[2])
             };
             let p = c.files.named_parent_linked(dir, raw.clone())?;
             if queue_root(&p) {
@@ -6535,9 +6568,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         133 | 259 => {
             let (dir, raw, mode, dev) = if n == 133 {
-                ((-100i32) as u64, path(c, a[0])?, a[1] as u32, a[2] as u32)
+                (
+                    (-100i32) as u64,
+                    name_path(c, a[0])?,
+                    a[1] as u32,
+                    a[2] as u32,
+                )
             } else {
-                (a[0], path(c, a[1])?, a[2] as u32, a[3] as u32)
+                (a[0], name_path(c, a[1])?, a[2] as u32, a[3] as u32)
             };
             mknod(c, dir, &raw, mode, dev)?;
             Ok(0)
@@ -6547,9 +6585,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 if a[2] & !512 != 0 {
                     return Err(Errno::EINVAL);
                 }
-                (a[0], path(c, a[1])?, a[2] & 512 != 0)
+                (a[0], name_path(c, a[1])?, a[2] & 512 != 0)
             } else {
-                ((-100i32) as u64, path(c, a[0])?, n == 84)
+                ((-100i32) as u64, name_path(c, a[0])?, n == 84)
             };
             let p = c.files.named_parent_linked(at_dir, raw.clone())?;
             if let Some(name) = paludarium_vfs::normalize_path(&p)
@@ -6586,9 +6624,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         88 | 266 => {
             let target = string(c, a[0])?;
             let (dir, raw) = if n == 88 {
-                ((-100i32) as u64, path(c, a[1])?)
+                ((-100i32) as u64, name_path(c, a[1])?)
             } else {
-                (a[1], path(c, a[2])?)
+                (a[1], name_path(c, a[2])?)
             };
             let p = c.files.named_parent_linked(dir, raw.clone())?;
             if queue_root(&p) {
@@ -8093,7 +8131,7 @@ pub(crate) fn open_how(
     // With `RESOLVE_*` flags its own walk meets each magic link, which they
     // may refuse; without, the path is taken as `openat` takes it.
     let raw = if resolve & !RESOLVE_CACHED == 0 {
-        path(c, at)?
+        open_path_at(c, at, flags)?
     } else {
         string(c, at)?
     };
@@ -9998,7 +10036,7 @@ fn own_owner(c: &Context<'_>) -> (u32, u32) {
     let dumpable = c
         .processes
         .view(c.process.pid)
-        .is_none_or(|view| view.dumpable);
+        .is_none_or(|view| view.dumpable.user());
     let creds = &c.process.credentials;
     if dumpable {
         (creds.euid, creds.egid)

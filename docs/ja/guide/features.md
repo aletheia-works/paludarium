@@ -595,6 +595,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   終わります。埋め込む側が決めた開けるファイルの天井は、root が `nr_open` に何を書いても、
   `nr_open` とは別にハードの上限を縛ります。
 
+- `/proc/sys/fs/suid_dumpable`（最初は 0）はマシン全体のもので、0 から 2 の `int` を
+  受け取る root のモード 0644 のファイルです（`proc_dointvec_minmax`、それ以外は
+  `EINVAL`）。Linux の `commit_creds` と `begin_new_exec` と同じく、実効 ID か
+  ファイルシステム用の ID が変わったあとと、読めないプログラムや ID の違う `execve` の
+  あとに、プロセスがどれだけダンプできるかを決めます。0 ならダンプできず、1 なら
+  でき、2 なら root としてだけできます（`SUID_DUMP_ROOT`）。2 は `PR_GET_DUMPABLE`
+  が 2 と返し、ほかの確認はすべてダンプできないものとして扱います。`/proc` の
+  ファイルは root のもので、読むのもトレースするのも `CAP_SYS_PTRACE` が要り、
+  コアも書きません。Linux はそのようなコアを絶対パスかパイプにしか書かず、`core` は
+  どちらでもないからです。
+
 - パイプは Linux と同じく 1 ページのバッファーを 16 個（64 KiB）持ちます。`fcntl` の
   `F_SETPIPE_SZ` と `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。
   大きさは 1 ページ以上の 2 のべき乗で、使っているバッファーより少なくすると `EBUSY`、
@@ -1645,7 +1656,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   アクセスや、そこへのシグナルフレームの書き込み、システムコール自身のそこへのコピー
   （`do_user_addr_fault` はカーネルのアクセスも同じに扱います）、`ptrace` や
   `/proc/<pid>/mem` のそこへのアクセス（`__access_remote_vm`。アクセスする側の上限の
-  中で）で、そのページまで下に伸び、アクセスはやり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
+  中で）で、そのページまで下に伸び、アクセスはやり直されます。
+  `/proc/sys/vm/mmap_min_addr`（最初は 64 KiB）より下、下に伸びずアクセスできるマッピングの
   上の 256 ページの guard gap（`stack_guard_gap`）の中、VMA 全体で `RLIMIT_STACK` を
   超えるところ、ロックされていれば `CAP_IPC_LOCK` なしで `RLIMIT_MEMLOCK` を超える
   ところへは伸びず、そのアクセスは `SIGSEGV` になります。その下の gap には、ヒントでも、
@@ -1667,8 +1679,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   2 GiB に置きます。空いていて 2 GiB までに終わるヒントならそこに、そうでなければ 1 GiB から上の
   いちばん低い空き（Linux は最大 32 MiB 上から、ランダムに始めます）に置き、そこでも 2 MiB の境目
   への配置に従います。空きがなければ `ENOMEM` です。`MAP_FIXED` はこれより優先し、`mremap` は
-  これに従いません。`mmap_min_addr`
-  （64 KiB）より低いヒントは、そのアドレスとして扱います。それより下への固定のマッピングと、`mremap`
+  これに従いません。`/proc/sys/vm/mmap_min_addr`
+  （最初は 64 KiB）より低いヒントは、それをページに切り上げたアドレスとして扱い
+  （`round_hint_to_min`）、どちらのレイアウトでも、固定のアドレスのないマッピングは
+  それより下に置きません。それより下への固定のマッピングと、`mremap`
   によるそこへの移動（移動先をアンマップし、元を縮めたあと。`MREMAP_DONTUNMAP` だけで求めた空き
   アドレスへも）と、そこへの `shmat` は、`CAP_SYS_RAWIO` がなければ `EPERM` です。
 
@@ -1713,10 +1727,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     成功してマップされたまま残します。
   - `fork` の子は封印を受け継ぎ、`exec` のあとは何も封印されていません。
 
-- io_uring は Linux 6.12 のものですが、登録したファイル、バッファーのグループ、NOP の
-  フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
-  `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。知っている操作、登録、setup と
-  `io_uring_enter` のフラグも Linux 7.0 のものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
+- io_uring は、差分テストを走らせるカーネルである Linux 7.0 のもので、テストのランナーのカーネルに
+  ある Linux master の変更（NOP の `IOSQE_FIXED_FILE` など）も含みます。操作、登録、setup と
+  `io_uring_enter` のフラグは、それが知っているものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と `_EPOLL_WAIT`、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`_READV_FIXED`、`_WRITEV_FIXED`、
   `IORING_OP_FILES_UPDATE`、
@@ -1934,7 +1947,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   取ります。切り詰めることになるバッファーは、リングが `IOU_PBUF_RING_INC` でなければ次に残し、
   最後のバッファーを取るとグループは空になります。何か送ったバンドルは `IORING_CQE_F_MORE` 付きで投稿して、長さなしの新しいバッファーで
   すぐにまた送り、何も送らなくなるか、グループの最後のバッファーを取るか、待ったところで終わります
-  （`io_send_finish`）。バッファーを選ばないものは、2 度目には何も送りません。`MSG_WAITALL` では、
+  （`io_send_finish`）。バッファーを選ばないものは、2 度目には何も送りません。バッファーを選ぶ
+  `IORING_RECVSEND_BUNDLE` の `IORING_OP_RECV` は、長さに要るだけのリングのバッファーに受信します。
+  長さを頼まなければ、ソケットが最後に告げた量に要るだけで（最初は 1 個）、最大 256 個、マルチショットの
+  受信なら残りの量までです（`io_recv_buf_select`）。見つからないグループは `ENOENT` で、提供された
+  バッファーのグループは 1 個を返します。1 バイトでも埋めたバッファーを使い、完了は最初のものを示します。
+  すべて埋めて、ソケットにまだあり、最初のものを切り詰めていなければ、一度だけその量をもう一度受信して
+  同じ完了に足します（`io_recv_finish`）。グループの最後のバッファーを取ったものは、マルチショットでも
+  `IORING_CQE_F_MORE` なしで完了します。`IORING_OP_RECVMSG` はバンドルを取りません（`EINVAL`）。`MSG_WAITALL` では、
   ストリームまたは順序付きパケットのソケットの送受信は長さ全体まで続け、動かした分をすべて
   返します。途中で失敗したもの（待たないように頼んだものや、取り消されたもの）も、それまでに動かした分を
   返します（`io_sendrecv_fail`）。受信は提供されたバッファーを選べ（`ENOBUFS`）、そのバッファーは、Linux master の
@@ -3637,8 +3657,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   アンビエントのものを失います。実効 ID が root でなくなると実効
   ケーパビリティを失い、root に戻ると取り戻します。ファイルシステム用の ID も、
   ファイルシステムのケーパビリティについて同じです。実効 ID かファイルシステム用の
-  ID が変わると、プロセスはダンプできなくなり（`fs.suid_dumpable` は 0）、親の
-  終了で受けるシグナルも消えます。`execve` は、set-user-ID のプログラムならその
+  ID が変わると、プロセスは `/proc/sys/fs/suid_dumpable` のとおりにダンプできる
+  ようになり（最初はダンプできません）、親の終了で受けるシグナルも消えます。`execve` は、set-user-ID のプログラムならその
   持ち主を実効ユーザー ID にし、set-group-ID のプログラムなら、グループが実行できる
   ときにそのグループを実効グループ ID にします。`PR_SET_NO_NEW_PRIVS` があれば
   これらのビットを無視します。それでも実効 ID が変わる（ファイルシステム用の
@@ -3884,7 +3904,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `openat2` は自身の解決の中で扱います）。`execve` も同じで、`/proc/self/fd/3/program` は
   ディスクリプタ 3 が持つディレクトリの中の `program` を動かします。`/proc` のディスクリプタや
   `/proc` の中の作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
-  Unix ソケットのアドレスは扱いません。
+  Unix ソケットのアドレスは扱いません。最後の名前であるリンクは、その名前を作る、消す、名前を
+  変える呼び出し（`mkdir`、`mknod`、`symlink`、`link`、`unlink`、`rmdir`、`rename`、
+  `O_CREAT` 付きの `open`）では、末尾にスラッシュがあっても飛び越えません。Linux の親までの
+  探索と同じく、呼び出しはリンクそのものを見つけます。`mkdir("/proc/self/fd/0/")` は
+  `EEXIST`、その `unlink` は `ENOTDIR` です。途中の `/dev` のリンクもたどるので、`/dev/fd` の
+  名前は `/proc/self/fd` の名前で、そこでの `rename` や `link` は `EXDEV` ではなく procfs の
+  上のものです。
 
 - `/proc` にあるのは、ほかには `/proc/cpuinfo`（後述）、`/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/version` などほかのシステムのファイル（後述）、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、
@@ -4354,8 +4380,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ポーリングが、`POLLOUT` のない `POLLIN`、`POLLRDNORM`、`POLLERR`、`POLLPRI` を返します。
   見たかどうかは `dup` と子で共有します。それを見張る epoll のポーリングも、見たことになります。
 
-- `/proc/sys/vm` にあるのは `drop_caches`、`max_map_count`、`unprivileged_userfaultfd`
-  だけなので、ほかの `vm` の sysctl もある Linux とは一覧が違います。`max_map_count` は
+- `/proc/sys/vm` にあるのは `drop_caches`、`max_map_count`、`mmap_min_addr`、
+  `unprivileged_userfaultfd` だけなので、ほかの `vm` の sysctl もある Linux とは一覧が
+  違います。`mmap_min_addr` はマシン全体のもので、最初は 65536、root のモード 0644 の
+  ファイルです。`unsigned long` を受け取り（`proc_doulongvec_minmax`、`-` は `EINVAL`）、
+  `mmap_min_addr_handler` と同じく、`CAP_SYS_RAWIO` のない書き手は書けません（何より先に
+  `EPERM`。空の書き込みも同じです）。マシンのアドレス空間はすべて、すぐにこれに従います。
+  ヒント、配置、`mremap`、スタックの伸び、`userfaultfd` の範囲、`MMAP_PAGE_ZERO` です。`max_map_count` は
   マシンの 65530（`DEFAULT_MAX_MAP_COUNT`）で、root のモード 0444 のファイルです。ここでは
   プロセスのマッピングをこれで縛らないので、誰も書くために開けません（`EACCES`）。
   `unprivileged_userfaultfd` は
@@ -6045,7 +6076,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux の `forget_original_parent` と同じく、各スレッドのシグナルは、そのプロセスを
   作った親のスレッドが終わったときに、親が動き続けていてもプロセスに送り、そのあと
   親になったスレッドが終わるたびにまた送ります）、`PR_SET_DUMPABLE`
-  （`execve` は、上に書いた場合のほかは、またダンプできるようにします）、
+  （0 か 1 で、ほかは `EINVAL`。`fs.suid_dumpable` の 2 がそうしたあとは
+  `PR_GET_DUMPABLE` が 2 も返します。`execve` は、上に書いた場合のほかは、また
+  ダンプできるようにします）、
   `PR_SET_KEEPCAPS`（スレッドごとで、`execve` で消えます）、ケーパビリティモジュールの
   `PR_CAPBSET_READ`、`PR_CAPBSET_DROP`（`CAP_SETPCAP` が要ります）、`PR_GET_SECUREBITS`、
   `PR_SET_SECUREBITS`（ロックされたビットは変えません。`CAP_SETPCAP` がなければ、

@@ -160,10 +160,11 @@ fn map(
         // to a huge page.
         let hint = match addr & !4095 {
             0 => None,
-            hint => hint
-                .max(paludarium_mmu::MMAP_MIN_ADDR)
-                .checked_next_multiple_of(HUGE_PAGE)
-                .map(GuestAddr),
+            hint if hint < c.mem.min_addr() => match crate::syscalls::hint_floor(c) {
+                0 => None,
+                floor => floor.checked_next_multiple_of(HUGE_PAGE).map(GuestAddr),
+            },
+            hint => hint.checked_next_multiple_of(HUGE_PAGE).map(GuestAddr),
         };
         let (size, offset) = (HUGE_PAGE, 0);
         if r.low {

@@ -30,6 +30,39 @@ fn process_of(entries: &BTreeMap<u32, Entry>, tid: u32) -> Option<u32> {
         .map(|(&pid, _)| pid)
 }
 
+/// How dumpable a process is, as Linux's `SUID_DUMP_*`: who may read its
+/// `/proc` files, trace it and see its events, and whether a fatal signal
+/// dumps its core.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Dumpable {
+    /// `SUID_DUMP_DISABLE`: not dumpable.
+    Disable = 0,
+    /// `SUID_DUMP_USER`: dumpable, as a process is at first.
+    #[default]
+    User = 1,
+    /// `SUID_DUMP_ROOT`: dumpable only by root and to a safe place, which
+    /// `fs.suid_dumpable` 2 makes a process whose credentials changed; to
+    /// everything else not dumpable.
+    Root = 2,
+}
+
+impl Dumpable {
+    /// What a change of credentials, or an exec not of the same IDs, leaves
+    /// a process when `fs.suid_dumpable` is `value` (`set_dumpable`).
+    fn after_change(value: i32) -> Self {
+        match value {
+            1 => Self::User,
+            2 => Self::Root,
+            _ => Self::Disable,
+        }
+    }
+    /// Whether it is dumpable as its user (`SUID_DUMP_USER`), which every
+    /// check but the core dump's asks (`get_dumpable(mm) != SUID_DUMP_USER`).
+    pub(crate) fn user(self) -> bool {
+        self == Self::User
+    }
+}
+
 /// Whom a process let attach to it with Yama's `PR_SET_PTRACER`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ptracer {
@@ -73,7 +106,7 @@ struct Entry {
     /// parent-death signals come from.
     last_thread: Option<(u32, TaskIds)>,
     /// PR_SET_DUMPABLE and PR_SET_NO_NEW_PRIVS, recorded for PR_GET_*.
-    dumpable: bool,
+    dumpable: Dumpable,
     no_new_privs: bool,
     /// The user namespace its program runs in, where a reader of an
     /// undumpable process needs `CAP_SYS_PTRACE` (Linux's
@@ -217,7 +250,7 @@ pub(crate) struct ProcessView {
     /// The resource limits, soft and hard, which `/proc/<pid>/limits` shows.
     pub limits: [(u64, u64); RLIMITS],
     pub no_new_privs: bool,
-    pub dumpable: bool,
+    pub dumpable: Dumpable,
     /// The user namespace its program runs in ([`Entry::exec_user`]).
     pub exec_user: crate::users::UserNs,
     /// It has ended and waits to be reaped.
@@ -344,7 +377,7 @@ impl Processes {
                     limits: DEFAULT_LIMITS,
                     death_signals: BTreeMap::new(),
                     last_thread: None,
-                    dumpable: true,
+                    dumpable: Dumpable::User,
                     no_new_privs: false,
                     exec_user: crate::users::UserNs::default(),
                     stop_report: None,
@@ -555,7 +588,7 @@ impl Processes {
                     pid,
                     0,
                     DEFAULT_LIMITS,
-                    (true, Default::default()),
+                    (Dumpable::User, Default::default()),
                     (false, (0, 0)),
                     None,
                 ),
@@ -624,9 +657,15 @@ impl Processes {
             }
             2 => Ok(Some(entry.death_signals.get(&tid).copied().unwrap_or(0))),
             // PR_GET_DUMPABLE, PR_SET_DUMPABLE
-            3 => Ok(Some(i32::from(entry.dumpable))),
+            // PR_GET_DUMPABLE gives 2 too, which PR_SET_DUMPABLE does not
+            // take (`EINVAL`).
+            3 => Ok(Some(entry.dumpable as i32)),
             4 if a[1] <= 1 => {
-                entry.dumpable = a[1] == 1;
+                entry.dumpable = if a[1] == 1 {
+                    Dumpable::User
+                } else {
+                    Dumpable::Disable
+                };
                 Ok(None)
             }
             // PR_SET_CHILD_SUBREAPER, PR_GET_CHILD_SUBREAPER (written out by
@@ -1020,12 +1059,14 @@ impl Processes {
         })
     }
     /// An effective or filesystem ID of thread `tid` changed: its process
-    /// becomes undumpable (`fs.suid_dumpable`, 0 by default) and the thread
-    /// forgets its parent-death signal, as Linux's `commit_creds` does.
+    /// becomes as dumpable as `fs.suid_dumpable` says (0, undumpable, by
+    /// default) and the thread forgets its parent-death signal, as Linux's
+    /// `commit_creds` does.
     pub(crate) fn credentials_changed(&self, pid: u32, tid: u32) {
+        let after = Dumpable::after_change(self.sysctls.suid_dumpable());
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
-            entry.dumpable = false;
+            entry.dumpable = after;
             entry.death_signals.remove(&tid);
         }
     }
@@ -1104,7 +1145,8 @@ impl Processes {
             }
         }
     }
-    /// After exec, the process is dumpable or not, its program runs in user
+    /// After exec, the process is dumpable, or with `dumpable` false as
+    /// dumpable as `fs.suid_dumpable` says, its program runs in user
     /// namespace `exec_user`, it may forget its parent-death signal, and a
     /// secure exec lowers its RLIMIT_STACK soft limit to 8 MiB (`_STK_LIM`),
     /// as Linux's `begin_new_exec` does.
@@ -1115,6 +1157,11 @@ impl Processes {
         forget_death_signal: bool,
         secure: bool,
     ) {
+        let dumpable = if dumpable {
+            Dumpable::User
+        } else {
+            Dumpable::after_change(self.sysctls.suid_dumpable())
+        };
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
             entry.dumpable = dumpable;
@@ -1930,11 +1977,14 @@ impl Processes {
     }
     /// The RLIMIT_CORE soft limit of `pid` when a fatal signal may dump its
     /// core: the process is dumpable and the limit is at least one page.
+    /// One that `fs.suid_dumpable` 2 left dumpable as root dumps only to an
+    /// absolute path or a pipe, which the `core_pattern` here (`core`)
+    /// never is, so it writes none either (`coredump_force_suid_safe`).
     pub(crate) fn core_limit(&self, pid: u32) -> Option<u64> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = entries.get(&pid)?;
         let limit = entry.limits[4].0;
-        (entry.dumpable && limit >= crate::coredump::MIN_LIMIT).then_some(limit)
+        (entry.dumpable.user() && limit >= crate::coredump::MIN_LIMIT).then_some(limit)
     }
     /// Who `pid` is, for its core, whose leader has the IDs `leader`.
     pub(crate) fn core_identity(
@@ -3597,7 +3647,7 @@ impl Kernel {
                 if pidfd.pid != self.process.pid
                     && !thread.state.credentials.may_read_ids(
                         &target,
-                        (view.dumpable, &view.exec_user),
+                        (view.dumpable.user(), &view.exec_user),
                         true,
                     )
                 {
@@ -4231,7 +4281,7 @@ impl Kernel {
                     tid,
                     Arc::clone(&self.group),
                     false,
-                    (own.dumpable, own.exec_user),
+                    (own.dumpable.user(), own.exec_user),
                     public,
                 ));
             }
@@ -4245,7 +4295,7 @@ impl Kernel {
                 tid,
                 Arc::clone(&view.group),
                 view.zombie,
-                (view.dumpable, view.exec_user.clone()),
+                (view.dumpable.user(), view.exec_user.clone()),
                 public,
             ))
         };
@@ -4383,7 +4433,7 @@ impl Kernel {
     ) -> bool {
         thread.state.credentials.may_read_task(
             &public.credentials,
-            (view.dumpable, &view.exec_user),
+            (view.dumpable.user(), &view.exec_user),
             true,
         )
     }
@@ -4498,7 +4548,7 @@ impl Kernel {
                 } else {
                     let readable = thread.state.credentials.may_read_task(
                         &public.credentials,
-                        (view.dumpable, &view.exec_user),
+                        (view.dumpable.user(), &view.exec_user),
                         false,
                     );
                     if !readable {
@@ -5348,7 +5398,8 @@ impl Kernel {
         let mut memory = match mem.memory_meter() {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
             None => AddressSpace::new(),
-        };
+        }
+        .with_min_addr(Arc::clone(&self.processes.sysctls.mmap_min_addr));
         // `mm_init` takes the core dump filter from the old `mm`.
         memory.set_dump_filter(mem.dump_filter());
         // And `PR_SET_THP_DISABLE`'s flags (`MMF_INIT_LEGACY_MASK`).
@@ -5376,8 +5427,9 @@ impl Kernel {
         // exec's own are told of as Linux makes them.
         let report = reported_open();
         // As Linux's `open_exec` of an interpreter: it needs execute
-        // permission (EACCES), and an unreadable one makes the program
-        // undumpable (`would_dump`). Its set-ID bits do not count.
+        // permission (EACCES), and an unreadable one makes the program as
+        // dumpable as `fs.suid_dumpable` says (`would_dump`). Its set-ID
+        // bits do not count.
         let mut interpreter = |name: &[u8]| {
             // An empty name finds the working directory.
             if name.is_empty() {
@@ -5459,8 +5511,10 @@ impl Kernel {
         exec_credentials?;
         // MMAP_PAGE_ZERO: SVr4's read-only page 0, as load_elf_binary maps it
         // last, when the new credentials may map below mmap_min_addr
-        // (CAP_SYS_RAWIO); a failure is ignored, as there.
-        if personality & crate::syscalls::MMAP_PAGE_ZERO != 0 && credentials.may_map_low() {
+        // (CAP_SYS_RAWIO) or it is 0; a failure is ignored, as there.
+        if personality & crate::syscalls::MMAP_PAGE_ZERO != 0
+            && (credentials.may_map_low() || memory.min_addr() == 0)
+        {
             let _ = memory.map_shared(
                 Some(GuestAddr(0)),
                 4096,
@@ -5580,7 +5634,8 @@ impl Kernel {
         thread.state.name_after(&path);
         // Linux decides from the IDs before exec, then installs the new ones
         // as a change of credentials (`commit_creds`). A program the thread
-        // may not read runs undumpable (`would_dump`).
+        // may not read runs as dumpable as `fs.suid_dumpable` says
+        // (`would_dump`), and so does one of other IDs.
         let changed = old.resets_dumpable(&credentials);
         let dumpable = old.euid == old.uid && old.egid == old.gid && unread.is_empty() && !changed;
         self.processes.executed_as(
@@ -5769,7 +5824,8 @@ fn read_string(
     Err(long)
 }
 /// The owner and group of a file exec runs, when its thread may not read it
-/// (`would_dump`): such a program runs undumpable, in the nearest user
+/// (`would_dump`): such a program runs as dumpable as `fs.suid_dumpable`
+/// says (undumpable by default), in the nearest user
 /// namespace that maps them
 /// ([`crate::credentials::Credentials::exec_user`]).
 fn unread_by(file: Option<&paludarium_host::FileStat>, may_read: bool) -> Vec<(u32, u32)> {
@@ -6249,11 +6305,14 @@ pub(crate) fn may_attach_task(
 ) -> bool {
     let capable =
         || reader.capable_in(crate::credentials::CAP_SYS_PTRACE, &public.credentials.user);
-    reader.may_read_task(&public.credentials, (view.dumpable, &view.exec_user), real)
-        && match processes.sysctls.ptrace_scope() {
-            0 => true,
-            1 => processes.yama_allows(reader_pid, pid) || capable(),
-            2 => capable(),
-            _ => false,
-        }
+    reader.may_read_task(
+        &public.credentials,
+        (view.dumpable.user(), &view.exec_user),
+        real,
+    ) && match processes.sysctls.ptrace_scope() {
+        0 => true,
+        1 => processes.yama_allows(reader_pid, pid) || capable(),
+        2 => capable(),
+        _ => false,
+    }
 }

@@ -13253,6 +13253,79 @@ static int io_uring_multishot_case(void) {
     unet_push(&u, 26, 1, sp[0], 0, (long)sout, 5, 0, 16);
     um_run(&u, 1, 1, "send-bundle-plain");
     printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    /* A receive's bundle (IORING_RECVSEND_BUNDLE with IOSQE_BUFFER_SELECT):
+       no group is ENOENT; a ring gives as many buffers as the length needs,
+       and one filled whole while more waits tries once more for it, in the
+       same completion; a provided buffer is one at most; a multishot one
+       ends once it took the group's last buffers. (Not one whose length
+       runs out on the last buffer, which ends only on Linux master's
+       8742f4b5a472: the multishot one asks for 12 bytes, more than the two
+       buffers left.) */
+    if (write(sp[1], "abcdef", 6) != 6) return 87;
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 8, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 9;
+    um_run(&u, 1, 1, "recv-bundle-none");
+    unsigned char *rring = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (rring == MAP_FAILED) return 88;
+    {
+        unsigned char reg[40] = {0};
+        unsigned long at = (unsigned long)rring;
+        unsigned entries = 4;
+        unsigned short bgid = 8;
+        memcpy(reg, &at, 8);
+        memcpy(reg + 8, &entries, 4);
+        memcpy(reg + 12, &bgid, 2);
+        uring_show("recv-ring", syscall(427, u.fd, 22, reg, 1));
+    }
+    char rin[64];
+    memset(rin, '.', sizeof rin);
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *e = rring + 16 * i;
+        unsigned long a = (unsigned long)rin + 8 * i;
+        unsigned len = 4;
+        unsigned short bid = 30 + i;
+        memcpy(e, &a, 8);
+        memcpy(e + 8, &len, 4);
+        memcpy(e + 12, &bid, 2);
+    }
+    __atomic_store_n((unsigned short *)(rring + 14), 4, __ATOMIC_RELEASE);
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 8, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 8;
+    um_run(&u, 1, 1, "recv-bundle");
+    if (write(sp[1], "ghijklmnop", 10) != 10) return 89;
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 4, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 8;
+    um_run(&u, 1, 1, "recv-bundle-again");
+    printf("buffers %.32s\n", rin);
+    char provided[8];
+    memset(provided, '.', sizeof provided);
+    unet_push(&u, 31, 1, 1, 4, (long)provided, 6, 0, 0)[40] = 9;
+    um_run(&u, 1, 1, "recv-provide");
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 0, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 9;
+    um_run(&u, 1, 1, "recv-bundle-provided");
+    printf("provided %.6s\n", provided);
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *e = rring + 16 * i;
+        unsigned long a = (unsigned long)rin + 32 + 8 * i;
+        unsigned short bid = 40 + i;
+        memcpy(e, &a, 8);
+        memcpy(e + 12, &bid, 2);
+    }
+    __atomic_store_n((unsigned short *)(rring + 14), 8, __ATOMIC_RELEASE);
+    if (write(sp[1], "qrstuv", 6) != 6) return 90;
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 12, 0, 2 | 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 8;
+    um_run(&u, 1, 1, "recv-bundle-multishot");
+    if (write(sp[1], "wxyz1234", 8) != 8) return 91;
+    um_run(&u, 0, 1, "recv-bundle-multishot-last");
+    printf("buffers %.32s\n", rin + 32);
     close(sp[0]);
     close(sp[1]);
     close(gram[0]);
@@ -19458,6 +19531,60 @@ static int grl_inner(const char *self) {
         }
     const char *runs[] = {"/proc/self/exe", "/lp/self/exe", "/lr/self/exe"};
     for (unsigned i = 0; i < 3; i++) printf("exec %s=%d\n", runs[i], gl_exec(self, runs[i], 0));
+    return 0;
+}
+/* The magic-link-names case: a link of /proc or /dev that is the last
+   name, with a trailing slash, is the name the calls that make, remove or
+   rename it find (EEXIST, EISDIR, ENOTDIR), not the file it leads to. As
+   nobody, in a child, so that the permission checks that come first
+   (EACCES to remove a name in /dev or /proc/self/ns) are the same whoever
+   runs the case. Only errno values are printed. */
+static int mln_e(int rc) { return rc < 0 ? errno : 0; }
+static int magic_link_names_rows(void) {
+    char base[] = "/tmp/paludarium-magic-names-XXXXXX";
+    if (!mkdtemp(base)) return 1;
+    char file[96];
+    snprintf(file, sizeof file, "%s/file", base);
+    int fd = open(file, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd < 0) return 2;
+    char own[64], thread[64], dev[64];
+    snprintf(own, sizeof own, "/proc/self/fd/%d/", fd);
+    snprintf(thread, sizeof thread, "/proc/thread-self/fd/%d/", fd);
+    snprintf(dev, sizeof dev, "/dev/fd/%d/", fd);
+    const char *const names[] = {own, thread, dev, "/proc/self/exe/", "/proc/self/cwd/",
+                                 "/proc/self/root/", "/proc/self/ns/net/", "/dev/stdin/",
+                                 "/dev/stdout/"};
+    printf("name mkdir mknod symlink link creat unlink rmdir rename\n");
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+        const char *p = names[i];
+        int m = mln_e(mkdir(p, 0700));
+        int k = mln_e(mknod(p, S_IFIFO | 0600, 0));
+        int s = mln_e(symlink("x", p));
+        int l = mln_e(link(file, p));
+        int c = open(p, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+        int ce = c < 0 ? errno : 0;
+        if (c >= 0) close(c);
+        int u = mln_e(unlink(p));
+        int r = mln_e(rmdir(p));
+        int rn = mln_e(rename("/proc/self/nonesuch", p));
+        printf("%s %d %d %d %d %d %d %d %d\n", i < 3 ? (i == 0 ? "own-fd/" : i == 1 ? "thread-fd/" : "dev-fd/") : p,
+               m, k, s, l, ce, u, r, rn);
+    }
+    close(fd);
+    unlink(file);
+    printf("cleaned=%d\n", rmdir(base) == 0);
+    return 0;
+}
+static int magic_link_names_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        int rc = magic_link_names_rows();
+        fflush(stdout);
+        _exit(rc);
+    }
+    printf("status=%d\n", reaped(child));
     return 0;
 }
 /* The dev-tty-node case: /dev/tty is a node of devtmpfs with or without a
@@ -32320,6 +32447,71 @@ static int sysctl_limits_case(void) {
         int beyond_errno = beyond < 0 ? errno : 0;
         printf("not root: start-within=%d at-max=%d beyond=%d\n", start == (pipe_max < 65536 ? pipe_max : 65536),
                at == pipe_max, beyond < 0 ? -beyond_errno : (int)beyond);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("not root: child=%d\n", status);
+    return 0;
+}
+
+/* The dump-min-sysctls case: /proc/sys/fs/suid_dumpable and
+   /proc/sys/vm/mmap_min_addr. Their values differ from machine to machine,
+   so their form shows, and what they bound: PR_SET_DUMPABLE takes 0 and 1
+   only, a hint below mmap_min_addr goes to it rounded up to a page, and,
+   as someone other than root, a fixed mapping below it is EPERM and
+   neither file opens to write. */
+static int dump_min_sysctls_case(void) {
+    char buf[64];
+    long long dumpable = -1, min = -1;
+    int formed = sl_number("/proc/sys/fs/suid_dumpable", buf, sizeof buf, &dumpable);
+    printf("suid_dumpable: formed=%d in-range=%d\n", formed, dumpable >= 0 && dumpable <= 2);
+    printf("mmap_min_addr: formed=%d\n", sl_number("/proc/sys/vm/mmap_min_addr", buf, sizeof buf, &min));
+    const char *files[] = {"/proc/sys/fs/suid_dumpable", "/proc/sys/vm/mmap_min_addr"};
+    for (int i = 0; i < 2; i++) {
+        struct stat st;
+        int r = stat(files[i], &st);
+        printf("%s: stat=%d mode=%o uid=%u size=%lld\n", files[i], r, (unsigned)(st.st_mode & 07777),
+               (unsigned)st.st_uid, (long long)st.st_size);
+    }
+    printf("dumpable: get=%d\n", prctl(PR_GET_DUMPABLE, 0, 0, 0, 0));
+    for (int value = 2; value <= 3; value++)
+        printf("dumpable: set %d=%d\n", value, prctl(PR_SET_DUMPABLE, value, 0, 0, 0) < 0 ? -errno : 0);
+    for (int value = 0; value <= 1; value++) {
+        int set = prctl(PR_SET_DUMPABLE, value, 0, 0, 0);
+        int get = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+        printf("dumpable: set %d=%d get=%d\n", value, set, get);
+    }
+    /* The page below the bound, when there is one. */
+    long long page = 4096, floor = (min + page - 1) & ~(page - 1);
+    long long below = min > page ? (min - 1) / page * page : 0;
+    if (below) {
+        void *at = mmap((void *)(uintptr_t)below, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        printf("hint below: raised=%d\n", at != MAP_FAILED && (long long)(uintptr_t)at == floor);
+        if (at != MAP_FAILED) munmap(at, 4096);
+    } else {
+        printf("hint below: raised=1\n");
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 && (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(2);
+        int fixed = 0;
+        if (below) {
+            void *at = mmap((void *)(uintptr_t)below, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            fixed = at == MAP_FAILED ? -errno : 0;
+        } else {
+            fixed = -EPERM;
+        }
+        printf("not root: fixed below=%d", fixed);
+        for (int i = 0; i < 2; i++) {
+            int fd = open(files[i], O_WRONLY | O_CLOEXEC);
+            printf(" write %d=%d", i, fd < 0 ? -errno : 0);
+            if (fd >= 0) close(fd);
+        }
+        printf("\n");
         fflush(stdout);
         _exit(0);
     }
@@ -46305,6 +46497,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
     if (!strcmp(mode, "sysctl-constants")) return sysctl_constants_case();
     if (!strcmp(mode, "sysctl-limits")) return sysctl_limits_case();
+    if (!strcmp(mode, "dump-min-sysctls")) return dump_min_sysctls_case();
     if (!strcmp(mode, "poll-default")) return poll_default_case();
     if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
     if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();
@@ -46386,6 +46579,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "statx-attributes")) return statx_attributes_case();
     if (!strcmp(mode, "generated-enotdir")) return generated_enotdir_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
+    if (!strcmp(mode, "magic-link-names")) return magic_link_names_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "dev-tty-node")) return dev_tty_node_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

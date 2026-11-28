@@ -107,6 +107,7 @@ impl Net {
     /// connection, a receive after any bytes but the last it may take.
     pub(super) fn goes_on(&mut self, res: i32) -> bool {
         if let Op::Transfer {
+            send: true,
             bundle: true,
             ref mut next,
             ..
@@ -137,6 +138,7 @@ impl Net {
         // `io_mshot_prep_retry`: a bundle sends again at once, all its
         // buffer sent (`sr->len` is 0), and selects anew.
         if let Op::Transfer {
+            send: true,
             bundle: true,
             ref mut len,
             ref mut done,
@@ -155,6 +157,18 @@ impl Net {
         let Some(file) = self.found.as_ref().map(|found| Arc::clone(&found.file)) else {
             return;
         };
+        // `io_mshot_prep_retry`: each completion starts anew.
+        if let Op::Transfer {
+            send: false,
+            bundle: true,
+            ref mut done,
+            ref mut retried,
+            ..
+        } = self.op
+        {
+            *done = 0;
+            *retried = None;
+        }
         let unknown = match self.op {
             // Only TCP tells whether more connections wait (`is_empty`).
             Op::Accept { .. } => crate::inet::of(&file).is_none(),
@@ -203,7 +217,7 @@ enum Op {
         done: u64,
         /// The `msghdr` of an `IORING_OP_SENDMSG` or `_RECVMSG`, at `buf`.
         message: Option<Box<MessageHeader>>,
-        /// A send with `IORING_RECVSEND_BUNDLE`, and whether it goes on
+        /// `IORING_RECVSEND_BUNDLE`, and for a send whether it goes on
         /// after the completion it posts (`io_send_finish`).
         bundle: bool,
         next: bool,
@@ -213,14 +227,21 @@ enum Op {
         /// The buffers a send selected, as they are left to go, which it
         /// keeps until it completes.
         picked: Option<Picked>,
+        /// What its socket last said it has left to read (`msg_inq`), which
+        /// a receive's bundle takes buffers for when it asks for no length.
+        inq: Option<u32>,
+        /// A receive's bundle that tried again and waited: the flags of its
+        /// first buffers, which its completion keeps (`req->cqe.flags` with
+        /// `IORING_RECV_RETRY`), so it does not try again.
+        retried: Option<u32>,
     },
 }
 
 /// Prepares a socket request from its entry (`io_shutdown_prep`,
 /// `io_socket_prep`, `io_accept_prep`, `io_connect_prep` and
 /// `io_sendmsg_prep` or `io_recvmsg_prep` with `io_send_setup`), but for
-/// what it reads of the caller's memory ([`prepare_memory`]). A receive's
-/// bundle is not there yet (`EINVAL`).
+/// what it reads of the caller's memory ([`prepare_memory`]). A receive
+/// that selects a buffer with `MSG_WAITALL` is not there yet (`EINVAL`).
 pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Errno> {
     let fixed = sqe_flags & super::IOSQE_FIXED_FILE != 0;
     let select = sqe_flags & super::IOSQE_BUFFER_SELECT != 0;
@@ -335,9 +356,9 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 // Only a multishot receive takes `optlen`.
                 return Err(Errno::EINVAL);
             }
-            // A receive's bundle and a selected buffer that a receive fills
-            // whole are not there yet; `IORING_OP_RECVMSG` takes no bundle.
-            if !send && (bundle || select && msg_flags & MSG_WAITALL != 0) {
+            // `IORING_OP_RECVMSG` takes no bundle; a selected buffer that a
+            // receive fills whole is not there yet.
+            if !send && (bundle && message || select && msg_flags & MSG_WAITALL != 0) {
                 return Err(Errno::EINVAL);
             }
             // A message's iovecs are vectored anyway, and a send that
@@ -363,6 +384,8 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 next: false,
                 vector: vectored.then(Vec::new),
                 picked: None,
+                inq: None,
+                retried: None,
             }
         }
         _ => return Err(super::EOPNOTSUPP),
@@ -555,6 +578,21 @@ pub(super) fn run(
             Some(layout) => {
                 let (issued, ended) = receive_messages(c, ring, net.polled, &net.op, layout, &file);
                 net.ended = ended;
+                issued
+            }
+            None if matches!(
+                net.op,
+                Op::Transfer {
+                    send: false,
+                    bundle: true,
+                    group: Some(_),
+                    ..
+                }
+            ) =>
+            {
+                let (issued, ended) =
+                    receive_bundle(c, ring, net.polled, &mut net.op, net.limit, &file);
+                net.ended = ended && net.multishot;
                 issued
             }
             None => transfer(c, ring, net.polled, &mut net.op, &file),
@@ -830,6 +868,7 @@ fn transfer(
         next,
         vector,
         picked,
+        ..
     } = op
     else {
         unreachable!()
@@ -1002,6 +1041,134 @@ fn transfer(
     Issued::Done(res, cflags, failed)
 }
 
+/// `io_recv` with `IORING_RECVSEND_BUNDLE` and a selected buffer, and
+/// whether it took the group's last buffers (`REQ_F_BL_EMPTY`), which ends
+/// a multishot one. Each try takes buffers for its length, or what the
+/// socket said it has (`msg_inq`) when it asks for none, no more than a
+/// multishot receive has left ([`super::select_receive`]), receives to
+/// them, and uses the ones it filled ([`super::put_received`]). Once, if
+/// it filled them all, the socket has more and the first was not cut, it
+/// tries again for that much and adds it to the same completion, which
+/// names the first buffer. Nothing to read gives the buffers back and
+/// waits, keeping what it received, and, after it tried again, the first
+/// buffers' flags, so that it does not try again.
+fn receive_bundle(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    polled: bool,
+    op: &mut Op,
+    limit: Option<u32>,
+    file: &Arc<dyn FileHandle>,
+) -> (Issued, bool) {
+    let Op::Transfer {
+        len,
+        msg_flags,
+        flags,
+        group: Some(bgid),
+        done,
+        inq,
+        retried: kept,
+        ..
+    } = op
+    else {
+        unreachable!()
+    };
+    let mask = if *msg_flags & MSG_ERRQUEUE != 0 {
+        POLL_IN_EVENTS & !POLLIN
+    } else {
+        POLL_IN_EVENTS
+    };
+    if !crate::sockets::is_socket(file) {
+        return (Issued::Done(-Errno(88).0, 0, true), false);
+    }
+    if !polled && *flags & RECVSEND_POLL_FIRST != 0 {
+        return (Issued::Again(mask), false);
+    }
+    let asked = u64::from(*msg_flags | MSG_DONTWAIT);
+    let mut want = if kept.is_some() {
+        inq.unwrap_or(0)
+    } else {
+        *len
+    };
+    let mut cflags = *kept;
+    let mut retried = kept.is_some();
+    loop {
+        let mut max = if want != 0 {
+            want
+        } else {
+            inq.filter(|&inq| inq > 1).unwrap_or(0)
+        };
+        if let Some(limit) = limit.filter(|&limit| limit != 0) {
+            max = if max == 0 { limit } else { max.min(limit) };
+        }
+        let received = match super::select_receive(c, ring, *bgid, max) {
+            Ok(received) => received,
+            Err(e) => {
+                *inq = None;
+                let res = if *done != 0 { *done as i32 } else { -e.0 };
+                return (Issued::Done(res, cflags.unwrap_or(0), true), false);
+            }
+        };
+        let room: u64 = received.pieces.iter().map(|&(_, size)| size as u64).sum();
+        let result = if let [(at, size)] = received.pieces[..] {
+            let a = [0, at, size as u64, asked, 0, 0];
+            crate::sockets::route_file(c, 45, a, file)
+        } else {
+            let header = MessageHeader::of_send(None, received.pieces.clone());
+            let a = [0, 0, asked, 0, 0, 0];
+            crate::sockets::with_shadow_header(0, &header, 0, || {
+                crate::sockets::route_file(c, 47, a, file)
+            })
+            .0
+        };
+        *inq = match result {
+            Ok(_) => crate::sockets::inq_hint(file).map(|n| n.min(u32::MAX as usize) as u32),
+            Err(_) => None,
+        };
+        let n = match result {
+            Ok(n) => n,
+            Err(Errno::EAGAIN) => {
+                super::put_received(c, ring, &received, 0);
+                if retried {
+                    *kept = cflags;
+                }
+                return (Issued::Again(mask), false);
+            }
+            Err(e) => {
+                super::put_received(c, ring, &received, 0);
+                let res = if *done != 0 { *done as i32 } else { -e.0 };
+                return (Issued::Done(res, cflags.unwrap_or(0), true), false);
+            }
+        };
+        let these = super::put_received(c, ring, &received, n);
+        let first = *cflags.get_or_insert(these);
+        *done += n;
+        if received.emptied {
+            let res = *done as i32;
+            return (Issued::Done(res, first | nonempty(*inq), false), true);
+        }
+        // `IORING_RECV_MSHOT_CAP`: a multishot receive that took its length.
+        let capped = limit.is_some() && *len != 0 && *done >= u64::from(*len);
+        let more = inq.is_some_and(|inq| inq > 1);
+        if !retried && !received.cut && !capped && more && n > 0 && n == room {
+            retried = true;
+            want = inq.unwrap_or(0);
+            continue;
+        }
+        let res = *done as i32;
+        return (Issued::Done(res, first | nonempty(*inq), false), false);
+    }
+}
+
+/// `IORING_CQE_F_SOCK_NONEMPTY` for a socket that has more to read.
+fn nonempty(inq: Option<u32>) -> u32 {
+    if inq.is_some_and(|inq| inq > 0) {
+        CQE_F_SOCK_NONEMPTY
+    } else {
+        0
+    }
+}
+
 /// A multishot receive of a message (`io_recvmsg` with
 /// `io_recvmsg_prep_multishot` and `io_recvmsg_multishot`), and whether it
 /// ended: the buffer it selects (`ENOBUFS`) has its name, its control and
@@ -1120,7 +1287,7 @@ fn advance(pieces: &mut Vec<(u64, usize)>, n: u64) {
 /// `io_kbuf_recycle`: a provided buffer goes back to the front of its
 /// group, whole; a ring's, which a socket's receive uses only once it is
 /// done, stays at the ring's head.
-fn recycle(ring: &Ring, chosen: &Chosen) {
+pub(super) fn recycle(ring: &Ring, chosen: &Chosen) {
     if chosen.ring {
         return;
     }

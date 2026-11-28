@@ -149,7 +149,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/interrupts`、`/proc/partitions`、`/proc/kallsyms`、
   `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、
-  `vm/max_map_count`、`vm/unprivileged_userfaultfd` 以外など）と、
+  `vm/max_map_count`、`vm/mmap_min_addr`、`vm/unprivileged_userfaultfd` 以外など）と、
   読むプロセス自身のディレクトリのほかの名前
   （`stack`、`sched`、`attr` など）は、ほかのプロセスのディレクトリと同じく `ENOENT` です。
   ファイルシステムがそこに何を持っていても（`--mount /:/` ではホストの `/proc`）同じです。
@@ -163,7 +163,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   モード 0444 で何も縛りません。Linux のものは root が書けて（0644）、それを超える
   マッピングを `ENOMEM` にします。`fs/pipe-user-pages-soft` と `fs/pipe-user-pages-hard`
   はなく、ユーザーのパイプのページを数えるものもないので、Linux のソフトの上限を超えた
-  ユーザーのパイプも小さくされず、伸ばすのも拒まれません（`EPERM`）。`io` は、Linux の `kernel_read` と `kernel_write` が
+  ユーザーのパイプも小さくされず、伸ばすのも拒まれません（`EPERM`）。
+  `fs/suid_dumpable` に 2 を書いても何も記録しません。Linux は、2 には絶対パスかパイプの
+  `kernel.core_pattern` が要ると記録します。ここには `kernel.core_pattern` がなく、その
+  `core` はどちらでもないので、root としてダンプできるプロセスはコアを書きません。
+  `vm/mmap_min_addr` は書いた値そのままです。セキュリティーモジュールの下限
+  （`CONFIG_LSM_MMAP_MIN_ADDR`）付きでビルドした Linux は、その下限より下にマッピングを
+  置きません。64 KiB より下にセグメントがある ELF のプログラムは、`vm/mmap_min_addr` が
+  何であっても `execve` で断ります（`ENOEXEC`）。Linux は、値か `CAP_SYS_RAWIO` が許せば
+  マップします。`io` は、Linux の `kernel_read` と `kernel_write` が
   そのプロセスに数えるもの（`execve` がプログラムとインタープリターを読むこと、コアダンプの
   書き込み）を数えません。また、Linux がファイルの操作の前でも中でも返す errno
   （`EINVAL`、`EFAULT`。eventfd に小さすぎるバッファを渡したときなど）で失敗した読み書きは、
@@ -558,10 +566,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
   `_LINKAT`、`_FTRUNCATE`、`_PIPE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
   だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、
-  受信のバンドル（`IORING_RECVSEND_BUNDLE`）と、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません
+  `MSG_WAITALL` でバッファーを選ぶ受信（バンドル `IORING_RECVSEND_BUNDLE` を含む）はまだありません
   （`EINVAL`）。送信が選ぶバッファーは Linux master に合わせます。差分テストのランナーのカーネルは、
   提供されたバッファーを長さにかかわらずまだ丸ごと送る（master の b7322810d187 より前）ので、テストは
   それを比べず、長さが最後のバッファーで尽きるバンドルが続くかどうか（8742f4b5a472）も比べません。
+  ランナーのカーネルは、そのとき送信のバンドルもマルチショットの受信のバンドルも終えませんが、ここでは
+  master と同じくどちらも終えます。
   ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
   （`MULTISHOT_MAX_RETRY`）続くとキューに戻し、ほかのタスクワークを先に動かします。
   `IORING_RECVSEND_FIXED_BUF` を付けた送受信は、差分テストを走らせるカーネルである Linux 7.0 と

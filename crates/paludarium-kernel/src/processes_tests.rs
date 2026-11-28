@@ -3860,6 +3860,34 @@ mod core_dumps {
         assert_eq!(wait_status(&mut k, &mut t, &m, pid), 11);
         assert_eq!(core(&k).as_deref(), Some(&[][..]));
     }
+    /// A change of IDs leaves a process dumpable only when
+    /// `fs.suid_dumpable` is 1. With 2 it is dumpable as root, to an
+    /// absolute path or a pipe only, which `core` is not
+    /// (`coredump_force_suid_safe`).
+    #[test]
+    fn a_change_of_ids_dumps_core_only_with_suid_dumpable_1() {
+        for (value, dumps) in [(b'0', false), (b'1', true), (b'2', false)] {
+            let (mut k, mut t, m) = setup();
+            m.write(GuestAddr(DATA + 0x900), b"/proc/sys/fs/suid_dumpable\0")
+                .unwrap();
+            m.write(GuestAddr(DATA + 0xa00), &[value]).unwrap();
+            let fd = syscall(&mut k, &mut t, &m, 2, [DATA + 0x900, 1, 0, 0, 0, 0]);
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 1, [fd, DATA + 0xa00, 1, 0, 0, 0]),
+                1
+            );
+            let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+            core_limit(&mut c, &mut ct, &cm, u64::MAX);
+            assert_eq!(
+                syscall(&mut c, &mut ct, &cm, 119, [1000, 1000, 1000, 0, 0, 0]),
+                0
+            );
+            end_by(&mut c, &mut ct, &cm, 11);
+            let status = wait_status(&mut k, &mut t, &m, ct.tid);
+            assert_eq!(status & 0x80 != 0, dumps, "suid_dumpable {value}");
+            assert_eq!(core(&k).is_some(), dumps, "suid_dumpable {value}");
+        }
+    }
     #[test]
     fn no_core_under_the_default_limit_a_page_or_without_dumpable() {
         for (limit, dumpable) in [(None, true), (Some(4095), true), (Some(u64::MAX), false)] {
@@ -5631,6 +5659,115 @@ mod shm {
         );
         assert_eq!(
             write_kernel(&mut k, &mut t, &m, name, b"1"),
+            e(Errno::EACCES)
+        );
+    }
+
+    /// `fs.suid_dumpable`, as `fs/exec.c` has it: 0 at first, 0 to 2. A
+    /// change of IDs leaves the process as dumpable as it says, which
+    /// PR_GET_DUMPABLE shows; PR_SET_DUMPABLE takes only 0 and 1.
+    #[test]
+    fn suid_dumpable_sets_how_dumpable_a_change_of_ids_leaves_a_process() {
+        let (mut k, mut t, m) = setup();
+        let name = "../fs/suid_dumpable";
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/fs/suid_dumpable"),
+            "0\n"
+        );
+        for bad in [&b"3"[..], b"-1", b"x"] {
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, name, bad),
+                e(Errno::EINVAL)
+            );
+        }
+        for (value, after) in [(0, 0), (1, 1), (2, 2)] {
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, name, format!("{value}\n").as_bytes()),
+                2
+            );
+            assert_eq!(
+                read_proc(&mut k, &mut t, &m, "/proc/sys/fs/suid_dumpable"),
+                format!("{value}\n")
+            );
+            let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+            assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [3, 0, 0, 0, 0, 0]), 1);
+            assert_eq!(
+                syscall(&mut c, &mut ct, &cm, 117, [1000, 1000, 1000, 0, 0, 0]),
+                0
+            );
+            assert_eq!(
+                syscall(&mut c, &mut ct, &cm, 157, [3, 0, 0, 0, 0, 0]),
+                after,
+                "suid_dumpable {value}"
+            );
+            assert_eq!(
+                syscall(&mut c, &mut ct, &cm, 157, [4, 2, 0, 0, 0, 0]),
+                e(Errno::EINVAL)
+            );
+            assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [4, 1, 0, 0, 0, 0]), 0);
+            assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [3, 0, 0, 0, 0, 0]), 1);
+        }
+        // Only root opens it to write.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, name, b"0"),
+            e(Errno::EACCES)
+        );
+    }
+
+    /// `vm.mmap_min_addr`, as `security/min_addr.c` has it: 65536 at first,
+    /// any `unsigned long`, written only with `CAP_SYS_RAWIO` (`EPERM`
+    /// before anything else); a hint below it goes to it, and a fixed
+    /// mapping below it needs `CAP_SYS_RAWIO`.
+    #[test]
+    fn mmap_min_addr_bounds_hints_and_fixed_mappings() {
+        let (mut k, mut t, m) = setup();
+        let m = m.with_min_addr(k.mmap_min_addr());
+        let name = "../vm/mmap_min_addr";
+        let read =
+            |k: &mut Kernel, t: &mut Thread| read_proc(k, t, &m, "/proc/sys/vm/mmap_min_addr");
+        let map = |k: &mut Kernel, t: &mut Thread, at: u64, flags: u64| {
+            syscall(k, t, &m, 9, [at, 4096, 3, flags, u64::MAX, 0])
+        };
+        let (hinted, fixed) = (0x22, 0x10_0022);
+        assert_eq!(read(&mut k, &mut t), "65536\n");
+        assert_eq!(map(&mut k, &mut t, 0x3000, hinted), 0x10000);
+        for bad in [&b"-1"[..], b"x"] {
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, name, bad),
+                e(Errno::EINVAL)
+            );
+        }
+        // Root without CAP_SYS_RAWIO: refused, also for nothing written.
+        let root = t.state.credentials.clone();
+        let mut bare = root.clone();
+        bare.effective &= !crate::credentials::CAP_SYS_RAWIO;
+        t.state.credentials = bare;
+        let eperm = e(Errno::EPERM);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, name, b"0"), eperm);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, name, b""), eperm);
+        t.state.credentials = root;
+        assert_eq!(write_kernel(&mut k, &mut t, &m, name, b"8192 "), 5);
+        assert_eq!(read(&mut k, &mut t), "8192\n");
+        // A hint below it is raised to it, one above kept.
+        assert_eq!(map(&mut k, &mut t, 0x1000, hinted), 0x2000);
+        assert_eq!(map(&mut k, &mut t, 0x3000, hinted), 0x3000);
+        // Not page-aligned, a hint goes to the page above it.
+        assert_eq!(write_kernel(&mut k, &mut t, &m, name, b"16385"), 5);
+        assert_eq!(map(&mut k, &mut t, 0x4000, hinted), 0x5000);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, name, b"8192"), 4);
+        // Without CAP_SYS_RAWIO a fixed mapping goes only from it up.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(map(&mut k, &mut t, 0x1000, fixed), eperm);
+        assert_eq!(map(&mut k, &mut t, 0x6000, fixed), 0x6000);
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, name, b"0"),
             e(Errno::EACCES)
         );
     }
@@ -8216,6 +8353,7 @@ mod proc_names {
                 "..",
                 "drop_caches",
                 "max_map_count",
+                "mmap_min_addr",
                 "unprivileged_userfaultfd"
             ]
         );

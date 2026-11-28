@@ -686,6 +686,18 @@ kernel.
   ceiling on open files bounds the hard limit beside `nr_open`, whatever
   root writes to it.
 
+- `/proc/sys/fs/suid_dumpable` (0 at first) is the machine's, a root's file
+  of mode 0644 that takes an `int` from 0 to 2 (`proc_dointvec_minmax`,
+  `EINVAL` otherwise): how dumpable a process is after a change of its
+  effective or filesystem IDs, and after an `execve` of a program it may not
+  read or of other IDs, as Linux's `commit_creds` and `begin_new_exec` set
+  it. 0 leaves it undumpable, 1 dumpable, and 2 dumpable only as root
+  (`SUID_DUMP_ROOT`), which `PR_GET_DUMPABLE` reports as 2 and every other
+  check takes as undumpable: its `/proc` files are root's, it is readable
+  and traceable only with `CAP_SYS_PTRACE`, and it writes no core, as Linux
+  writes such a core only to an absolute path or a pipe, and `core` is
+  neither.
+
 - A pipe holds 16 buffers of a page each (64 KiB), as on Linux, and
   `fcntl`'s `F_SETPIPE_SZ` and `F_GETPIPE_SZ` resize and report it like
   `pipe_set_size`: a power of two of at least a page, `EBUSY` below the
@@ -1870,7 +1882,8 @@ kernel.
   `do_user_addr_fault` serves a kernel access), or an access of `ptrace` or
   `/proc/<pid>/mem` there (`__access_remote_vm`, within the limits of the
   one who makes it), extends it down to that
-  page, and the access is made again. It does not grow below `mmap_min_addr` (64 KiB), within the
+  page, and the access is made again. It does not grow below
+  `/proc/sys/vm/mmap_min_addr` (64 KiB at first), within the
   guard gap of 256 pages (`stack_guard_gap`) above a mapping that does not
   grow down and can be accessed, past `RLIMIT_STACK` for the whole VMA, or,
   locked, past `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`; the access then gives
@@ -1895,7 +1908,9 @@ kernel.
   lowest room from 1 GiB up (Linux starts up to 32 MiB higher, at random),
   with the placements at a 2 MiB boundary there too, or `ENOMEM`.
   `MAP_FIXED` overrides it, and `mremap` does not keep to it. A hint below
-  `mmap_min_addr` (64 KiB) is taken as that address; a fixed mapping
+  `/proc/sys/vm/mmap_min_addr` (64 KiB at first) is taken as that address,
+  rounded up to a page (`round_hint_to_min`), and no mapping without a fixed
+  address goes below it, in either layout; a fixed mapping
   below it, a move there by `mremap` (once its target is unmapped and its
   source shrunk; a free address asked for with `MREMAP_DONTUNMAP` alone
   too) and a `shmat` there give `EPERM` without `CAP_SYS_RAWIO`.
@@ -1948,11 +1963,10 @@ kernel.
     ignores its failed unmap.
   - A child of `fork` keeps the seals; `exec` starts without any.
 
-- io_uring is Linux 6.12's, but for its registered files, its groups of
-  buffers and a NOP's flags, which are Linux 7.0's (`io_uring/rsrc.c`,
-  `kbuf.c` and `nop.c`, with master's `IOSQE_FIXED_FILE` for a NOP), the
-  kernel the differential tests run on, and so are the operations,
-  registrations and setup and `io_uring_enter` flags it knows of. Its
+- io_uring is Linux 7.0's, the kernel the differential tests run on, with
+  the changes of Linux master that the test runners' kernel has, such as a
+  NOP's `IOSQE_FIXED_FILE`; its operations, registrations and setup and
+  `io_uring_enter` flags are those it knows of. Its
   operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with) and
   `_EPOLL_WAIT`, the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`,
@@ -2232,7 +2246,18 @@ kernel.
   sent anything posts with `IORING_CQE_F_MORE` and sends again at once,
   with no length and new buffers, until it sends nothing, takes its
   group's last buffers or waited (`io_send_finish`); one that selects none
-  sends nothing the second time. With `MSG_WAITALL`, a stream or
+  sends nothing the second time. An `IORING_OP_RECV` with
+  `IORING_RECVSEND_BUNDLE` that selects receives to as many of a ring's
+  buffers as its length needs, or as its socket last said it has when it
+  asks for none (one, at first), at most 256 and no more than a multishot
+  receive has left (`io_recv_buf_select`); a group it does not find is
+  `ENOENT`, and a group of provided buffers gives one. It uses the buffers
+  it filled any of, and its completion names the first. Once, if it filled
+  them all, its socket has more and the first was not cut, it receives
+  again for that much and adds it to the same completion
+  (`io_recv_finish`). One that took the group's last buffers completes, a
+  multishot one too, without `IORING_CQE_F_MORE`. `IORING_OP_RECVMSG`
+  takes no bundle (`EINVAL`). With `MSG_WAITALL`, a stream or
   sequenced-packet socket's send or receive goes on to its whole length
   and gives all it moved; one that fails on the way, as it asked not to
   wait or was cancelled, gives what it moved too (`io_sendrecv_fail`). A
@@ -4263,8 +4288,9 @@ kernel.
   `PR_SET_KEEPCAPS`) and the ambient ones, the effective ID leaving root
   drops the effective ones and coming back raises them, and the filesystem
   ID does the same for the filesystem capabilities. A change of
-  an effective or filesystem ID makes the process undumpable
-  (`fs.suid_dumpable` is 0) and clears its parent-death signal. `execve`
+  an effective or filesystem ID leaves the process as dumpable as
+  `/proc/sys/fs/suid_dumpable` says (undumpable at first) and clears its
+  parent-death signal. `execve`
   of a set-user-ID program makes its owner the effective user ID, and of a
   set-group-ID program its group the effective group ID when the group may
   execute it. With `PR_SET_NO_NEW_PRIVS` it ignores those bits, and an exec
@@ -4540,7 +4566,15 @@ kernel.
   own walk), and so does `execve` (`/proc/self/fd/3/program` runs `program`
   in the directory descriptor 3 holds); a path relative to a descriptor of
   `/proc` or to a working directory there, one whose `..` or symbolic link
-  leads into `/proc`, and a Unix socket's address do not.
+  leads into `/proc`, and a Unix socket's address do not. A link that is the
+  last name is not jumped through by the calls that make, remove or rename
+  that name (`mkdir`, `mknod`, `symlink`, `link`, `unlink`, `rmdir`,
+  `rename` and an `open` with `O_CREAT`), even with a trailing slash. They
+  find the link itself, as Linux's walk to the parent leaves it to them:
+  `mkdir("/proc/self/fd/0/")` is `EEXIST`, and `unlink` of it `ENOTDIR`.
+  A link of `/dev` on the way is followed too, so a name in `/dev/fd` is
+  one of `/proc/self/fd`: a `rename` or `link` there is on procfs, not
+  `EXDEV`.
 
 - The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
   `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/version` and the other system files (below), `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
@@ -5099,9 +5133,15 @@ kernel.
   `POLLRDNORM`, `POLLERR` and `POLLPRI` and no `POLLOUT`. A `dup` and a child
   share what it has seen, and a poll of an epoll that watches it is one too.
 
-- `/proc/sys/vm` has `drop_caches`, `max_map_count` and
+- `/proc/sys/vm` has `drop_caches`, `max_map_count`, `mmap_min_addr` and
   `unprivileged_userfaultfd` alone, so its listing differs from Linux's,
-  which has the rest of the `vm` sysctls too. `max_map_count` is the
+  which has the rest of the `vm` sysctls too. `mmap_min_addr` is the
+  machine's, 65536 at first, root's of mode 0644: an `unsigned long`
+  (`proc_doulongvec_minmax`, `EINVAL` for a `-`), which a writer without
+  `CAP_SYS_RAWIO` may not write (`EPERM`, before anything else, also for an
+  empty write), as `mmap_min_addr_handler` asks. Every address space of the
+  machine keeps to it at once: hints, placements, `mremap`, stack growth,
+  `userfaultfd` ranges and `MMAP_PAGE_ZERO`. `max_map_count` is the
   machine's 65530 (`DEFAULT_MAX_MAP_COUNT`), root's, of mode 0444, which no
   one opens to write (`EACCES`), as nothing here bounds a process's
   mappings by it. `unprivileged_userfaultfd` is the machine's, 0 at first, root's of
@@ -7109,8 +7149,9 @@ kernel.
   thread or process; as Linux's `forget_original_parent` sends it, each
   thread's signal goes to its process when the parent's thread that made
   the process exits, even if the parent goes on, and again as each thread
-  the process is then a child of exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
-  again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
+  the process is then a child of exits), `PR_SET_DUMPABLE` (0 or 1, else
+  `EINVAL`; `PR_GET_DUMPABLE` gives 2 too after `fs.suid_dumpable` 2 set it;
+  `execve` makes the process dumpable again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
   by `execve`), the capability module's `PR_CAPBSET_READ`, `PR_CAPBSET_DROP`
   (with `CAP_SETPCAP`), `PR_GET_SECUREBITS`, `PR_SET_SECUREBITS` (which
   changes no locked bit; without `CAP_SETPCAP` only the two bits for exec's

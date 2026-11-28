@@ -27,8 +27,15 @@ pub const ENTRIES_PER_TABLE: u64 = 512;
 /// (Linux's default `fault_around_bytes`, 64 KiB).
 const FAULT_AROUND_PAGES: u64 = 16;
 
-/// Lowest address handed out for mappings without a fixed address.
+/// `vm.mmap_min_addr` at first (`CONFIG_DEFAULT_MMAP_MIN_ADDR` of Debian,
+/// Ubuntu and the CI runners): no mapping without a fixed address goes
+/// below it, nor a fixed one without `CAP_SYS_RAWIO`.
 pub const MMAP_MIN_ADDR: u64 = 0x10000;
+
+/// A machine's `vm.mmap_min_addr`, which each of its address spaces looks
+/// at as it places a mapping, moves one or grows a stack, and its sysctl
+/// sets ([`AddressSpace::with_min_addr`]).
+pub type MinAddr = Arc<AtomicU64>;
 /// Where `MAP_32BIT` looks for room, from the lowest address up
 /// (`find_start_end`, without its random start).
 const LOW_AREA: std::ops::Range<u64> = 0x4000_0000..0x8000_0000;
@@ -2809,7 +2816,7 @@ pub struct Remap {
     pub keep_old: bool,
     /// The target with `fixed`, or a hint with `keep_old` alone.
     pub new_addr: GuestAddr,
-    /// Whether the move may go below `MMAP_MIN_ADDR` (`cap_mmap_addr`).
+    /// Whether the move may go below `vm.mmap_min_addr` (`cap_mmap_addr`).
     pub low: bool,
 }
 
@@ -3384,6 +3391,8 @@ struct AddressSpaceData {
     /// What the frames are charged to; shared with the spaces forked from
     /// this one and the ones its exec starts.
     meter: Option<Arc<MemoryMeter>>,
+    /// The machine's `vm.mmap_min_addr`; shared as the meter is.
+    min_addr: MinAddr,
     /// A write found no room under the meter since the last
     /// [`AddressSpace::take_out_of_memory`], which reads it without the
     /// locks.
@@ -3511,6 +3520,7 @@ impl AddressSpaceData {
             mmap_top: DEFAULT_MMAP_TOP,
             bottom_up: None,
             meter: None,
+            min_addr: Arc::new(AtomicU64::new(MMAP_MIN_ADDR)),
             out_of_memory: Arc::default(),
             resident: AtomicU64::new(0),
             peak_resident: 0,
@@ -4498,6 +4508,7 @@ impl AddressSpaceData {
     fn fork(&mut self) -> Result<Self, Errno> {
         let mut copy = Self::new();
         copy.meter = self.meter.clone();
+        copy.min_addr = Arc::clone(&self.min_addr);
         copy.mappings = self.mappings.clone();
         copy.anon_names = self.anon_names.clone();
         copy.dump_filter = self.dump_filter;
@@ -5816,7 +5827,7 @@ impl AddressSpaceData {
             USER_ADDRESS_LIMIT - PAGE_SIZE
         };
         let free_at = |at: u64| {
-            at >= MMAP_MIN_ADDR
+            at >= self.min_addr()
                 && at.checked_add(padded).is_some_and(|stop| stop <= limit)
                 && !self.overlaps(at, at + padded)
                 // Linux looks for the longer area's guard gap too.
@@ -5841,14 +5852,21 @@ impl AddressSpaceData {
     /// (`MAP_32BIT`), else where [`Self::find_free`] puts them.
     fn free_area(&self, len: u64, low: bool) -> Option<u64> {
         if low {
-            self.lowest_gap_below(LOW_AREA.end, LOW_AREA.start, len, PAGE_SIZE)
+            let from = LOW_AREA.start.max(self.min_addr());
+            self.lowest_gap_below(LOW_AREA.end, from, len, PAGE_SIZE)
         } else {
             self.find_free(len)
         }
     }
+    /// The machine's `vm.mmap_min_addr` now.
+    fn min_addr(&self) -> u64 {
+        self.min_addr.load(Ordering::SeqCst)
+    }
     fn find_free(&self, len: u64) -> Option<u64> {
+        // Never below `vm.mmap_min_addr`, as `unmapped_area` raises its
+        // low limit to it.
         if let Some(base) = self.bottom_up {
-            return self.lowest_gap(base, len, PAGE_SIZE);
+            return self.lowest_gap(base.max(self.min_addr()), len, PAGE_SIZE);
         }
         let mut end = self.mmap_top;
         for (_, m) in self.mappings.range(..self.mmap_top).rev() {
@@ -5858,7 +5876,7 @@ impl AddressSpaceData {
             end = end.min(m.start_gap());
         }
         let start = end.checked_sub(len)?;
-        (start >= MMAP_MIN_ADDR).then_some(start)
+        (start >= self.min_addr()).then_some(start)
     }
 
     /// Applies `f` to every populated page entry in `[start, end)`. Only the
@@ -6759,7 +6777,7 @@ impl AddressSpaceData {
             }
             // `security_mmap_addr`, as `vrm_set_new_addr` asks it: the
             // target is unmapped and the source shrunk by then.
-            if to < MMAP_MIN_ADDR && !how.low {
+            if to < self.min_addr() && !how.low {
                 return Err(Errno::EPERM);
             }
             // Moving a part of memory that may not be split
@@ -7942,7 +7960,7 @@ impl AddressSpaceData {
     /// Linux's `expand_downwards` for an access at `addr` that no mapping
     /// holds: the mapping above it, when it grows down, takes the pages from
     /// `addr`'s down, so that the access can be made again. It does not when
-    /// `addr` is below `MMAP_MIN_ADDR` (`EPERM`), when a mapping below that
+    /// `addr` is below `vm.mmap_min_addr` (`EPERM`), when a mapping below that
     /// does not grow down and can be accessed ends less than
     /// [`STACK_GUARD_GAP`] under `addr`, when the VMA would then be larger
     /// than `stack_limit` (`RLIMIT_STACK`), or when it is locked and its new
@@ -7957,7 +7975,7 @@ impl AddressSpaceData {
         let Some((_, &next)) = self.mappings.range(addr..).next() else {
             return false;
         };
-        if !next.grows_down || addr < MMAP_MIN_ADDR {
+        if !next.grows_down || addr < self.min_addr() {
             return false;
         }
         if let Some((_, prev)) = self.mappings.range(..addr).next_back()
@@ -9664,6 +9682,22 @@ impl AddressSpace {
             .unwrap_or_else(PoisonError::into_inner)
             .meter = Some(meter);
         self
+    }
+    /// Looks at `min_addr` as the machine's `vm.mmap_min_addr`, and so do
+    /// the spaces forked from it.
+    #[must_use]
+    pub fn with_min_addr(self, min_addr: MinAddr) -> Self {
+        self.data
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .min_addr = min_addr;
+        self
+    }
+    /// The machine's `vm.mmap_min_addr` now, below which nothing is placed
+    /// without a fixed address (`mmap_min_addr`).
+    #[must_use]
+    pub fn min_addr(&self) -> u64 {
+        self.locked().min_addr()
     }
     /// The meter this space's frames are charged to.
     #[must_use]

@@ -2983,6 +2983,68 @@ mod tests {
         (r.errno, r.line)
     }
 
+    /// A digest of what the checks of each instruction's fields decide:
+    /// every code with registers, offsets and immediates at the edges the
+    /// checks look at, alone before `r0 = 0; exit` and, for a 64-bit load,
+    /// with its second half. A refusal of the field checks counts its errno
+    /// and line; anything else (taken, or refused later) only that it got
+    /// past them, so that the walk's own messages do not change it.
+    #[test]
+    fn the_field_checks_decide_as_they_did() {
+        let field_check = |line: &str| {
+            [
+                "uses reserved fields",
+                "unknown opcode",
+                " is invalid",
+                "bpf_ld_imm64",
+                "BPF_LD_IMM64",
+                "addr_space_cast",
+                "may_goto imm",
+                "fd_idx",
+                "paludarium: ",
+            ]
+            .iter()
+            .any(|p| line.contains(p))
+        };
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        let mut fnv = |bytes: &[u8]| {
+            for &b in bytes {
+                digest ^= u64::from(b);
+                digest = digest.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        let mut refusals = 0;
+        for code in 0..=u8::MAX {
+            for dst in [0, 1, 10, 11] {
+                for src in [0, 1, 2, 3, 4, 10, 11] {
+                    for off in [0, 1, 2, 8, 16, 32, -1] {
+                        for imm in [0, 1, 2, 8, 16, 32, 64, 1 << 16, -1] {
+                            let insn = i(code, dst, src, off, imm);
+                            let mut program = vec![insn];
+                            if insn.ldimm64() {
+                                program.push(i(0, 0, 0, 0, 0));
+                            }
+                            program.extend([mov(0, 0), exit()]);
+                            let outcome = match verify(&program, Options::default()) {
+                                Err(r) if field_check(&r.line) => {
+                                    refusals += 1;
+                                    format!("{} {}", r.errno.0, r.line)
+                                }
+                                _ => String::from("past"),
+                            };
+                            fnv(&[code, dst, src]);
+                            fnv(&off.to_le_bytes());
+                            fnv(&imm.to_le_bytes());
+                            fnv(outcome.as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        // Of 451,584 instructions, made before the checks were written anew.
+        assert_eq!((digest, refusals), (0x2dae_bfa7_7895_d275, 383_417));
+    }
+
     #[test]
     fn a_constant_return_loads() {
         assert_eq!(ok(&[mov(0, 0), exit()]), 2);

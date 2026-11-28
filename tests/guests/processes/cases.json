@@ -472,6 +472,7 @@
     {"name":"uts-sysctl-poll","binary":"process"},
     {"name":"net-sysctl","binary":"process"},
     {"name":"rseq","binary":"process"},
+    {"name":"dump-min-sysctls","binary":"process"},
     {"name":"pkey","binary":"process"},
     {"name":"vector-flags","binary":"process"},
     {"name":"old-times","binary":"process"},

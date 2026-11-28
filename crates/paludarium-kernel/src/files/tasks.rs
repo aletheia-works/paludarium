@@ -197,13 +197,14 @@ impl Task {
     /// rule.
     pub(super) fn owned(&self, stat: FileStat) -> FileStat {
         let ids = &self.public.credentials;
-        let (uid, gid) = if (self.holds() && self.view.dumpable) || stat.mode == OPEN_DIRECTORY {
-            (ids.euid, ids.egid)
-        } else if self.holds() {
-            dump_root(&self.view.exec_user)
-        } else {
-            (0, 0)
-        };
+        let (uid, gid) =
+            if (self.holds() && self.view.dumpable.user()) || stat.mode == OPEN_DIRECTORY {
+                (ids.euid, ids.egid)
+            } else if self.holds() {
+                dump_root(&self.view.exec_user)
+            } else {
+                (0, 0)
+            };
         FileStat { uid, gid, ..stat }
     }
     /// Whether the reader may see the task's memory and links, as Linux's
@@ -214,7 +215,7 @@ impl Task {
         self.pid == c.process.pid
             || c.process.credentials.may_read_task(
                 &self.public.credentials,
-                (self.view.dumpable, &self.view.exec_user),
+                (self.view.dumpable.user(), &self.view.exec_user),
                 real,
             )
     }
@@ -652,7 +653,7 @@ pub(crate) fn own_live_owner(
         // its program's namespace's root's while it is undumpable.
         let gone = view.zombie || (tid == pid && !view.group.has_member(pid));
         match public {
-            Some(public) if open || (view.dumpable && !gone) => {
+            Some(public) if open || (view.dumpable.user() && !gone) => {
                 (public.credentials.euid, public.credentials.egid)
             }
             Some(_) if !gone => dump_root(&view.exec_user),
@@ -736,7 +737,7 @@ impl AtRead {
             Reader::Own => true,
             Reader::Other(reader) => reader.credentials.may_read_task(
                 &self.target.credentials,
-                (self.view.dumpable, &self.view.exec_user),
+                (self.view.dumpable.user(), &self.view.exec_user),
                 false,
             ),
             Reader::Unknown => false,

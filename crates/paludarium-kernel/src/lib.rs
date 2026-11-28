@@ -1300,6 +1300,12 @@ impl Kernel {
         Ok((loaded, script))
     }
 
+    /// The machine's `vm.mmap_min_addr`, which the first program's address
+    /// space looks at as every later one does
+    /// ([`paludarium_mmu::AddressSpace::with_min_addr`]).
+    pub fn mmap_min_addr(&self) -> paludarium_mmu::MinAddr {
+        Arc::clone(&self.processes.sysctls.mmap_min_addr)
+    }
     /// What the mappings of the first program's ELF interpreter, at `path`,
     /// keep while they last: a hold on its file, as Linux's hold theirs.
     pub fn interpreter_keep(&self, path: &[u8]) -> Option<paludarium_loader::Keep> {

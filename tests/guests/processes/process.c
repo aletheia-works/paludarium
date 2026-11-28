@@ -32260,6 +32260,71 @@ static int sysctl_limits_case(void) {
     return 0;
 }
 
+/* The dump-min-sysctls case: /proc/sys/fs/suid_dumpable and
+   /proc/sys/vm/mmap_min_addr. Their values differ from machine to machine,
+   so their form shows, and what they bound: PR_SET_DUMPABLE takes 0 and 1
+   only, a hint below mmap_min_addr goes to it rounded up to a page, and,
+   as someone other than root, a fixed mapping below it is EPERM and
+   neither file opens to write. */
+static int dump_min_sysctls_case(void) {
+    char buf[64];
+    long long dumpable = -1, min = -1;
+    int formed = sl_number("/proc/sys/fs/suid_dumpable", buf, sizeof buf, &dumpable);
+    printf("suid_dumpable: formed=%d in-range=%d\n", formed, dumpable >= 0 && dumpable <= 2);
+    printf("mmap_min_addr: formed=%d\n", sl_number("/proc/sys/vm/mmap_min_addr", buf, sizeof buf, &min));
+    const char *files[] = {"/proc/sys/fs/suid_dumpable", "/proc/sys/vm/mmap_min_addr"};
+    for (int i = 0; i < 2; i++) {
+        struct stat st;
+        int r = stat(files[i], &st);
+        printf("%s: stat=%d mode=%o uid=%u size=%lld\n", files[i], r, (unsigned)(st.st_mode & 07777),
+               (unsigned)st.st_uid, (long long)st.st_size);
+    }
+    printf("dumpable: get=%d\n", prctl(PR_GET_DUMPABLE, 0, 0, 0, 0));
+    for (int value = 2; value <= 3; value++)
+        printf("dumpable: set %d=%d\n", value, prctl(PR_SET_DUMPABLE, value, 0, 0, 0) < 0 ? -errno : 0);
+    for (int value = 0; value <= 1; value++) {
+        int set = prctl(PR_SET_DUMPABLE, value, 0, 0, 0);
+        int get = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+        printf("dumpable: set %d=%d get=%d\n", value, set, get);
+    }
+    /* The page below the bound, when there is one. */
+    long long page = 4096, floor = (min + page - 1) & ~(page - 1);
+    long long below = min > page ? (min - 1) / page * page : 0;
+    if (below) {
+        void *at = mmap((void *)(uintptr_t)below, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        printf("hint below: raised=%d\n", at != MAP_FAILED && (long long)(uintptr_t)at == floor);
+        if (at != MAP_FAILED) munmap(at, 4096);
+    } else {
+        printf("hint below: raised=1\n");
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 && (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(2);
+        int fixed = 0;
+        if (below) {
+            void *at = mmap((void *)(uintptr_t)below, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            fixed = at == MAP_FAILED ? -errno : 0;
+        } else {
+            fixed = -EPERM;
+        }
+        printf("not root: fixed below=%d", fixed);
+        for (int i = 0; i < 2; i++) {
+            int fd = open(files[i], O_WRONLY | O_CLOEXEC);
+            printf(" write %d=%d", i, fd < 0 ? -errno : 0);
+            if (fd >= 0) close(fd);
+        }
+        printf("\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("not root: child=%d\n", status);
+    return 0;
+}
+
 /* The uts-sysctl case's files, under /proc/sys/kernel. */
 static int us_open(const char *name, int flags) {
     char path[96];
@@ -46236,6 +46301,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
     if (!strcmp(mode, "sysctl-constants")) return sysctl_constants_case();
     if (!strcmp(mode, "sysctl-limits")) return sysctl_limits_case();
+    if (!strcmp(mode, "dump-min-sysctls")) return dump_min_sysctls_case();
     if (!strcmp(mode, "poll-default")) return poll_default_case();
     if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
     if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();

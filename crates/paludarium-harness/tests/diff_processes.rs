@@ -1161,6 +1161,7 @@ mod linux {
         processes_uts_sysctl_poll => ("uts-sysctl-poll","process"),
         processes_net_sysctl => ("net-sysctl","process"),
         processes_rseq => ("rseq","process"),
+        processes_dump_min_sysctls => ("dump-min-sysctls","process"),
         processes_pkey => ("pkey","process"),
         processes_vector_flags => ("vector-flags","process"),
         processes_old_times => ("old-times","process"),

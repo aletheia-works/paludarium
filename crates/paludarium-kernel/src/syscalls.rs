@@ -2554,14 +2554,22 @@ const MAP_GROWSDOWN: u64 = 0x100;
 const MAP_32BIT: u64 = 0x40;
 
 /// Whether a mapping of `len` bytes at `addr` is refused for lying below
-/// `mmap_min_addr` (`cap_mmap_addr`): one that fits in what a program may
-/// map, without CAP_SYS_RAWIO in the first user namespace.
+/// the machine's `vm.mmap_min_addr` (`cap_mmap_addr`): one that fits in
+/// what a program may map, without CAP_SYS_RAWIO in the first user
+/// namespace.
 pub(crate) fn below_min(c: &Context<'_>, addr: u64, len: u64) -> bool {
     let fits = len
         .checked_next_multiple_of(4096)
         .and_then(|len| addr.checked_add(len))
         .is_some_and(|end| end <= USER_ADDRESS_LIMIT - 4096);
-    addr < paludarium_mmu::MMAP_MIN_ADDR && fits && !c.process.credentials.may_map_low()
+    addr < c.mem.min_addr() && fits && !c.process.credentials.may_map_low()
+}
+
+/// Where a hint below the machine's `vm.mmap_min_addr` goes: that, rounded
+/// up to a page as `round_hint_to_min` rounds it (`PAGE_ALIGN`, which wraps
+/// past the top).
+pub(crate) fn hint_floor(c: &Context<'_>) -> u64 {
+    c.mem.min_addr().wrapping_add(4095) & !4095
 }
 
 /// How a new mapping of `len` bytes with `flags` is locked, by `MAP_LOCKED`
@@ -2751,7 +2759,12 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // Linux rounds a non-fixed hint down to its page boundary, and one
         // below `mmap_min_addr` up to that (`round_hint_to_min`).
         let hint = addr & !4095;
-        let hint = (hint != 0).then(|| GuestAddr(hint.max(paludarium_mmu::MMAP_MIN_ADDR)));
+        let hint = if hint != 0 && hint < c.mem.min_addr() {
+            hint_floor(c)
+        } else {
+            hint
+        };
+        let hint = (hint != 0).then_some(GuestAddr(hint));
         // A file of a tmpfs mount with `huge=` goes at the 2 MiB boundary
         // its offset agrees with (`shmem_get_unmapped_area`).
         const HUGE: u64 = 2 << 20;

@@ -595,6 +595,41 @@ fn a_mapping_that_grows_down_grows_as_linux_expand_downwards_does() {
 }
 
 #[test]
+fn spaces_follow_their_machine_s_mmap_min_addr() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let min = Arc::new(AtomicU64::new(MMAP_MIN_ADDR));
+    let mut space = AddressSpace::new().with_min_addr(Arc::clone(&min));
+    assert_eq!(space.min_addr(), MMAP_MIN_ADDR);
+    space
+        .map(
+            Some(GuestAddr(MMAP_MIN_ADDR)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Stack,
+        )
+        .unwrap();
+    assert!(!space.grow_down(GuestAddr(MMAP_MIN_ADDR - 1), u64::MAX, u64::MAX));
+    // Lowered, a stack grows below the old bound, in the space and in its
+    // fork, which shares the value.
+    min.store(PAGE_SIZE, Ordering::SeqCst);
+    let fork = space.fork().unwrap();
+    assert_eq!(fork.min_addr(), PAGE_SIZE);
+    assert!(space.grow_down(GuestAddr(MMAP_MIN_ADDR - 1), u64::MAX, u64::MAX));
+    assert!(!space.grow_down(GuestAddr(PAGE_SIZE - 1), u64::MAX, u64::MAX));
+    // Raised, nothing without a fixed address goes below it, from the
+    // bottom up or in the first 2 GiB (`MAP_32BIT`).
+    min.store(0x5000_0000, Ordering::SeqCst);
+    space.set_bottom_up(Some(GuestAddr(0x1000_0000)));
+    let found = space
+        .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    assert_eq!(found.0, 0x5000_0000);
+    // Another space keeps its own.
+    assert_eq!(AddressSpace::new().min_addr(), MMAP_MIN_ADDR);
+}
+
+#[test]
 fn a_locked_mapping_grows_down_within_the_lock_limit() {
     let m = AddressSpace::new();
     let top = 0x4000_0000;

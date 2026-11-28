@@ -9960,7 +9960,7 @@ fn own_owner(c: &Context<'_>) -> (u32, u32) {
     let dumpable = c
         .processes
         .view(c.process.pid)
-        .is_none_or(|view| view.dumpable);
+        .is_none_or(|view| view.dumpable.user());
     let creds = &c.process.credentials;
     if dumpable {
         (creds.euid, creds.egid)

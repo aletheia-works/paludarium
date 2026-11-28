@@ -1179,7 +1179,7 @@ fn task(c: &Context<'_>, pid: i32) -> Result<(Arc<ThreadGroup>, u32, bool), Errn
     let readable = perfmon_capable(c)
         || c.process.credentials.may_read_task(
             &public.credentials,
-            (view.dumpable, &view.exec_user),
+            (view.dumpable.user(), &view.exec_user),
             true,
         );
     Ok((view.group, tid, readable))

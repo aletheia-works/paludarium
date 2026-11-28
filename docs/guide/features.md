@@ -686,6 +686,18 @@ kernel.
   ceiling on open files bounds the hard limit beside `nr_open`, whatever
   root writes to it.
 
+- `/proc/sys/fs/suid_dumpable` (0 at first) is the machine's, a root's file
+  of mode 0644 that takes an `int` from 0 to 2 (`proc_dointvec_minmax`,
+  `EINVAL` otherwise): how dumpable a process is after a change of its
+  effective or filesystem IDs, and after an `execve` of a program it may not
+  read or of other IDs, as Linux's `commit_creds` and `begin_new_exec` set
+  it. 0 leaves it undumpable, 1 dumpable, and 2 dumpable only as root
+  (`SUID_DUMP_ROOT`), which `PR_GET_DUMPABLE` reports as 2 and every other
+  check takes as undumpable: its `/proc` files are root's, it is readable
+  and traceable only with `CAP_SYS_PTRACE`, and it writes no core, as Linux
+  writes such a core only to an absolute path or a pipe, and `core` is
+  neither.
+
 - A pipe holds 16 buffers of a page each (64 KiB), as on Linux, and
   `fcntl`'s `F_SETPIPE_SZ` and `F_GETPIPE_SZ` resize and report it like
   `pipe_set_size`: a power of two of at least a page, `EBUSY` below the
@@ -1870,7 +1882,8 @@ kernel.
   `do_user_addr_fault` serves a kernel access), or an access of `ptrace` or
   `/proc/<pid>/mem` there (`__access_remote_vm`, within the limits of the
   one who makes it), extends it down to that
-  page, and the access is made again. It does not grow below `mmap_min_addr` (64 KiB), within the
+  page, and the access is made again. It does not grow below
+  `/proc/sys/vm/mmap_min_addr` (64 KiB at first), within the
   guard gap of 256 pages (`stack_guard_gap`) above a mapping that does not
   grow down and can be accessed, past `RLIMIT_STACK` for the whole VMA, or,
   locked, past `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`; the access then gives
@@ -1895,7 +1908,9 @@ kernel.
   lowest room from 1 GiB up (Linux starts up to 32 MiB higher, at random),
   with the placements at a 2 MiB boundary there too, or `ENOMEM`.
   `MAP_FIXED` overrides it, and `mremap` does not keep to it. A hint below
-  `mmap_min_addr` (64 KiB) is taken as that address; a fixed mapping
+  `/proc/sys/vm/mmap_min_addr` (64 KiB at first) is taken as that address,
+  rounded up to a page (`round_hint_to_min`), and no mapping without a fixed
+  address goes below it, in either layout; a fixed mapping
   below it, a move there by `mremap` (once its target is unmapped and its
   source shrunk; a free address asked for with `MREMAP_DONTUNMAP` alone
   too) and a `shmat` there give `EPERM` without `CAP_SYS_RAWIO`.
@@ -4260,8 +4275,9 @@ kernel.
   `PR_SET_KEEPCAPS`) and the ambient ones, the effective ID leaving root
   drops the effective ones and coming back raises them, and the filesystem
   ID does the same for the filesystem capabilities. A change of
-  an effective or filesystem ID makes the process undumpable
-  (`fs.suid_dumpable` is 0) and clears its parent-death signal. `execve`
+  an effective or filesystem ID leaves the process as dumpable as
+  `/proc/sys/fs/suid_dumpable` says (undumpable at first) and clears its
+  parent-death signal. `execve`
   of a set-user-ID program makes its owner the effective user ID, and of a
   set-group-ID program its group the effective group ID when the group may
   execute it. With `PR_SET_NO_NEW_PRIVS` it ignores those bits, and an exec
@@ -5094,9 +5110,15 @@ kernel.
   `POLLRDNORM`, `POLLERR` and `POLLPRI` and no `POLLOUT`. A `dup` and a child
   share what it has seen, and a poll of an epoll that watches it is one too.
 
-- `/proc/sys/vm` has `drop_caches`, `max_map_count` and
+- `/proc/sys/vm` has `drop_caches`, `max_map_count`, `mmap_min_addr` and
   `unprivileged_userfaultfd` alone, so its listing differs from Linux's,
-  which has the rest of the `vm` sysctls too. `max_map_count` is the
+  which has the rest of the `vm` sysctls too. `mmap_min_addr` is the
+  machine's, 65536 at first, root's of mode 0644: an `unsigned long`
+  (`proc_doulongvec_minmax`, `EINVAL` for a `-`), which a writer without
+  `CAP_SYS_RAWIO` may not write (`EPERM`, before anything else, also for an
+  empty write), as `mmap_min_addr_handler` asks. Every address space of the
+  machine keeps to it at once: hints, placements, `mremap`, stack growth,
+  `userfaultfd` ranges and `MMAP_PAGE_ZERO`. `max_map_count` is the
   machine's 65530 (`DEFAULT_MAX_MAP_COUNT`), root's, of mode 0444, which no
   one opens to write (`EACCES`), as nothing here bounds a process's
   mappings by it. `unprivileged_userfaultfd` is the machine's, 0 at first, root's of
@@ -7101,8 +7123,9 @@ kernel.
   thread or process; as Linux's `forget_original_parent` sends it, each
   thread's signal goes to its process when the parent's thread that made
   the process exits, even if the parent goes on, and again as each thread
-  the process is then a child of exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
-  again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
+  the process is then a child of exits), `PR_SET_DUMPABLE` (0 or 1, else
+  `EINVAL`; `PR_GET_DUMPABLE` gives 2 too after `fs.suid_dumpable` 2 set it;
+  `execve` makes the process dumpable again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
   by `execve`), the capability module's `PR_CAPBSET_READ`, `PR_CAPBSET_DROP`
   (with `CAP_SETPCAP`), `PR_GET_SECUREBITS`, `PR_SET_SECUREBITS` (which
   changes no locked bit; without `CAP_SETPCAP` only the two bits for exec's

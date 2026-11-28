@@ -175,8 +175,8 @@ verified.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/interrupts`, `/proc/partitions`, `/proc/kallsyms`, the files of `/proc/sys` but for the ones of `fs`,
-  `kernel` and `net` it has and `vm/drop_caches`, `vm/max_map_count` and
-  `vm/unprivileged_userfaultfd`, ...) and the other names in
+  `kernel` and `net` it has and `vm/drop_caches`, `vm/max_map_count`,
+  `vm/mmap_min_addr` and `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, `attr`, ...) are `ENOENT`, as in
   another process's directory, whatever the filesystem holds there (with
   `--mount /:/`, the host's `/proc`), where Linux shows them, and root
@@ -192,6 +192,15 @@ verified.
   `fs/pipe-user-pages-soft` and `fs/pipe-user-pages-hard`, and nothing counts
   a user's pipe pages, so a pipe of a user past Linux's soft limit is not
   made smaller nor refused growth (`EPERM`).
+  A write of 2 to `fs/suid_dumpable` logs nothing, where Linux logs that 2
+  wants an absolute or pipe `kernel.core_pattern`; there is no
+  `kernel.core_pattern` here, and its `core` is never one, so a process left
+  dumpable as root writes no core. `vm/mmap_min_addr` is wholly what was
+  written, where a Linux built with a security module's floor
+  (`CONFIG_LSM_MMAP_MIN_ADDR`) never places a mapping below that floor. An
+  ELF program whose segment lies below 64 KiB is refused at `execve`
+  (`ENOEXEC`) whatever `vm/mmap_min_addr` is, where Linux maps it when the
+  value or `CAP_SYS_RAWIO` lets it.
   `io` does not count what Linux's
   `kernel_read` and `kernel_write` count for the process (`execve` reading its
   program and interpreter, a core dump's writes), and a read or write that

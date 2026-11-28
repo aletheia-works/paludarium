@@ -81,8 +81,6 @@ const O_ASYNC: u32 = crate::fasync::O_ASYNC;
 const ERR: u32 = 8;
 const CAP_SYS_PTRACE: u64 = 1 << 19;
 const PAGE: u64 = 4096;
-/// `mmap_min_addr`, below which no range lies.
-const MIN_ADDRESS: u64 = paludarium_mmu::MMAP_MIN_ADDR;
 
 /// `UFFD_FEATURE_PAGEFAULT_FLAG_WP`: faults of write-protected pages are
 /// reported, with [`PAGEFAULT_FLAG_WP`].
@@ -1049,13 +1047,14 @@ fn put_word(c: &Context<'_>, at: u64, value: u64) -> Result<(), Errno> {
 }
 
 /// Linux 7.0's `validate_unaligned_range`, which the CI runners have: a
-/// whole number of pages, at least one, from at least `mmap_min_addr`,
-/// within the user half (`EINVAL`). Linux master no longer asks for
-/// `mmap_min_addr`.
-fn validate_unaligned(start: u64, len: u64) -> Result<(), Errno> {
+/// whole number of pages, at least one, from at least `min`, the machine's
+/// `vm.mmap_min_addr`, within the user half (`EINVAL`). Linux master no
+/// longer asks for `mmap_min_addr`.
+fn validate_unaligned(start: u64, len: u64, min: u64) -> Result<(), Errno> {
     if !len.is_multiple_of(PAGE)
         || len == 0
-        || !(MIN_ADDRESS..USER_ADDRESS_LIMIT).contains(&start)
+        || start < min
+        || start >= USER_ADDRESS_LIMIT
         || len > USER_ADDRESS_LIMIT - start
     {
         return Err(Errno::EINVAL);
@@ -1064,11 +1063,11 @@ fn validate_unaligned(start: u64, len: u64) -> Result<(), Errno> {
 }
 
 /// Linux's `validate_range`: the same, from a page's start.
-fn validate(start: u64, len: u64) -> Result<(), Errno> {
+fn validate(start: u64, len: u64, min: u64) -> Result<(), Errno> {
     if !start.is_multiple_of(PAGE) {
         return Err(Errno::EINVAL);
     }
-    validate_unaligned(start, len)
+    validate_unaligned(start, len, min)
 }
 
 /// `UFFDIO_API` (`userfaultfd_api`): the version and the features asked
@@ -1128,7 +1127,7 @@ fn register(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64,
     if mode == 0 || mode & !MODES != 0 {
         return Err(Errno::EINVAL);
     }
-    validate(start, len)?;
+    validate(start, len, c.mem.min_addr())?;
     let mut modes = mode as u8;
     if context.features() & FEATURE_WP_UNPOPULATED != 0 {
         modes |= paludarium_mmu::Userfault::WP_UNPOPULATED;
@@ -1160,7 +1159,7 @@ fn register(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64,
 /// context, and the waits for its missing pages end.
 fn unregister(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64, Errno> {
     let [start, len] = words::<2>(c, arg)?;
-    validate(start, len)?;
+    validate(start, len, c.mem.min_addr())?;
     for (from, to) in context
         .memory
         .userfault_unregister(start, start + len, context.id)?
@@ -1180,7 +1179,7 @@ fn write_protect(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result
         return Err(Errno::EAGAIN);
     }
     let [start, len, mode] = words::<3>(c, arg)?;
-    validate(start, len)?;
+    validate(start, len, c.mem.min_addr())?;
     if mode & !(WRITEPROTECT_MODE_WP | WRITEPROTECT_MODE_DONTWAKE) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -1201,7 +1200,7 @@ fn write_protect(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result
 /// `UFFDIO_WAKE` (`userfaultfd_wake`): ends the waits for the range.
 fn wake(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64, Errno> {
     let [start, len] = words::<2>(c, arg)?;
-    validate(start, len)?;
+    validate(start, len, c.mem.min_addr())?;
     context.wake(start, len);
     Ok(0)
 }
@@ -1241,15 +1240,15 @@ fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Res
     }
     let (dst, src, len, mode, result_at) = if copy {
         let [dst, src, len, mode] = words::<4>(c, arg)?;
-        validate_unaligned(src, len)?;
-        validate(dst, len)?;
+        validate_unaligned(src, len, c.mem.min_addr())?;
+        validate(dst, len, c.mem.min_addr())?;
         if mode & !(DONTWAKE | COPY_MODE_WP) != 0 {
             return Err(Errno::EINVAL);
         }
         (dst, src, len, mode, arg + 32)
     } else {
         let [dst, len, mode] = words::<3>(c, arg)?;
-        validate(dst, len)?;
+        validate(dst, len, c.mem.min_addr())?;
         let modes = if kind == Fill::Continue {
             DONTWAKE | COPY_MODE_WP
         } else {
@@ -1340,8 +1339,8 @@ fn move_pages(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u6
     if c.mem.view().identity() != context.memory.identity() {
         return Err(Errno::EINVAL);
     }
-    validate(dst, len)?;
-    validate(src, len)?;
+    validate(dst, len, c.mem.min_addr())?;
+    validate(src, len, c.mem.min_addr())?;
     if mode & !(MOVE_MODE_DONTWAKE | MOVE_MODE_ALLOW_SRC_HOLES) != 0 {
         return Err(Errno::EINVAL);
     }

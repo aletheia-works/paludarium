@@ -63,10 +63,12 @@ On x86-64 Linux, `mise run test:diff` needs
 `sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0` for the
 core-dump case and `sudo sysctl -w net.unix.max_dgram_qlen=10` for the
 unix-datagram case, as CI sets.
-A new process case is a mode of `tests/guests/processes/process.c`, listed in
-`tests/guests/processes/cases.json` and in the `cases!` list of
-`crates/paludarium-harness/tests/diff_processes.rs`; a test fails when the two
-lists differ.
+A new process case is a mode of a guest in `tests/guests/processes` and one
+line of the `cases!` list of `crates/paludarium-harness/tests/diff_processes.rs`,
+in its place by test name, with `root` when Linux's side must run as root and a
+comment above saying why. A test fails when the list is out of order or holds a
+case twice. A guest of its own is a new `.c` file there; `build.sh` builds each
+one with the flags they share, so it needs no line of its own.
 `lint:all` also checks that the system-call tables of the features pages, in
 English and Japanese, list exactly the calls the kernel implements: a new
 system call gets its name in `scripts/syscall-docs.py` and a place in both

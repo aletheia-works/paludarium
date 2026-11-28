@@ -31807,6 +31807,59 @@ static int sysctl_constants_case(void) {
     return 0;
 }
 
+/* The vfork-state case: what /proc shows of a parent that waits for its
+   vfork child, which Linux's wait_for_vfork_done does TASK_KILLABLE: the
+   state letter of its stat and the State line of its status. The child
+   writes them itself, sharing the parent's memory, so without stdio. */
+static int vfork_state_case(void) {
+    pid_t parent = getpid();
+    pid_t pid = vfork();
+    if (pid < 0) return 93;
+    if (!pid) {
+        char path[64], text[2048], out[160];
+        char stat_state = '?';
+        /* The parent may not be in its wait yet, running still: look again
+           a while. */
+        for (int tries = 0; tries < 2000; tries++) {
+            snprintf(path, sizeof path, "/proc/%d/stat", (int)parent);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            long n = fd < 0 ? -1 : read(fd, text, sizeof text - 1);
+            if (fd >= 0) close(fd);
+            text[n < 0 ? 0 : n] = 0;
+            char *paren = strrchr(text, ')');
+            stat_state = paren && paren[1] == ' ' ? paren[2] : '?';
+            if (stat_state != 'R') break;
+            struct timespec pause = {0, 1000000};
+            nanosleep(&pause, NULL);
+        }
+        int fd;
+        long n;
+        snprintf(path, sizeof path, "/proc/%d/status", (int)parent);
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        n = fd < 0 ? -1 : read(fd, text, sizeof text - 1);
+        if (fd >= 0) close(fd);
+        text[n < 0 ? 0 : n] = 0;
+        char *line = strstr(text, "\nState:\t");
+        char *end = line ? strchr(line + 1, '\n') : NULL;
+        int len = snprintf(out, sizeof out, "parent: stat=%c status=%.*s\n", stat_state,
+                           line && end ? (int)(end - line - 8) : 1, line && end ? line + 8 : "?");
+        if (write(1, out, len) != len) _exit(2);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("child: status=%d\n", status);
+    char path[64], text[2048];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)parent);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    long n = fd < 0 ? -1 : read(fd, text, sizeof text - 1);
+    if (fd >= 0) close(fd);
+    text[n < 0 ? 0 : n] = 0;
+    char *paren = strrchr(text, ')');
+    printf("self after: stat=%c\n", paren && paren[1] == ' ' ? paren[2] : '?');
+    return 0;
+}
+
 /* The uts-sysctl case's files, under /proc/sys/kernel. */
 static int us_open(const char *name, int flags) {
     char path[96];
@@ -47141,6 +47194,7 @@ int main(int argc, char **argv) {
         result("status", status);
         return 0;
     }
+    if (!strcmp(mode, "vfork-state")) return vfork_state_case();
     int vf = !strcmp(mode, "vfork-exec") || !strcmp(mode, "vfork-exit");
     pid_t pid = vf ? vfork() : child();
     if (pid < 0) return 93;

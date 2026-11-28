@@ -3971,7 +3971,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、Linux が動いていない
   タスクをそう見せるのと同じく、スレッドが待ちで眠っている間（パイプ、futex、タイマーなど
-  何を待っていても）は `S (sleeping)`、それ以外は `R` です。待たないシステムコールの中に
+  何を待っていても）は `S (sleeping)` です。ただし、Linux のタスクが `TASK_KILLABLE` で眠る
+  待ち（子を待つ `vfork` の親、fanotify のリスナーの答えを待つ open、userfaultfd の
+  イベントが読まれるのを待つタスク、`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` で kill だけで
+  終わるようになった seccomp の通知の待ち）では `D (disk sleep)` です。それ以外は `R` です。待たないシステムコールの中に
   いる間も `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
   持ちません。Linux と同じく、`cmdline`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。

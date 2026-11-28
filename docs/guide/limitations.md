@@ -195,8 +195,11 @@ verified.
   and `getrusage` and a wait's rusage as `ru_nvcsw` and 0 as `ru_nivcsw`.
   `status` has no `VmPin` or `VmPTE`, as nothing counts the pages pinned
   (`pinned_vm`) or the bytes of the page tables.
-  Another process's thread is `S (sleeping)` in every wait, where Linux shows
-  some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
+  Another process's thread is `D (disk sleep)` only in the waits Linux makes
+  `TASK_KILLABLE` that paludarium has (see features) and `S (sleeping)` in
+  every other, where Linux also shows its uninterruptible locks (a pipe's
+  mutex, which a thread here takes without showing it asleep) and I/O
+  waits as `D`. A thread shows another
   process what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen
   only while the thread is stopped in it. A task with no memory left (a

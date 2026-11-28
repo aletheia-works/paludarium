@@ -1295,6 +1295,7 @@ mod linux {
         processes_io_uring_multishot => ("io-uring-multishot","process"),
         processes_io_uring_splice => ("io-uring-splice","process"),
         vfork_exit => ("vfork-exit","process"),
+        vfork_state => ("vfork-state","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),
         clone_vm => ("clone-vm","process"),

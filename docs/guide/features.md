@@ -4642,7 +4642,12 @@ kernel.
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
   a futex, a timer or anything else it sleeps on), as Linux shows a task
-  that is not running, and `R` otherwise, also while it runs in a system
+  that is not running, `D (disk sleep)` instead in a wait Linux's task
+  sleeps `TASK_KILLABLE` in (a `vfork` parent waiting for its child, an
+  open waiting for a fanotify listener's answer, a task waiting for its
+  userfaultfd event to be read, and a seccomp notification's wait once
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` makes it killable), and `R`
+  otherwise, also while it runs in a system
   call that does not wait. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
   `maps` and `smaps` are empty, and open for any reader their mode lets,

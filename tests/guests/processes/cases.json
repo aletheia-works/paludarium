@@ -443,6 +443,7 @@
     {"name":"offset","binary":"process"},
     {"name":"vfork-exec","binary":"process"},
     {"name":"vfork-exit","binary":"process"},
+    {"name":"vfork-state","binary":"process"},
     {"name":"exec","binary":"process"},
     {"name":"exec-thread","binary":"process"},
     {"name":"enoent","binary":"process"},

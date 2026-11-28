@@ -1277,9 +1277,9 @@ verified.
   Ethernet address (EUI-64, `addr_gen_mode` 0). What IPv6 sends of
   itself, its MLD reports, duplicate address detection's probes and the
   router solicitation, makes the neighbours of the groups it goes to
-  (`ff02::16`, the solicited-node ones, `ff02::2`), but reaches no peer:
-  a peer that forwards learns no neighbour of the end's link-local
-  address from the solicitation (`ndisc_recv_rs`). A report goes at once,
+  (`ff02::16`, the solicited-node ones, `ff02::2`), but only the router
+  solicitation reaches the peer, which learns from it if it forwards.
+  A report goes at once,
   where Linux's goes two ticks on (`mld_ifc_start_work`); none is sent
   again as Linux's timers send them (`mld_ifc_work`, `mld_dad_work`,
   `addrconf_rs_timer`), so a neighbour of one that is deleted is not made

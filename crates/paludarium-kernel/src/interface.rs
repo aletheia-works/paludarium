@@ -1903,6 +1903,30 @@ impl Addresses {
         n.timer = false;
         vec![Event::NewNeighbour(*n)]
     }
+    /// [`Self::neigh_learn`] of a router solicitation from `ip` at `lladdr`
+    /// that a device that forwards takes in (`ndisc_recv_rs`), which also
+    /// says the sender is no router (`NEIGH_UPDATE_F_OVERRIDE_ISROUTER`):
+    /// `NTF_ROUTER` goes from any but a permanent or `NUD_NOARP` one, told
+    /// of if that is all that changes.
+    pub(crate) fn neigh_learn_rs(
+        &mut self,
+        index: i32,
+        ip: Ipv6Addr,
+        lladdr: [u8; 6],
+        now: u64,
+    ) -> Vec<Event> {
+        let mut events = self.neigh_learn(index, ip, lladdr, now);
+        let i = self.end_neighbour(index, IpAddr::V6(ip), now);
+        let n = &mut self.neighbours[i];
+        if n.state & (NUD_NOARP | NUD_PERMANENT) == 0 && n.flags & NTF_ROUTER != 0 {
+            n.flags &= !NTF_ROUTER;
+            match events.last_mut() {
+                Some(Event::NewNeighbour(told)) => *told = *n,
+                _ => events.push(Event::NewNeighbour(*n)),
+            }
+        }
+        events
+    }
     /// The neighbours of the device of `index` flushed, as `neigh_ifdown`
     /// does when it goes down or away, or, `keep_permanent`, as
     /// `neigh_carrier_down` does when it loses its carrier, keeping the

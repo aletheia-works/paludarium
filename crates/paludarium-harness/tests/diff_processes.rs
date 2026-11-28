@@ -471,6 +471,7 @@ mod linux {
                     | "veth-dev-mcast"
                     | "net-dev-counters"
                     | "veth-igmp-neighbours"
+                    | "veth-ipv6-solicited-routers"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -750,6 +751,7 @@ mod linux {
         veth_dev_mcast => ("veth-dev-mcast","veth-dev-mcast"),
         net_dev_counters => ("net-dev-counters","net-dev-counters"),
         veth_igmp_neighbours => ("veth-igmp-neighbours","veth-igmp-neighbours"),
+        veth_ipv6_solicited_routers => ("veth-ipv6-solicited-routers","veth-ipv6-solicited-routers"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),

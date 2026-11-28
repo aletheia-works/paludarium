@@ -66,6 +66,7 @@ musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie 
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-dev-mcast" "$here/veth-dev-mcast.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/net-dev-counters" "$here/net-dev-counters.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-igmp-neighbours" "$here/veth-igmp-neighbours.c"
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-solicited-routers" "$here/veth-ipv6-solicited-routers.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-accept" "$here/veth-ipv6-accept.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-oif" "$here/veth-ipv6-oif.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-scope" "$here/veth-ipv6-scope.c"

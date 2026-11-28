@@ -869,6 +869,34 @@ impl Network {
         });
         Some((peer, own_mac))
     }
+    /// The router solicitation the veth end `index` sends at `now` from
+    /// its link-local address, with its own Ethernet address
+    /// (`ndisc_send_rs`), comes to its peer, which, as it forwards, learns
+    /// of its sender (`ndisc_recv_rs`,
+    /// [`crate::interface::Addresses::neigh_learn_rs`]); told of there. A
+    /// peer that does not forward takes no notice.
+    pub(crate) fn routers_solicited(&self, index: i32, now: u64) {
+        let Some(from) = self.addresses_at(Some(now)).ns_source(index, None) else {
+            return;
+        };
+        let Some((_, own_mac)) = self.veth_peer(index) else {
+            return;
+        };
+        let Some((there, at, _)) = self.nd_peer(index) else {
+            return;
+        };
+        let forwards = there
+            .devices()
+            .by_index(at)
+            .is_some_and(|d| d.conf6.forwarding != 0);
+        if !forwards {
+            return;
+        }
+        let events = there
+            .addresses_at(Some(now))
+            .neigh_learn_rs(at, from, own_mac, now);
+        there.later(events);
+    }
     /// [`Self::veth_peer`], where the peer takes IPv6.
     fn nd_peer(&self, index: i32) -> Option<(Arc<Network>, i32, [u8; 6])> {
         self.veth_peer(index)?.0.filter(|(there, at, _)| {

@@ -2640,154 +2640,158 @@ impl FileHandle for MapFile {
     }
 }
 
-/// What an LRU hash's element is on: Linux's `enum bpf_lru_list_type`.
+/// The lists an LRU hash's element can be on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Place {
+enum List {
+    /// Keys in use, the more recently used ones.
     Active,
+    /// Keys in use, the ones evicted first.
     Inactive,
+    /// Elements holding no key.
     Free,
+    /// Free elements the CPU has taken in a batch.
     LocalFree,
-    LocalPending,
+    /// Elements the CPU has given keys since it last took a batch.
+    Pending,
 }
 
-/// The lists of an LRU hash, as Linux's `bpf_lru_list.c` keeps them for the
-/// one CPU every command here runs on (a test on Linux pins itself to one):
-/// the active, inactive and free lists, and for a common LRU that CPU's
-/// local free and pending lists. Elements, as `bpf_lru_node`s, are linked
-/// in rings with a head each, so that each list's order, and so which key
-/// goes when the map is full, is the one Linux's gives.
+const LISTS: usize = 5;
+
+/// The elements of an LRU hash and its lists, for the one CPU every
+/// command here runs on (a test on Linux pins itself to one). A list is
+/// in order from its front, where elements are put, to its back, where
+/// they are taken from: each element on it has a stamp, smaller than
+/// every other's when it is put at the front.
+///
+/// The data structure is this file's own; the steps that choose a key to
+/// evict are Linux's, kept as they were, because which key goes is what a
+/// program sees (the tests fix it with digests of long traces, and the
+/// differential tests compare it with Linux). Its documentation
+/// (`map_hash.rst`, "LRU hash eviction") and the commit that brought the
+/// lists (3a08c2fd7634) describe the steps: a key is put on the CPU's
+/// pending list; a program's lookup sets its reference. When the CPU's
+/// free batch is empty, the pending keys go to the active list
+/// (referenced) or the inactive one, the lists are rotated, and a batch of
+/// `target_free` is taken from the free list, or failing that, shrunk off
+/// the inactive list's back. A per-CPU LRU (`BPF_F_NO_COMMON_LRU`) has no
+/// batches: an element is taken from the free list and put on the
+/// inactive one, and an empty free list is shrunk by
+/// [`PER_CPU_FREE_TARGET`].
 struct Lru {
-    /// Each element's links, then each list head's.
-    next: Vec<usize>,
-    prev: Vec<usize>,
-    place: Vec<Place>,
-    /// `bpf_lru_node.ref`, which only replacing a key sets from user space.
+    /// Each list's elements by stamp.
+    lists: [BTreeMap<i64, usize>; LISTS],
+    /// Each element's list and stamp on it.
+    on: Vec<(List, i64)>,
+    /// The next front's stamp.
+    front: i64,
+    /// The reference bit, which a program's lookup and replacing a key
+    /// set.
     referenced: Vec<bool>,
     keys: Vec<Vec<u8>>,
     /// Each element's value, while it holds a key.
     values: Vec<Option<Cell>>,
     /// The hash table: which element holds each key.
     table: BTreeMap<Vec<u8>, usize>,
-    /// How many are active and inactive (`counts`).
-    active: usize,
-    inactive: usize,
-    /// `next_inactive_rotation`: an element, or the inactive list's head.
-    rotation: usize,
-    /// `target_free` (a common LRU) and `nr_scans`.
+    /// Where the inactive list's next rotation starts: an element on it,
+    /// or `None`, before its front.
+    cursor: Option<usize>,
+    /// How many free elements a shrinking makes: a common LRU's batch size
+    /// (`target_free`), or a per-CPU one's [`PER_CPU_FREE_TARGET`]; and
+    /// how many elements one rotation or shrinking looks at.
     target_free: usize,
     scans: usize,
-    /// `BPF_F_NO_COMMON_LRU`: the CPU's own lists, without local ones.
     per_cpu: bool,
 }
 
-/// `LOCAL_FREE_TARGET`, `PERCPU_FREE_TARGET`: also each kind's `nr_scans`.
-const LOCAL_FREE_TARGET: usize = 128;
-const PERCPU_FREE_TARGET: usize = 4;
+/// How many elements a common LRU's rotation looks at, and the most a
+/// batch takes.
+const COMMON_SCANS: usize = 128;
+/// How many a per-CPU LRU's looks at.
+const PER_CPU_SCANS: usize = 4;
+/// How many elements a per-CPU LRU frees when its free list is empty, 4
+/// as its scans are, but a number of its own.
+const PER_CPU_FREE_TARGET: usize = 4;
 
 impl Lru {
-    /// `bpf_lru_init` and `bpf_lru_populate`: every element on the free list,
-    /// each put at its head. A common LRU has them all, with a target of
-    /// half a CPU's share between 1 and 128; one per CPU has this CPU's
-    /// share.
+    /// Every element free, the last one first. A common LRU has all of
+    /// them and batches of half a CPU's share, from 1 to 128; a per-CPU
+    /// one has this CPU's share.
     fn new(max_entries: u32, cpus: u64, per_cpu: bool) -> Lru {
         let share = (u64::from(max_entries) / cpus.max(1)) as usize;
         let elements = if per_cpu { share } else { max_entries as usize };
-        let heads = elements + 5;
         let mut lru = Lru {
-            next: (0..heads).collect(),
-            prev: (0..heads).collect(),
-            place: vec![Place::Free; elements],
+            lists: Default::default(),
+            on: vec![(List::Free, 0); elements],
+            front: 0,
             referenced: vec![false; elements],
             keys: vec![Vec::new(); elements],
             values: vec![None; elements],
             table: BTreeMap::new(),
-            active: 0,
-            inactive: 0,
-            rotation: elements + 1,
-            target_free: (share / 2).clamp(1, LOCAL_FREE_TARGET),
-            scans: if per_cpu {
-                PERCPU_FREE_TARGET
+            cursor: None,
+            target_free: if per_cpu {
+                PER_CPU_FREE_TARGET
             } else {
-                LOCAL_FREE_TARGET
+                (share / 2).clamp(1, COMMON_SCANS)
             },
+            scans: if per_cpu { PER_CPU_SCANS } else { COMMON_SCANS },
             per_cpu,
         };
         for i in 0..elements {
-            lru.add(i, lru.head(Place::Free));
+            lru.on[i] = (List::Free, i64::MAX);
+            lru.put(i, List::Free);
         }
         lru
     }
-    /// The head of a list, past the elements.
-    fn head(&self, place: Place) -> usize {
-        self.place.len()
-            + match place {
-                Place::Active => 0,
-                Place::Inactive => 1,
-                Place::Free => 2,
-                Place::LocalFree => 3,
-                Place::LocalPending => 4,
-            }
+
+    fn list(&self, list: List) -> &BTreeMap<i64, usize> {
+        &self.lists[list as usize]
     }
-    fn unlink(&mut self, i: usize) {
-        let (p, n) = (self.prev[i], self.next[i]);
-        self.next[p] = n;
-        self.prev[n] = p;
+
+    fn len(&self, list: List) -> usize {
+        self.list(list).len()
     }
-    /// `list_add`: at the head.
-    fn add(&mut self, i: usize, head: usize) {
-        let first = self.next[head];
-        self.next[i] = first;
-        self.prev[i] = head;
-        self.prev[first] = i;
-        self.next[head] = i;
+
+    /// The element at a list's front or back.
+    fn front_of(&self, list: List) -> Option<usize> {
+        self.list(list).values().next().copied()
     }
-    /// `list_move`: to the head of another list, or its own.
-    fn relink(&mut self, i: usize, head: usize) {
-        self.unlink(i);
-        self.add(i, head);
+
+    fn back_of(&self, list: List) -> Option<usize> {
+        self.list(list).values().next_back().copied()
     }
-    fn first(&self, place: Place) -> Option<usize> {
-        let head = self.head(place);
-        (self.next[head] != head).then_some(self.next[head])
+
+    /// The element next to `i` on its list, towards the front or the back.
+    fn before(&self, i: usize) -> Option<usize> {
+        let (list, stamp) = self.on[i];
+        self.list(list).range(..stamp).next_back().map(|(_, &e)| e)
     }
-    fn count(&mut self, place: Place, by: isize) {
-        match place {
-            Place::Active => self.active = self.active.wrapping_add_signed(by),
-            Place::Inactive => self.inactive = self.inactive.wrapping_add_signed(by),
-            _ => {}
+
+    fn after(&self, i: usize) -> Option<usize> {
+        let (list, stamp) = self.on[i];
+        self.list(list).range(stamp + 1..).next().map(|(_, &e)| e)
+    }
+
+    /// `i` put at the front of `list`, off the list it was on. Taking the
+    /// element the inactive list's next rotation starts at moves that
+    /// start one towards the front.
+    fn put(&mut self, i: usize, list: List) {
+        if self.cursor == Some(i) {
+            self.cursor = self.before(i);
         }
+        let (old, stamp) = self.on[i];
+        self.lists[old as usize].remove(&stamp);
+        self.front -= 1;
+        self.on[i] = (list, self.front);
+        self.lists[list as usize].insert(self.front, i);
     }
-    /// `__bpf_lru_node_move_to_free`.
-    fn move_to_free(&mut self, i: usize, head: usize, place: Place) {
-        if i == self.rotation {
-            self.rotation = self.prev[self.rotation];
-        }
-        self.count(self.place[i], -1);
-        self.place[i] = place;
-        self.relink(i, head);
-    }
-    /// `__bpf_lru_node_move_in`, from a local list.
-    fn move_in(&mut self, i: usize, place: Place) {
-        self.count(place, 1);
-        self.place[i] = place;
+
+    /// `i` put at the front of `list`, its reference cleared.
+    fn refile(&mut self, i: usize, list: List) {
         self.referenced[i] = false;
-        self.relink(i, self.head(place));
+        self.put(i, list);
     }
-    /// `__bpf_lru_node_move`, between the active, inactive and free lists.
-    fn shift(&mut self, i: usize, place: Place) {
-        if self.place[i] != place {
-            self.count(self.place[i], -1);
-            self.count(place, 1);
-            self.place[i] = place;
-        }
-        self.referenced[i] = false;
-        if i == self.rotation {
-            self.rotation = self.prev[self.rotation];
-        }
-        self.relink(i, self.head(place));
-    }
-    /// `htab_lru_map_delete_node`: takes the element's key out of the table
-    /// if it is still there.
+
+    /// Takes the element's key out of the table, if it still holds it.
     fn take_out(&mut self, i: usize) -> bool {
         if self.table.get(&self.keys[i]) == Some(&i) {
             self.table.remove(&self.keys[i]);
@@ -2799,210 +2803,198 @@ impl Lru {
             false
         }
     }
-    /// `__bpf_lru_list_rotate_active`: from the tail, up to `nr_scans`
-    /// elements back to the first, a referenced one to the active list's
-    /// head and the rest to the inactive list's.
+
+    /// The active list, when the inactive one has fewer: from its back,
+    /// up to a rotation's elements, the referenced ones back to its front
+    /// and the rest to the inactive list's, all unreferenced.
     fn rotate_active(&mut self) {
-        let head = self.head(Place::Active);
-        let first = self.next[head];
-        let mut i = self.prev[head];
-        let mut scanned = 0;
-        while i != head {
-            let before = self.prev[i];
-            let to = if self.referenced[i] {
-                Place::Active
-            } else {
-                Place::Inactive
-            };
-            self.shift(i, to);
-            scanned += 1;
-            if scanned == self.scans || i == first {
+        let mut scan = Vec::new();
+        let mut at = self.back_of(List::Active);
+        while let Some(i) = at {
+            if scan.len() == self.scans {
                 break;
             }
-            i = before;
+            scan.push(i);
+            at = self.before(i);
+        }
+        for i in scan {
+            let to = if self.referenced[i] {
+                List::Active
+            } else {
+                List::Inactive
+            };
+            self.refile(i, to);
         }
     }
-    /// `__bpf_lru_list_rotate_inactive`: from `next_inactive_rotation`
-    /// towards the head, up to `nr_scans` elements, a referenced one to the
-    /// active list; where it stops is where the next starts.
+
+    /// The inactive list in a circle, from the start the last rotation
+    /// left, towards the front and on from the back, up to a rotation's
+    /// elements, ending after the one past the start: the referenced ones
+    /// go to the active list's front. The next starts before the last one
+    /// looked at.
     fn rotate_inactive(&mut self) {
-        let head = self.head(Place::Inactive);
-        if self.next[head] == head {
+        if self.len(List::Inactive) == 0 {
             return;
         }
-        let mut last = self.next[self.rotation];
-        if last == head {
-            last = self.next[last];
-        }
-        let (mut current, mut next) = (self.rotation, head);
-        let mut scanned = 0;
-        while scanned < self.scans {
-            if current == head {
-                current = self.prev[current];
+        // The circle's next after an element, and before one, past the
+        // place before the front (`None`).
+        let circle_after = |lru: &Lru, at: Option<usize>| match at {
+            Some(i) => lru.after(i),
+            None => lru.front_of(List::Inactive),
+        };
+        let stop = circle_after(self, self.cursor).or_else(|| self.front_of(List::Inactive));
+        let mut at = self.cursor;
+        let mut start = None;
+        let mut looked = 0;
+        while looked < self.scans {
+            let Some(i) = at else {
+                at = self.back_of(List::Inactive);
                 continue;
+            };
+            start = self.before(i);
+            if self.referenced[i] {
+                self.refile(i, List::Active);
             }
-            next = self.prev[current];
-            if self.referenced[current] {
-                self.shift(current, Place::Active);
-            }
-            if current == last {
+            if Some(i) == stop {
                 break;
             }
-            current = next;
-            scanned += 1;
+            at = start;
+            looked += 1;
         }
-        self.rotation = next;
+        self.cursor = start;
     }
-    /// `__bpf_lru_list_rotate`: the active list when the inactive one has
-    /// fewer, then the inactive list.
+
     fn rotate(&mut self) {
-        if self.inactive < self.active {
+        if self.len(List::Inactive) < self.len(List::Active) {
             self.rotate_active();
         }
         self.rotate_inactive();
     }
-    /// `__bpf_lru_list_shrink`: up to `target` unreferenced elements from the
-    /// inactive list's tail onto a free list, within `nr_scans`; failing
-    /// that, the last of the inactive list, or else of the active one,
+
+    /// Up to `want` keys evicted onto `to`: from the inactive list's back,
+    /// within a rotation's elements, a referenced one going back to the
+    /// active list. If none goes, the first key from the back of the
+    /// inactive list, or if it is empty of the active one, is evicted
     /// whatever its reference.
-    fn shrink(&mut self, target: usize, free: usize, place: Place) {
-        let head = self.head(Place::Inactive);
-        let (mut i, mut scanned, mut shrunk) = (self.prev[head], 0, 0);
-        while i != head {
-            let before = self.prev[i];
+    fn shrink(&mut self, want: usize, to: List) {
+        let (mut at, mut looked, mut evicted) = (self.back_of(List::Inactive), 0, 0);
+        while let Some(i) = at {
+            let next = self.before(i);
             if self.referenced[i] {
-                self.shift(i, Place::Active);
+                self.refile(i, List::Active);
             } else if self.take_out(i) {
-                self.move_to_free(i, free, place);
-                shrunk += 1;
-                if shrunk == target {
+                self.put(i, to);
+                evicted += 1;
+                if evicted == want {
                     break;
                 }
             }
-            scanned += 1;
-            if scanned == self.scans {
+            looked += 1;
+            if looked == self.scans {
                 break;
             }
-            i = before;
+            at = next;
         }
-        if shrunk > 0 {
+        if evicted > 0 {
             return;
         }
-        let forced = if self.next[head] != head {
-            head
+        let from = if self.len(List::Inactive) > 0 {
+            List::Inactive
         } else {
-            self.head(Place::Active)
+            List::Active
         };
-        let mut i = self.prev[forced];
-        while i != forced {
-            let before = self.prev[i];
+        let mut at = self.back_of(from);
+        while let Some(i) = at {
+            let next = self.before(i);
             if self.take_out(i) {
-                self.move_to_free(i, free, place);
+                self.put(i, to);
                 return;
             }
-            i = before;
+            at = next;
         }
     }
-    /// `bpf_lru_list_pop_free_to_local`: the pending elements into the
-    /// lists, a rotation, then up to `target_free` free ones to the local
-    /// free list, and what is missing shrunk onto it.
-    fn pop_free_to_local(&mut self) {
-        let pending = self.head(Place::LocalPending);
-        let mut i = self.prev[pending];
-        while i != pending {
-            let before = self.prev[i];
+
+    /// A batch for the CPU: the pending keys onto the lists, oldest first,
+    /// a rotation, then free elements from the free list's front, and
+    /// what it lacks shrunk off.
+    fn take_batch(&mut self) {
+        while let Some(i) = self.back_of(List::Pending) {
             let to = if self.referenced[i] {
-                Place::Active
+                List::Active
             } else {
-                Place::Inactive
+                List::Inactive
             };
-            self.move_in(i, to);
-            i = before;
+            self.refile(i, to);
         }
         self.rotate();
-        let (free, local) = (self.head(Place::Free), self.head(Place::LocalFree));
-        let mut moved = 0;
-        let mut i = self.next[free];
-        while i != free {
-            let after = self.next[i];
-            self.move_to_free(i, local, Place::LocalFree);
-            moved += 1;
-            if moved == self.target_free {
-                break;
-            }
-            i = after;
+        let mut taken = 0;
+        while taken < self.target_free
+            && let Some(i) = self.front_of(List::Free)
+        {
+            self.put(i, List::LocalFree);
+            taken += 1;
         }
-        if moved < self.target_free {
-            self.shrink(self.target_free - moved, local, Place::LocalFree);
+        if taken < self.target_free {
+            self.shrink(self.target_free - taken, List::LocalFree);
         }
     }
-    /// `__local_list_pop_pending`: the oldest pending element whose key can
-    /// be taken out, unreferenced first.
-    fn pop_pending(&mut self) -> Option<usize> {
-        let pending = self.head(Place::LocalPending);
-        for force in [false, true] {
-            let mut i = self.prev[pending];
-            while i != pending {
-                if (!self.referenced[i] || force) && self.take_out(i) {
-                    self.unlink(i);
+
+    /// With no free element anywhere: the oldest pending key, an
+    /// unreferenced one first, whose element is taken back.
+    fn steal_pending(&mut self) -> Option<usize> {
+        for any in [false, true] {
+            let mut at = self.back_of(List::Pending);
+            while let Some(i) = at {
+                if (any || !self.referenced[i]) && self.take_out(i) {
                     return Some(i);
                 }
-                i = self.prev[i];
+                at = self.before(i);
             }
         }
         None
     }
-    /// `bpf_lru_pop_free`: an element for a new key, which may take another
-    /// key out of the table.
-    fn pop_free(&mut self) -> Option<usize> {
+
+    /// An element for a new key, which may evict another.
+    fn take_free(&mut self) -> Option<usize> {
         if self.per_cpu {
             self.rotate();
-            let free = self.head(Place::Free);
-            if self.next[free] == free {
-                self.shrink(PERCPU_FREE_TARGET, free, Place::Free);
+            if self.len(List::Free) == 0 {
+                self.shrink(self.target_free, List::Free);
             }
-            let i = self.first(Place::Free)?;
-            self.referenced[i] = false;
-            self.shift(i, Place::Inactive);
+            let i = self.front_of(List::Free)?;
+            self.refile(i, List::Inactive);
             return Some(i);
         }
-        let mut i = self.first(Place::LocalFree);
-        if i.is_none() {
-            self.pop_free_to_local();
-            i = self.first(Place::LocalFree);
+        if self.len(List::LocalFree) == 0 {
+            self.take_batch();
         }
-        let i = match i {
-            Some(i) => {
-                self.unlink(i);
-                i
-            }
-            // Stolen back from the CPU's own pending list: every other
-            // CPU's local lists are empty.
-            None => self.pop_pending()?,
+        let i = match self.front_of(List::LocalFree) {
+            Some(i) => i,
+            // Every other CPU's lists are empty: the pending ones are
+            // the only keys left to take.
+            None => self.steal_pending()?,
         };
-        self.place[i] = Place::LocalPending;
-        self.referenced[i] = false;
-        self.add(i, self.head(Place::LocalPending));
+        self.refile(i, List::Pending);
         Some(i)
     }
-    /// `bpf_lru_push_free`: a pending element back to the local free list,
-    /// any other to the free list.
-    fn push_free(&mut self, i: usize) {
+
+    /// An element given back: a pending one to the CPU's free batch, any
+    /// other to the free list.
+    fn give_back(&mut self, i: usize) {
         // A free element holds no value: not one a refused update put
         // there, nor a replaced key's old one.
         self.values[i] = None;
-        if !self.per_cpu && self.place[i] == Place::LocalPending {
-            self.place[i] = Place::LocalFree;
-            self.referenced[i] = false;
-            self.relink(i, self.head(Place::LocalFree));
+        if !self.per_cpu && self.on[i].0 == List::Pending {
+            self.refile(i, List::LocalFree);
         } else {
-            self.shift(i, Place::Free);
+            self.refile(i, List::Free);
         }
     }
-    /// `htab_lru_map_update_elem`: an element is taken first, then the flags
-    /// are checked; a key replaced is referenced in its new element.
+
+    /// An update: an element is taken first, then the flags are checked; a
+    /// key replaced is referenced in its new element.
     fn update(&mut self, key: &[u8], value: Cell, mode: u64) -> Result<(), Errno> {
-        let i = self.pop_free().ok_or(ENOMEM)?;
+        let i = self.take_free().ok_or(ENOMEM)?;
         self.keys[i] = key.to_vec();
         self.values[i] = Some(value);
         let old = self.table.get(key).copied();
@@ -3012,27 +3004,29 @@ impl Lru {
             _ => None,
         };
         if let Some(e) = refused {
-            self.push_free(i);
+            self.give_back(i);
             return Err(e);
         }
         self.table.insert(key.to_vec(), i);
         if let Some(old) = old {
             self.referenced[i] = true;
-            self.push_free(old);
+            self.give_back(old);
         }
         Ok(())
     }
-    /// `htab_lru_map_delete_elem`.
+
     fn delete(&mut self, key: &[u8]) -> Result<Vec<u8>, Errno> {
         let i = self.table.remove(key).ok_or(Errno::ENOENT)?;
         let value = self.values[i].take().map(|value| copy(&value));
-        self.push_free(i);
+        self.give_back(i);
         Ok(value.unwrap_or_default())
     }
+
     fn get(&self, key: &[u8]) -> Option<&Cell> {
         self.table.get(key).and_then(|&i| self.values[i].as_ref())
     }
-    /// `bpf_lru_node_set_ref`, as a program's lookup sets it.
+
+    /// A program's lookup, which references the key.
     fn reference(&mut self, key: &[u8]) -> Option<&Cell> {
         let &i = self.table.get(key)?;
         self.referenced[i] = true;
@@ -3803,5 +3797,76 @@ mod tests {
         assert!(value.same(&m.prog_lookup(&3u32.to_le_bytes()).unwrap()));
         assert!(!value.same(&m.prog_lookup(&2u32.to_le_bytes()).unwrap()));
         assert!(m.prog_lookup(&4u32.to_le_bytes()).is_none());
+    }
+
+    /// The keys an LRU hash holds after each of many operations, as a
+    /// digest: fixed before the lists were written again, so that the
+    /// rewrite evicts as before.
+    fn lru_trace(max_entries: u32, cpus: u64, per_cpu: bool, seed: u64) -> u64 {
+        let mut lru = Lru::new(max_entries, cpus, per_cpu);
+        let mut rng = seed | 1;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                digest = (digest ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        let span = u64::from(max_entries) * 2 + 2;
+        for _ in 0..4000 {
+            let r = next();
+            let key = ((r >> 8) % span).to_le_bytes().to_vec();
+            let outcome = match r % 8 {
+                0..=3 => {
+                    let mode = [0, 0, NOEXIST, EXIST][(r >> 40) as usize % 4];
+                    lru.update(&key, cell(vec![1]), mode).map(|()| 0)
+                }
+                4 => lru.delete(&key).map(|_| 1),
+                5 | 6 => Ok(u8::from(lru.reference(&key).is_some())),
+                _ => Ok(2 + u8::from(lru.get(&key).is_some())),
+            };
+            mix(&[match outcome {
+                Ok(v) => v,
+                Err(e) => 100 + e.0 as u8,
+            }]);
+            for k in lru.table.keys() {
+                mix(k);
+            }
+            mix(&[0xff]);
+        }
+        digest
+    }
+
+    #[test]
+    fn an_lru_hash_evicts_as_it_did() {
+        let cases: [(u32, u64, bool, [u64; 2]); 8] = [
+            (4, 1, false, [0x7af4_c27f_c587_7783, 0xffd6_d081_36fa_692a]),
+            (8, 1, false, [0x13e8_2637_29c0_21ef, 0xa2e5_3fc6_2208_77db]),
+            (16, 2, false, [0x1665_7061_8f84_7841, 0x873b_02a7_f346_b468]),
+            (
+                300,
+                1,
+                false,
+                [0xc5ac_61ab_0698_8eea, 0x899a_69ab_d5d4_bc65],
+            ),
+            (3, 1, true, [0x21f3_5ed3_567b_25ed, 0x673e_3a94_c3a4_f51a]),
+            (8, 2, true, [0x1b5b_e125_5ff1_c5c1, 0x6d66_5a63_af48_a1ac]),
+            (16, 4, true, [0x1129_162a_23c3_e4e3, 0x4bb7_a439_2a5f_db47]),
+            (40, 1, true, [0x754e_4fc3_89d0_642c, 0x5663_e938_674d_4378]),
+        ];
+        for (max_entries, cpus, per_cpu, expected) in cases {
+            for (seed, want) in [1, 2].into_iter().zip(expected) {
+                assert_eq!(
+                    lru_trace(max_entries, cpus, per_cpu, seed * 0x9e37_79b9),
+                    want,
+                    "{max_entries} entries, {cpus} CPUs, per CPU {per_cpu}, seed {seed}"
+                );
+            }
+        }
     }
 }

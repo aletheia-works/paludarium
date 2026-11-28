@@ -308,6 +308,17 @@ kernel.
   whose IDs start at 21, does not show, as Linux's internal mounts are.
   `AT_EMPTY_PATH` names the descriptor, or the working directory for
   `AT_FDCWD`, and as since Linux 6.11 a null path with it does too.
+  `stx_attributes_mask` has the attributes Linux 7.0 knows for every file
+  (`STATX_ATTR_AUTOMOUNT`, `STATX_ATTR_MOUNT_ROOT` and `STATX_ATTR_DAX`, of
+  which no file here has the first or the last). A tmpfs or devtmpfs file,
+  a symbolic link, a special file or a memfd too, adds
+  `STATX_ATTR_IMMUTABLE`, `STATX_ATTR_APPEND` and `STATX_ATTR_NODUMP`, as
+  `shmem_getattr` does. `STATX_ATTR_MOUNT_ROOT` is set for a mount's root by
+  whatever path names it (`.`, `..`, a link on the way, its descriptor), and
+  not for a symbolic link, a chroot's root that is no mount's, or the file
+  of a pipe or socket. A `/proc/<pid>` directory has no
+  `STATX_ATTR_IMMUTABLE`, though its inode is `S_IMMUTABLE`, as proc's
+  `getattr` gives none on Linux.
 
 - `name_to_handle_at` gives a file's handle, checked in the order of
   Linux's (6.13 and later): the flags (`EINVAL`, also for
@@ -655,10 +666,33 @@ kernel.
   (45 at first) are root's files of mode 0644, which take any `int`
   (`proc_dointvec`).
 
+- `/proc/sys/fs/nr_open` and `/proc/sys/fs/pipe-max-size` (both 1048576 at
+  first) are the machine's, root's files of mode 0644 that take an
+  `unsigned int` (`proc_douintvec_minmax`): `nr_open` from 64 to 2147483584
+  (`EINVAL` otherwise), and `pipe-max-size` cut to 32 bits and rounded up to
+  a power of two of at least a page, as `round_pipe_size` rounds it, past
+  2³¹ `EINVAL`. `nr_open` bounds the hard `RLIMIT_NOFILE` (`EPERM` past it)
+  and each descriptor table, as Linux's tables grow: a table has room for 64
+  descriptors at first, and a number past its room grows it to the least
+  power of two that holds the number, but not past `nr_open`, cut back to a
+  multiple of 64, nor past 2²⁷ descriptors; a number it cannot grow to is
+  `EMFILE` (`EBADF` for `dup2` and `dup3`). A table that grew keeps its room
+  when `nr_open` drops. A copy of a table (`fork`, `clone` without
+  `CLONE_FILES`, `unshare(CLONE_FILES)`, `CLOSE_RANGE_UNSHARE` and the exec
+  of a thread that shares its table) has room for its highest number in use,
+  in steps of 64, not counting the numbers `close_range` closes, and fails
+  with `EMFILE` when `nr_open` no longer lets a table have that much; the
+  exec, past its point of no return, ends with `SIGSEGV`. An embedder's
+  ceiling on open files bounds the hard limit beside `nr_open`, whatever
+  root writes to it.
+
 - A pipe holds 16 buffers of a page each (64 KiB), as on Linux, and
   `fcntl`'s `F_SETPIPE_SZ` and `F_GETPIPE_SZ` resize and report it like
   `pipe_set_size`: a power of two of at least a page, `EBUSY` below the
-  buffers in use and `EINVAL` past 2³¹. A write's bytes past whole pages
+  buffers in use and `EINVAL` past 2³¹. Without `CAP_SYS_RESOURCE`, a new
+  pipe or FIFO holds no more than `/proc/sys/fs/pipe-max-size`, and
+  `F_SETPIPE_SZ` may not grow a pipe past it (`EPERM`), as
+  `alloc_pipe_info` and `pipe_set_size` have it. A write's bytes past whole pages
   join the last buffer where it has room, and the rest go into new
   buffers, as `anon_pipe_write` places them; `splice`, `tee` and
   `vmsplice` make buffers of their own, which no write joins.
@@ -836,6 +870,17 @@ kernel.
   signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_ERR`,
   `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set
   through as `si_fd`.
+
+  Naming an owner keeps who named it, as `sigio_perm` checks: `F_SETOWN`,
+  `F_SETOWN_EX`, and dnotify, a lease or a terminal's `O_ASYNC` making the
+  caller the owner of a file that has none. The file's signals, and a
+  socket's `SIGURG`, reach a process (or the thread `F_OWNER_TID` names)
+  only when the effective user ID kept is root's, or either kept user ID is
+  that process's real or saved one. Who makes the file signal does not count,
+  nor does a later `F_SETSIG`. A Landlock domain of the one who named the
+  owner, if it scopes signals, keeps them from processes outside it, though
+  never from that one's own process; a domain entered after naming the owner
+  does not count.
   - **Pipes.** Every write signals the reader as it ends, even one that
     finds the pipe full, and also before each wait. Every read signals the
     writer as it ends, with data or not. The close of either end signals
@@ -2170,7 +2215,23 @@ kernel.
   again once the socket is ready, unless it asked not to (`MSG_DONTWAIT`,
   `IORING_ACCEPT_DONTWAIT`), when it completes with `EAGAIN`.
   `IORING_RECVSEND_POLL_FIRST` and `IORING_ACCEPT_POLL_FIRST` wait first.
-  A send adds `MSG_NOSIGNAL`. With `MSG_WAITALL`, a stream or
+  A send adds `MSG_NOSIGNAL`. With `IORING_SEND_VECTORIZED` it sends the
+  iovecs at its address, as many as its length says, which it reads as it
+  is prepared (`io_net_import_vec`). With `IOSQE_BUFFER_SELECT` it sends
+  from the buffers it selects as it first runs, and keeps them while it
+  waits (`io_buffers_select`): a group it does not find is `ENOENT`, one
+  with none left `ENOBUFS`, and a ring's buffer outside the user half
+  `EFAULT`. A buffer is cut to the length, as Linux master cuts it, its
+  ring entry as it was. Its completion names the first, as a
+  read's does, and so does one that fails. With `IORING_RECVSEND_BUNDLE` a
+  send sends all it has (`MSG_WAITALL`), and one that selects takes as
+  many of a ring's buffers as its length needs, at most 256, leaving one
+  it would cut for the next unless the ring has `IOU_PBUF_RING_INC`; taking
+  the last one there is empties the group. A bundle that
+  sent anything posts with `IORING_CQE_F_MORE` and sends again at once,
+  with no length and new buffers, until it sends nothing, takes its
+  group's last buffers or waited (`io_send_finish`); one that selects none
+  sends nothing the second time. With `MSG_WAITALL`, a stream or
   sequenced-packet socket's send or receive goes on to its whole length
   and gives all it moved; one that fails on the way, as it asked not to
   wait or was cancelled, gives what it moved too (`io_sendrecv_fail`). A
@@ -3198,10 +3259,15 @@ kernel.
     (`ip_route_connect`). A socket's flow hashes its own port, which a UDP
     socket has before its route (`inet_send_prepare`, `inet_dgram_connect`),
     and a connection with none yet a random one (`FLOWI_FLAG_ANY_SPORT`);
-    an answer hashes its own ports. A packet may come in on the device of any hop of
-    the route back to its source (`fib_info_nh_uses_dev`), and its answer
-    goes back by a lookup of its own, through whichever end that takes, or
-    the one its listener is bound to. An output lookup that goes through
+    an answer hashes its own ports. IPv4's port unreachable is looked up
+    with the datagram it tells of (`icmp_route_lookup`), hashed as the
+    packet of an `RTM_GETROUTE` is. Under policy 1, a datagram from a
+    connected socket is hashed instead by the random flow hash that socket
+    gave it (`sk_txhash`, `skb_set_hash_from_sk`). A packet may come in
+    on the device of any hop of the route back to its source
+    (`fib_info_nh_uses_dev`), and its answer goes back by a lookup of its
+    own, through whichever end that takes, or the one its listener is bound
+    to. An output lookup that goes through
     an end leaves from its first primary address, else from the first of
     the other devices' in the order they were made
     (`inet_select_addr`), and names it as `RTA_OIF`,
@@ -4362,7 +4428,7 @@ kernel.
   space and inodes are what it holds, and a mounted host directory with the
   host filesystem's own numbers. `/proc/self/mountinfo` and `/proc/self/mounts`
   list the mounts of the caller's mount namespace, and so does `/proc/mounts`,
-  a symbolic link to `self/mounts` (0777, of size 11) as Linux's
+  a symbolic link to `self/mounts` (0777, of size 11), as on Linux
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
   `proc` for `/proc`, `devtmpfs` for `/dev` and the tmpfs on `/dev/shm`
   from start-up,
@@ -4926,9 +4992,27 @@ kernel.
   (`ptrace`, `process_vm_readv`, `pidfd_getfd`, `/proc/<pid>/mem` and the
   other files that attach), and at 2 `PTRACE_TRACEME` needs a tracer with
   `CAP_SYS_PTRACE` in the caller's user namespace and at 3 is refused
-  (`EPERM`), as `yama_ptrace_traceme`. `/proc/sys/kernel` lists only these,
-  the six below and `yama`, and each directory of `/proc/sys` lists its
-  entries by name, as Linux's tree of them keeps them.
+  (`EPERM`), as `yama_ptrace_traceme`.
+  `/proc/sys/kernel` also has the machine's constants, of mode 0444 and
+  root's, which no one opens to write (`EACCES`): `cap_last_cap` (40, the
+  highest capability `prctl` takes) and `ngroups_max` (65536, the most
+  groups `setgroups` takes), as Linux's `kernel/sysctl.c`; and
+  `seccomp/actions_avail`, the names of the actions
+  `SECCOMP_GET_ACTION_AVAIL` takes, as `kernel/seccomp.c` has it
+  (`actions_logged`, which Linux has beside it, is not made, as nothing is
+  logged). `/proc/sys/kernel/random` has the files of Linux's
+  `drivers/char/random.c`: `poolsize`, `entropy_avail` and
+  `write_wakeup_threshold` 256, the bits of a pool that is ready, as on a
+  booted machine, and `urandom_min_reseed_secs` 60, of which the last two
+  are of mode 0644 and take what root writes whole, to no effect
+  (`proc_do_rointvec`); `boot_id`, a random version 4 UUID the machine draws
+  at its first read and keeps, and `uuid`, a new one at each read
+  (`proc_do_uuid`). A string among these is read from where the file is, as
+  `proc_dostring` reads it, and an `int` only from the start.
+  `/proc/sys/kernel` lists only these, the six below and the directories
+  `random`, `seccomp` and `yama`, and each directory of `/proc/sys` lists
+  its entries by name, directories among files, as Linux's tree of them
+  keeps them.
 
 - `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
   `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`
@@ -4952,9 +5036,12 @@ kernel.
   `POLLRDNORM`, `POLLERR` and `POLLPRI` and no `POLLOUT`. A `dup` and a child
   share what it has seen, and a poll of an epoll that watches it is one too.
 
-- `/proc/sys/vm` has `drop_caches` and `unprivileged_userfaultfd` alone, so
-  its listing differs from Linux's, which has the rest of the `vm` sysctls
-  too. `unprivileged_userfaultfd` is the machine's, 0 at first, root's of
+- `/proc/sys/vm` has `drop_caches`, `max_map_count` and
+  `unprivileged_userfaultfd` alone, so its listing differs from Linux's,
+  which has the rest of the `vm` sysctls too. `max_map_count` is the
+  machine's 65530 (`DEFAULT_MAX_MAP_COUNT`), root's, of mode 0444, which no
+  one opens to write (`EACCES`), as nothing here bounds a process's
+  mappings by it. `unprivileged_userfaultfd` is the machine's, 0 at first, root's of
   mode 0644, which only root opens to write, and takes 0 or 1
   (`proc_dointvec_minmax`, else `EINVAL`). As Linux's
   `fs/drop_caches.c` has it, the file is root's, of mode 0200: no one may
@@ -5151,9 +5238,13 @@ kernel.
     loopback to an own address, through a veth end to its peer, or once
     for a broadcast or a group whoever takes it, the sender's own copy
     looping back uncounted (`dev_loopback_xmit`); ICMP's port unreachable
-    that answers one, quoting at most what fits in 576 bytes or, of IPv6,
-    1280 (`icmp_send`, `icmp6_send`); and an ARP request and its answer
-    (`arp_send`). What they leave out is in the
+    that answers one, out through the end its own route takes, quoting at
+    most what fits in 576 bytes or, of IPv6, 1280 (`icmp_send`,
+    `icmp6_send`); an ARP request and its answer (`arp_send`); and each TCP
+    segment, a GSO buffer of several as one (`__tcp_transmit_skb`), with its
+    TCP header: the SYN's and SYN-ACK's options, a reset's to a closed port
+    none (`tcp_v4_send_reset`), the rest the timestamps and their SACK blocks
+    (`tcp_options_write`). What they leave out is in the
     [limitations](./limitations).
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
     first, with their users, under a line of the device with how many it
@@ -5988,7 +6079,12 @@ kernel.
   (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack
   and mappings; and
   `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
-  that is made or ends. A `cpu-clock` or `task-clock` event whose
+  that is made or ends; and with `namespaces` (which takes `CAP_PERFMON`),
+  `PERF_RECORD_NAMESPACES` of a thread's namespaces, the device and inode
+  of each of its `/proc/<pid>/ns` files of net, uts, ipc, pid, user, mnt
+  and cgroup: of a new thread or child, written by its creator, and of a
+  thread after each `unshare` that succeeds, new namespaces or not, and
+  each `setns`. A `cpu-clock` or `task-clock` event whose
   interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
   throttled until the next tick, its count stopped meanwhile, with
   `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,
@@ -6230,19 +6326,9 @@ kernel.
   and no wider than the spill, which the load zero- or sign-extends), a
   load through a scalar ("R%d invalid mem
   access 'scalar'", `EACCES`) and the exit's R0, which may be any value.
-  Of a scalar it knows the bits and the unsigned and signed bounds, of 64
-  and of 32 bits, as Linux 7.0's verifier follows them (`tnum`,
-  `umin_value` to `s32_max_value`): through each ALU operation, the zero or
-  sign extension of a load, and `bpf_get_smp_processor_id`'s result below
-  the CPUs. A copy, a spill and its fill link a scalar to its copy, and to
-  one with a constant added (`BPF_ADD_CONST`). A conditional jump goes one
-  way where the bounds decide it (`is_branch_taken`), and is walked both
-  ways otherwise, each with what holds there (`reg_set_min_max`) in the
-  registers compared and those linked to them (`sync_linked_regs`). A
-  `BPF_AND` or `BPF_OR` of a constant to a register that is -1 or 0 is
-  walked once for each (`maybe_fork_scalars`). It gives up as Linux does
-  after 1,000,000 instructions or 8,192 jumps waiting to be walked
-  (`E2BIG`).
+  A conditional jump whose operands it knows goes one way; any other is
+  walked both ways. It gives up as Linux does after 1,000,000 instructions
+  or 8,192 jumps waiting to be walked (`E2BIG`).
 
 - Programs use maps as Linux's verifier lets them. A `BPF_LD_IMM64` of a
   map's descriptor (`BPF_PSEUDO_MAP_FD`) gives the map, and one of its
@@ -6639,9 +6725,12 @@ kernel.
   forked child's inherited file reads the child's signals. Edge-triggered
   `epoll` gets an edge for each signal queued to the process or any of its
   threads while one of the file's signals is pending for the waiter, as Linux's `signalfd_notify`
-  wakes the file for each: another real-time signal of a number already
+  wakes the file for each, as it is sent, even when another thread has yet
+  to take it in: another real-time signal of a number already
   waiting counts, a standard signal already pending or one ignored and
-  unblocked does not; a new mask is an edge too. `signalfd` on a
+  unblocked does not, nor one the init of a nested PID namespace drops
+  unblocked as it has no handler (`SIGNAL_UNKILLABLE`); a new mask is an
+  edge too. `signalfd` on a
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);
   `SIGKILL` and `SIGSTOP` never enter one, and neither a read nor a poll
   takes a signal whose action is `SA_IMMUTABLE` (below), as Linux master's
@@ -7034,8 +7123,9 @@ kernel.
 
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
-  read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's
-  `fs.nr_open`), or to a lower ceiling the embedder sets. Raising a hard limit
+  read and changed; the hard `RLIMIT_NOFILE` goes up to `fs.nr_open`
+  (1048576 at first, which root may change through `/proc/sys/fs/nr_open`),
+  or to a lower ceiling the embedder sets. Raising a hard limit
   needs `CAP_SYS_RESOURCE` (`EPERM`). `prlimit64` on another thread, to read
   or to set, needs `CAP_SYS_RESOURCE`, or the caller's real user and group IDs
   to be all of that thread's real, effective and saved ones (`EPERM`, before

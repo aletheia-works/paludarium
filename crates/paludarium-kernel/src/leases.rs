@@ -186,6 +186,7 @@ fn disown(c: &Context<'_>, files: &[usize]) {
                 kind: crate::fasync::OwnerKind::Process,
                 id: 0,
                 signal: 0,
+                setter: crate::fasync::Setter::default(),
             },
         );
     }
@@ -287,6 +288,7 @@ pub(crate) fn set(c: &Context<'_>, fd: u64, d: &Descriptor, arg: u64) -> Result<
             crate::fasync::FileOwner {
                 kind: crate::fasync::OwnerKind::Process,
                 id: c.process.pid,
+                setter: crate::fasync::Setter::of(c),
                 ..owner
             },
         );
@@ -424,7 +426,7 @@ fn break_lease(c: &mut Context<'_>, key: Key, flags: u32) -> Result<(), Errno> {
     for (file, fd) in broken {
         let owner = c.processes.file_owner_at(file);
         c.processes
-            .send_io(owner, fd, crate::fasync::Reason::Message);
+            .send_io(&owner, fd, crate::fasync::Reason::Message);
     }
     if conflict && flags & O_NONBLOCK != 0 {
         return Err(Errno::EAGAIN);

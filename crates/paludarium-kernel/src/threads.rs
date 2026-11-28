@@ -17,6 +17,12 @@ use std::{
     },
 };
 
+/// The signal actions a group's threads share (Linux's `sighand_struct`),
+/// which `CLONE_SIGHAND` shares with another process too, in the slot that
+/// `execve` puts the process's own copy in.
+pub(crate) type Actions = Arc<Mutex<BTreeMap<i32, SignalAction>>>;
+pub(crate) type ActionSlot = Arc<Mutex<Actions>>;
+
 /// A thread's audit login user and session, as Linux's `task_struct` keeps
 /// them (`loginuid`, `sessionid`): passed on by `clone` and kept across
 /// `execve`; [`crate::users::INVALID`] for none (`AUDIT_UID_UNSET`,
@@ -94,7 +100,7 @@ pub struct ThreadGroup {
     leader_exit: AtomicI32,
     /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
     /// with another process (Linux's `sighand_struct`).
-    actions: Mutex<Arc<Mutex<BTreeMap<i32, SignalAction>>>>,
+    actions: ActionSlot,
     process_inbox: Mutex<Arc<SignalInbox>>,
     process_pending: Mutex<ThreadState>,
     /// The threads one of which a signal for the process wakes.
@@ -189,10 +195,6 @@ pub struct ThreadGroup {
     /// The voluntary context switches of its reaped children and theirs
     /// (Linux's `signal->cnvcsw`).
     children_switches: AtomicU64,
-    /// The process is the init of a nested PID namespace, which takes only
-    /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
-    /// SIGNAL_UNKILLABLE), until a fault ends it.
-    unkillable: std::sync::atomic::AtomicBool,
     /// A SIGKILL was sent to the process, which Linux's `complete_signal`
     /// marks as the whole group's exit (SIGNAL_GROUP_EXIT) as it sends it.
     killed: std::sync::atomic::AtomicBool,
@@ -288,7 +290,7 @@ impl Default for ThreadGroup {
             seccomp_syncs: AtomicU64::new(0),
             status: Mutex::new(None),
             leader_exit: AtomicI32::new(0),
-            actions: Mutex::default(),
+            actions: ActionSlot::default(),
             process_inbox: Mutex::new(Arc::new(process_inbox)),
             process_pending: Mutex::new(ThreadState::default()),
             targets,
@@ -326,7 +328,6 @@ impl Default for ThreadGroup {
             children_faults: AtomicU64::new(0),
             children_major_faults: AtomicU64::new(0),
             children_switches: AtomicU64::new(0),
-            unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
             stop_signal: std::sync::atomic::AtomicI32::new(0),
@@ -335,9 +336,12 @@ impl Default for ThreadGroup {
     }
 }
 impl ThreadGroup {
-    /// Whether the process is the init of a nested PID namespace.
+    /// Whether the process is the init of a nested PID namespace, which
+    /// takes only the signals it handles, and SIGKILL and SIGSTOP from
+    /// outside (Linux's SIGNAL_UNKILLABLE), until a fault ends it. Its
+    /// [`Targets`] keep it, for the signals its threads' inboxes count.
     pub(crate) fn unkillable(&self) -> bool {
-        self.unkillable.load(Ordering::SeqCst)
+        self.targets.unkillable()
     }
     /// Whether the init of a nested PID namespace drops signal `number`
     /// (1 to 64) as it is sent, as Linux's `sig_task_ignored` with
@@ -426,7 +430,7 @@ impl ThreadGroup {
     }
     /// Makes the process the init of a nested PID namespace.
     pub(crate) fn set_unkillable(&self) {
-        self.unkillable.store(true, Ordering::SeqCst);
+        self.targets.set_unkillable();
     }
     /// Keeps the robust list head of `tid`.
     pub(crate) fn set_robust_list(&self, tid: u32, head: u64) {
@@ -695,7 +699,7 @@ impl ThreadGroup {
             Arc::new(Mutex::new(copy))
         };
         Self {
-            actions: Mutex::new(actions),
+            actions: Arc::new(Mutex::new(actions)),
             nofile: AtomicU64::new(self.nofile()),
             fsize: AtomicU64::new(self.fsize()),
             memlock: Arc::new(AtomicU64::new(self.memlock.load(Ordering::SeqCst))),
@@ -1107,6 +1111,7 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner);
         pending.pending.retain(|signal| signal.number != number);
         drop(pending);
+        self.targets.forget_own(number);
         self.inbox_of_process().purge(number);
         for inbox in self
             .members
@@ -1447,6 +1452,7 @@ impl ThreadGroup {
     }
     pub(crate) fn register(&self, tid: u32, inbox: Arc<SignalInbox>) {
         inbox.attach(Arc::clone(&self.discards), Arc::clone(&self.arrivals));
+        inbox.follow_actions(Arc::clone(&self.actions));
         let wake = inbox.wake_token();
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         let owner = self.exec_owner.load(Ordering::SeqCst);
@@ -2331,6 +2337,7 @@ impl ThreadGroup {
     /// themselves; `local`, the caller's, drops them now.
     pub(crate) fn discard_pending(&self, number: i32, local: &mut ThreadState) {
         self.discards.mark(number);
+        self.targets.forget_own(number);
         self.discards.apply(local);
         let mut pending = self
             .process_pending
@@ -3043,6 +3050,11 @@ impl Kernel {
             .sched(parent.tid)
             .forked(self.group.nice(parent.tid).unwrap_or(0))?;
         let task = self.processes.charge_task()?;
+        // copy_files: a copy of the table fails when `fs.nr_open` no longer
+        // lets one hold its numbers (`EMFILE`).
+        let files = self
+            .files
+            .for_clone(flags & 0x400 != 0, flags & 0x200 != 0)?;
         // copy_namespaces; CLONE_NEWIPC leaves the semaphore undo list,
         // which CLONE_SYSVSEM would share.
         crate::namespaces::check(namespaces, parent.state.credentials.administers_own())?;
@@ -3111,7 +3123,7 @@ impl Kernel {
             host: self.host.clone(),
             process: self.process.clone(),
             table: crate::SyscallTable::u1(),
-            files: self.files.for_clone(flags & 0x400 != 0, flags & 0x200 != 0),
+            files,
             cancellation: inbox.wake_token(),
             inbox: inbox.clone(),
             group: self.group.clone(),

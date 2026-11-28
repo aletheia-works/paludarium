@@ -27,7 +27,7 @@ mod side_band;
 
 pub(crate) use buffer::{buffers_mapped, scheduled_in};
 pub(crate) use sample::{Task, Who, clock_due, overflow, samples_faults, sampling};
-pub(crate) use side_band::{Space, comm, wanted};
+pub(crate) use side_band::{Space, comm, namespaces, wanted};
 
 use crate::ThreadGroup;
 use crate::syscalls::{Context, Outcome};
@@ -632,7 +632,7 @@ impl Events {
         lists.side_band.retain(|event| event.strong_count() > 0);
         lists.asking.retain(|event| event.strong_count() > 0);
         lists.cpu_sampling.retain(|event| event.strong_count() > 0);
-        if side_band::asks(&event.attr) {
+        if side_band::attached(&event.attr) {
             self.side_band.store(true, Ordering::Relaxed);
             lists.asking.push(erase(event));
             if matches!(event.target, Target::Cpu) {
@@ -1463,7 +1463,8 @@ const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
 /// opened event's attributes, enabled as the one it is made from is
 /// (`inherit_event`). An event `remove_on_exec` or the end of its task took
 /// out is not inherited. Then the events that count the thread `who`
-/// take `PERF_RECORD_FORK` of the new one (`perf_event_fork`).
+/// take `PERF_RECORD_FORK` of the new one and `NAMESPACES` of its
+/// namespaces (`perf_event_fork`).
 pub(crate) fn clone(
     events: &Events,
     group: &ThreadGroup,
@@ -1479,6 +1480,10 @@ pub(crate) fn clone(
         child_tid
     };
     side_band::fork(events, group, who, child_pid, child_tid);
+    if side_band::wanted(events) {
+        let of_child = child_group.namespaces(child_tid);
+        side_band::namespaces(events, group, who, (child_pid, child_tid), &of_child);
+    }
 }
 
 fn inherit(

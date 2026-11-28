@@ -90,9 +90,29 @@ pub(crate) struct Link {
     request: AtomicU64,
     opens: OnceLock<Notify>,
     senders: [Mutex<Sender>; 2],
+    /// Where each side's packets go out, for the devices' counters.
+    ways: [Option<Way>; 2],
     /// When its timers are next to be run, changed with `flows` locked.
     armed: AtomicU64,
     deadlines: Arc<Deadlines>,
+}
+/// Where a side of a connection sends its packets, for the devices'
+/// counters: the tally of its device, and that of the peer that takes
+/// them in, none for the loopback, whose two are one; with the bytes each
+/// takes there before its TCP header, the IP header's and the link's.
+pub(crate) struct Way {
+    pub(crate) tx: Arc<crate::netdev::Tally>,
+    pub(crate) rx: Option<Arc<crate::netdev::Tally>>,
+    pub(crate) before: usize,
+}
+impl Way {
+    /// A packet of `len` bytes from its TCP header goes.
+    fn count(&self, len: usize) {
+        self.tx.add(self.before + len);
+        if let Some(rx) = &self.rx {
+            rx.add(self.before + len);
+        }
+    }
 }
 /// [`Link::request`]'s values.
 const REQUEST: u64 = 1;
@@ -145,14 +165,15 @@ impl Link {
     /// both, the server's first: `client` from `client_local`, `server` from
     /// `server_local`. `host`'s clock times the segments and each side's
     /// end, `deadlines` run the connection's timers, `notify` tells each
-    /// side of an urgent byte, and `mtu` is the devices' it goes through.
+    /// side of an urgent byte, `mtu` is the devices' it goes through, and
+    /// `ways` where each side's packets go ([`Way`]).
     pub(crate) fn join(
         client: &Arc<Stream>,
         server: &Arc<Stream>,
         (client_local, server_local): (SocketAddr, SocketAddr),
         (host, deadlines): (&Arc<dyn paludarium_host::Host>, &Arc<Deadlines>),
         notify: [Notify; 2],
-        (mtu, names): (usize, Option<Names>),
+        (mtu, names, ways): (usize, Option<Names>, [Option<Way>; 2]),
     ) -> Arc<Self> {
         let now = host.clock(paludarium_host::ClockId::Monotonic).ok();
         let link = Arc::new_cyclic(|this| Self {
@@ -175,6 +196,7 @@ impl Link {
             request: AtomicU64::new(0),
             opens: OnceLock::new(),
             senders: Default::default(),
+            ways,
             armed: AtomicU64::new(NEVER),
             deadlines: Arc::clone(deadlines),
         });
@@ -285,7 +307,7 @@ impl Link {
                     flows.end(from, now);
                 }
             }
-            self.arm(&flows);
+            self.arm(&mut flows);
             (flows.arrived(), flows.over())
         };
         for from in 0..2 {
@@ -373,12 +395,21 @@ impl Link {
     fn reset_flows(&self, side: usize, now: u64) -> bool {
         let mut flows = self.flows();
         let heard = flows.reset(side, now);
-        self.arm(&flows);
+        self.arm(&mut flows);
         heard
     }
-    /// Sets when the connection's timers are next to be run, and tells of a
-    /// request that has opened or been dropped.
-    fn arm(&self, flows: &Flows) {
+    /// Counts what each side has sent on its devices ([`Way`]), sets when
+    /// the connection's timers are next to be run, and tells of a request
+    /// that has opened or been dropped.
+    fn arm(&self, flows: &mut Flows) {
+        let sent = flows.take_sent();
+        for (way, lens) in self.ways.iter().zip(sent) {
+            if let Some(way) = way {
+                for len in lens {
+                    way.count(len as usize);
+                }
+            }
+        }
         if self.request.load(Ordering::SeqCst) == REQUEST {
             static ORDER: AtomicU64 = AtomicU64::new(FIRST);
             match flows.request() {
@@ -411,7 +442,7 @@ impl Link {
         let (result, arrived) = {
             let mut flows = self.flows();
             let result = f(&mut flows, self.micros());
-            self.arm(&flows);
+            self.arm(&mut flows);
             (result, flows.arrived() != [false; 2])
         };
         if arrived {
@@ -481,7 +512,7 @@ impl Link {
         if waits {
             self.request.store(REQUEST, Ordering::SeqCst);
         }
-        self.arm(&flows);
+        self.arm(&mut flows);
         !waits
     }
     /// Whether it is a request still, and once opened its place among them.
@@ -502,7 +533,7 @@ impl Link {
         let mut flows = self.flows();
         flows.forget(true);
         self.first.store(RESET, Ordering::SeqCst);
-        self.arm(&flows);
+        self.arm(&mut flows);
     }
     /// What `side`'s segments go with from now on.
     pub(crate) fn set_sender(&self, side: usize, sender: Sender) {

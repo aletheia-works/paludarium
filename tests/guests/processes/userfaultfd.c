@@ -2597,6 +2597,12 @@ static void by_continue(int fd, struct counted *c) {
 static void by_unregister(int fd, struct counted *c) {
     unreg(fd, c->at, PAGE);
 }
+/* The last file of the userfaultfd closed: its registrations go and its
+   waiting faults are woken, as an unregistering wakes them. */
+static void by_close(int fd, struct counted *c) {
+    (void)c;
+    close(fd);
+}
 /* A signal ends the wait; the fault the access then takes again is
    served by a copy. */
 static void by_signal_then_copy(int fd, struct counted *c) {
@@ -2677,6 +2683,17 @@ static int case_major(void) {
     counted("write(2), zeropage", fd, &(struct counted){.at = base + 7 * PAGE, .how = 4}, by_zeropage);
     char drained;
     read(kernel_pipe[0], &drained, 1);
+    /* A userfaultfd of its own, closed while the fault waits: the access
+       is tried again without the registration, where a read finds a zero
+       page and the kernel's copy for a read(2) fills one. */
+    for (int how = 0; how <= 3; how += 3) {
+        int closing = ready(O_NONBLOCK, 0);
+        struct counted waits_close = {.at = anon(PAGE), .how = how};
+        reg(closing, waits_close.at, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+        if (how == 3) write(kernel_pipe[1], "k", 1);
+        counted(how ? "read(2), close" : "read, close", closing, &waits_close, by_close);
+        printf("closed: page %d\n", waits_close.at[0]);
+    }
     /* The process's are its threads', the three above among them. */
     struct rusage self;
     getrusage(RUSAGE_SELF, &self);

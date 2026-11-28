@@ -87,6 +87,12 @@ verified.
   `ksys_pwrite64` do for every file, where Linux master takes them for a
   file of unsigned offsets (`FOP_UNSIGNED_OFFSET`). This follows v7.0
   until the runners' kernel has master's change.
+- **`statx`'s `STATX_ATTR_VERITY` in `stx_attributes_mask`**: Linux
+  master's `vfs_getattr_nosec` says every file knows it (since its
+  f9e450420da2), where Linux 7.0's says it only for a file system with
+  fs-verity. No file here has fs-verity, and the mask follows v7.0, which
+  the differential tests compare, until the runners' kernel has master's
+  change.
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do. A page of a loaded
   program's segment, which has no page cache, is a file's (bit 61) until
@@ -132,8 +138,15 @@ verified.
   the two that paludarium refuses ([decisions](../design/decisions)).
 - **Device counters, in part**: `/proc/net/dev` and a link's
   `IFLA_STATS64` and `IFLA_STATS` count UDP datagrams, ICMP's port
-  unreachable and ARP alone (see [features](./features)). TCP's segments
-  are not counted yet, nor the packets of IPv6 that the kernel sends of
+  unreachable, ARP and TCP's segments alone (see [features](./features)).
+  ICMP's port unreachable is sent, and counted, for each datagram to a
+  closed port, where Linux limits how many go (`icmp_ratelimit`,
+  `icmp_msgs_per_sec`, and per peer through a veth pair).
+  A SYN that a listener's full queue drops, or that nothing answers, is
+  not counted, nor are its retries; a connection's own retransmissions,
+  the SYN-ACK's sent again among them, are, as is its handshake once
+  the listener has answered, whether or not the request is dropped
+  later. Nor are the packets of IPv6 that the kernel sends of
   itself (neighbour discovery, MLD reports, router solicitations and
   duplicate address detection), nor ARP's probes of a neighbour whose
   entry ages, nor what goes to the host (a TCP connection to a port no
@@ -162,7 +175,7 @@ verified.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/interrupts`, `/proc/partitions`, `/proc/kallsyms`, the files of `/proc/sys` but for the ones of `fs`,
-  `kernel` and `net` it has and `vm/drop_caches` and
+  `kernel` and `net` it has and `vm/drop_caches`, `vm/max_map_count` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, `attr`, ...) are `ENOENT`, as in
   another process's directory, whatever the filesystem holds there (with
@@ -174,6 +187,11 @@ verified.
   of `hostname` and `domainname` polls them by descriptor number until one is
   ready, where Linux does in the order they changed, so that of several that
   changed another may be the one it has seen.
+  `vm/max_map_count` is of mode 0444 and bounds nothing, where Linux's is
+  root's to write (0644) and makes a mapping past it `ENOMEM`. There are no
+  `fs/pipe-user-pages-soft` and `fs/pipe-user-pages-hard`, and nothing counts
+  a user's pipe pages, so a pipe of a user past Linux's soft limit is not
+  made smaller nor refused growth (`EPERM`).
   `io` does not count what Linux's
   `kernel_read` and `kernel_write` count for the process (`execve` reading its
   program and interpreter, a core dump's writes), and a read or write that
@@ -430,7 +448,7 @@ verified.
   start-up) as if its pages were all cached, where Linux gives none for a
   page it has not read or has evicted; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
-  failed `clone` writes neither; and `NAMESPACES`, `CGROUP`,
+  failed `clone` writes neither; and `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
   written. When `REFRESH`'s last overflow disables the event, its count
   stops there, but its times (a clock's apart) and its group's other
@@ -506,11 +524,8 @@ verified.
   [Features](./features) lists (`bpf_tail_call`, `bpf_perf_event_output`,
   `bpf_trace_printk`, the ring buffer, spin locks and the rest), the map
   helpers of maps of maps, queues, stacks and bloom filters, a helper's
-  size whose value the verifier does not know, a comparison whose
-  registers are linked to more than 6 (Linux follows the 6 it finds
-  live; which are live is not followed here), a register whose bounds
-  disagree with its known bits (where Linux writes a line of a bug in
-  itself), kfuncs, the context's socket
+  size whose value the verifier does not know, `bpf_get_netns_cookie` of
+  a scalar it does not know is 0, kfuncs, the context's socket
   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
   `fd_array` and maps made with `excl_prog_hash`, `BPF_LD_IMM64` of BTF
   IDs and of functions (and so callbacks), `may_goto`, indirect jumps, a
@@ -522,15 +537,10 @@ verified.
   frames deep ("the call stack of 9 frames is too deep", `E2BIG`), not
   before the walk as master does ("recursive call from %s() to %s()",
   `EINVAL`): the differential tests compare the line with that kernel,
-  and master's check comes here once it has it. A scalar's bits and
-  bounds follow Linux 7.0's; master follows them otherwise (ranges that
-  wrap around, and steps), and where the two decide a jump, an access or
-  a size differently, it does not refuse yet: it may take a program master
-  refuses, or refuse one master takes. `bpf_get_smp_processor_id`'s result
-  is below the CPUs the emulator gives the guest, as its maps count them,
-  which may be fewer than the machine's `nr_cpu_ids` that Linux bounds it
-  by. It prunes no states, so a program
-  with many branches may reach the limits sooner. A
+  and master's check comes here once it has it. A scalar is a value the
+  verifier knows or nothing at all, where Linux keeps its bounds, so it
+  walks both ways of a jump Linux knows goes one way, and it prunes no
+  states, so a program with many branches may reach the limits sooner. A
   lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
   the immediate 0, or with a value's or a map's pointer it equals, tells,
   or an array's key is one the stack holds
@@ -653,10 +663,13 @@ verified.
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
   Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
-  socket requests, a bundle
-  (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
-  send that selects a buffer, and a receive with `MSG_WAITALL` that selects
-  one are not there yet (`EINVAL`). A multishot receive whose socket keeps
+  socket requests, a receive's bundle (`IORING_RECVSEND_BUNDLE`) and a
+  receive with `MSG_WAITALL` that selects a buffer are not there yet
+  (`EINVAL`). A send's selected buffers follow Linux master; the kernel of
+  the differential tests' runners still sends a provided buffer whole
+  whatever the length (before master's b7322810d187), so the tests do not
+  compare that, nor whether a bundle whose length runs out on the last
+  buffer goes on (8742f4b5a472). A multishot receive whose socket keeps
   having more goes on at once however many times in a row, where Linux
   requeues it after 32 (`MULTISHOT_MAX_RETRY`), letting other task work
   run first. A send or a receive with
@@ -1093,8 +1106,7 @@ verified.
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the
   kernel, where Linux waits until they all have. Signals to them meet it at
-  once, and `/proc` shows it after each one's next system call. `SIGIO` and
-  `SIGURG` from `F_SETOWN` are not scoped, as `F_SETOWN` records no sender. A
+  once, and `/proc` shows it after each one's next system call. A
   rename's Landlock check comes after its permission checks, where Linux's
   comes before them, which shows only when both refuse. A rule on a file under
   `/proc` does not count for `execve`. An open checks the file its path
@@ -1108,9 +1120,7 @@ verified.
   thread's new filter only after its next system call.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
-  files but nowhere else yet. `F_SETOWN` records no sender's credentials, so
-  `SIGIO` and `SIGURG` reach their owner whoever set it, where Linux's
-  `sigio_perm` checks.
+  files but nowhere else yet.
   Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
@@ -1155,11 +1165,10 @@ verified.
   than those 10 ms can go unseen and send none, unless a read or write told
   the guest `EAGAIN`, which always gets its signal. In WebAssembly, which has
   no thread to look, they send none.
-- **Edge-triggered `epoll` on a signalfd**: a signal queued for another
-  thread of the process gives the waiting thread its edge once that thread
-  takes it in, at its next system call or within 10 ms of a wait, where
-  Linux's `signalfd_notify` wakes the file as the signal is sent; an
-  `epoll_wait` that does not wait can come before it.
+- **Edge-triggered `epoll` on a signalfd, in part**: a signal queued for
+  another thread of the process is the waiting thread's edge as it is sent,
+  but a thread already waiting sees it within 10 ms, where Linux's
+  `signalfd_notify` wakes the file at once.
 - **A POSIX timer's signal, in part**: a timer on a clock of real time
   sends to the process's leader first, where Linux's `posixtimer_get_target`
   sends to a thread of the process that its interrupt finds running. One

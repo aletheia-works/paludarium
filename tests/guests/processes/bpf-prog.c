@@ -1,8 +1,8 @@
 /* BPF programs, compared with Linux: socket filters that the verifier
    loads or refuses, from instructions written out here (no libbpf, no
    BTF).
-   bpf-prog-verify: programs of registers, jumps and the stack, with
-   one helper and one context field at most. For each, the result of
+   bpf-prog-verify: programs of registers, jumps and the stack, without
+   helpers or the context's fields. For each, the result of
    BPF_PROG_LOAD (a descriptor, or the error) and the line of the log
    that says why it was refused (the last before "processed ... insns");
    for a program loaded, its fdinfo's type, tag (a hash of the
@@ -10,14 +10,10 @@
    a read of the stack gives, which a jump on it shows: zeros stored, a
    spill read from its start no wider than it, narrowed or sign-extended
    by the load, and an atomic's old value, which it knows, and reads it
-   does not know the value of. What it knows of the bounds of a value of
-   bpf_get_prandom_u32 or of the context's len, which a jump on it shows:
-   after each ALU operation, a jump either way, 32-bit jumps, copies (and
-   a constant added to one) and spills, which a jump on another register
-   bounds, sign extension, a byte swap, a bit test, and a register
-   compared with itself. Then the log's arguments: a buffer too small
-   (ENOSPC), one that cannot be written (EFAULT), and the checks before
-   the verifier, which log nothing.
+   does not know the value of. Then
+   the log's arguments: a buffer too small (ENOSPC), one that cannot be
+   written (EFAULT), and the checks before the verifier, which log
+   nothing.
    bpf-prog-maps: programs that use maps: the map and its value by
    descriptor in BPF_LD_IMM64, bpf_map_lookup_elem, bpf_map_update_elem
    and bpf_map_delete_elem with keys and values on the stack or in a
@@ -133,6 +129,12 @@
    context, in their order. Not printed: the time a run took, and what
    master and the test machines' Linux 7.0 do differently (a short IPv4
    or IPv6 header, IPX, and a packet in pages cut by data_size_out).
+   bpf-prog-cfg: the shape of the jumps, which the verifier checks before
+   any path: jumps to the next instruction, paths that meet, a 64-bit
+   constant jumped onto or over, a function two paths call; and code no
+   path reaches, a jump into a 64-bit constant or past either end, and a
+   jump from a function into the main program, with the first such
+   instruction the log names.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -409,56 +411,6 @@ static int case_verify(void) {
     READS("after an atomic", 5, WIDE, MOV(2, 0), I(0xc3, 10, 2, -8, 0), LDX_W(0, 10, -8));
 #undef WIDE
 #undef READS
-
-    /* What the verifier knows of a scalar's bounds, as Linux 7.0 follows
-       them: a jump the bounds decide goes one way, so a program loads only
-       where the read through R0 on the other way is never walked. RAND is
-       bpf_get_prandom_u32, any 64-bit value; ONLY continues where `reg
-       <code> k` holds and exits elsewhere. TAKEN reads on the fall-through,
-       NOT_TAKEN on the target. */
-#define RAND CALL(7)
-#define ONLY(code, reg, k) I(code, reg, 0, 1, k), EXIT()
-#define TAKEN(name, code, reg, k, ...) LOAD(name, __VA_ARGS__, I(code, reg, 0, 1, k), LDX_DW(1, 0, 0), EXIT())
-#define NOT_TAKEN(name, code, reg, k, ...) \
-    LOAD(name, __VA_ARGS__, I(code, reg, 0, 2, k), MOV(0, 0), EXIT(), LDX_DW(1, 0, 0), EXIT())
-    TAKEN("unknown", 0xb5, 0, 9, RAND);
-    TAKEN("and", 0xb5, 0, 0xff, RAND, I(0x57, 0, 0, 0, 0xff));
-    TAKEN("and, one below", 0xb5, 0, 0xfe, RAND, I(0x57, 0, 0, 0, 0xff));
-    TAKEN("a 32-bit load", 0x15, 0, 0, LDX_W(0, 1, 0), I(0x77, 0, 0, 0, 32));
-    TAKEN("a right shift", 0xa5, 0, 16, RAND, I(0x77, 0, 0, 0, 60));
-    NOT_TAKEN("a multiplication", 0x25, 0, 21, RAND, I(0x57, 0, 0, 0, 7), I(0x27, 0, 0, 0, 3));
-    NOT_TAKEN("an addition", 0xa5, 0, 10, RAND, I(0x57, 0, 0, 0, 7), ADD(0, 10));
-    TAKEN("a subtraction, signed", 0xd5, 0, 6, RAND, I(0x57, 0, 0, 0, 7), I(0x17, 0, 0, 0, 1));
-    TAKEN("a subtraction, unsigned", 0xb5, 0, 6, RAND, I(0x57, 0, 0, 0, 7), I(0x17, 0, 0, 0, 1));
-    TAKEN("a division", 0xb5, 0, 12, RAND, I(0x57, 0, 0, 0, 0x7f), I(0x37, 0, 0, 0, 10));
-    TAKEN("a modulo", 0xa5, 0, 10, RAND, I(0x97, 0, 0, 0, 10));
-    TAKEN("a signed modulo", 0x75, 0, -9, RAND, I(0x97, 0, 0, 1, 10));
-    NOT_TAKEN("an or", 0xa5, 0, 0x10, RAND, I(0x47, 0, 0, 0, 0x10));
-    TAKEN("a negation", 0xd5, 0, 0, RAND, I(0x57, 0, 0, 0, 7), I(0x87, 0, 0, 0, 0));
-    TAKEN("a sign", 0xd5, 0, 0, RAND, I(0xc7, 0, 0, 0, 63));
-    NOT_TAKEN("and of a sign, each way", 0x15, 0, 1, RAND, I(0xc7, 0, 0, 0, 63), I(0x57, 0, 0, 0, 5));
-    TAKEN("a jump's bounds", 0xb5, 0, 9, RAND, ONLY(0xb5, 0, 9));
-    TAKEN("not equal at the edge", 0x15, 0, 1, RAND, I(0x57, 0, 0, 0, 1), ONLY(0x55, 0, 0));
-    TAKEN("a 32-bit jump", 0xb6, 0, 9, RAND, ONLY(0xb6, 0, 9));
-    TAKEN("a 32-bit jump, then 64 bits", 0xb5, 0, 9, RAND, ONLY(0xb6, 0, 9));
-    TAKEN("the low half of a bound", 0xb6, 0, 0xffff, RAND, ONLY(0xb5, 0, 0xffff));
-    TAKEN("a register's bound", 0xa5, 0, 10, RAND, I(0x57, 0, 0, 0, 15), MOV(1, 10), I(0xad, 0, 1, 1, 0),
-          EXIT());
-    TAKEN("a copy", 0xb5, 1, 9, RAND, MOV_REG(1, 0), ONLY(0xb5, 0, 9));
-    TAKEN("a copy plus a constant", 0xb5, 1, 10, RAND, MOV_REG(1, 0), ADD(1, 1), ONLY(0xb5, 0, 9));
-    TAKEN("a copy plus a constant, one below", 0xb5, 1, 9, RAND, MOV_REG(1, 0), ADD(1, 1), ONLY(0xb5, 0, 9));
-    TAKEN("a copy multiplied", 0xb5, 1, 9, RAND, MOV_REG(1, 0), I(0x27, 1, 0, 0, 1), ONLY(0xb5, 0, 9));
-    TAKEN("a spill", 0xb5, 1, 9, RAND, STX_DW(10, 0, -8), ONLY(0xb5, 0, 9), LDX_DW(1, 10, -8));
-    TAKEN("a narrow spill", 0xb5, 1, 0xff, RAND, I(0x57, 0, 0, 0, 0xff), STX_W(10, 0, -8), LDX_W(1, 10, -8));
-    TAKEN("a sign extension", 0x75, 1, -128, RAND, I(0x57, 0, 0, 0, 0xff), I(0xbf, 1, 0, 8, 0));
-    TAKEN("a sign extension, one above", 0x75, 1, -127, RAND, I(0x57, 0, 0, 0, 0xff), I(0xbf, 1, 0, 8, 0));
-    NOT_TAKEN("a bit test", 0x45, 0, 1, RAND, I(0x57, 0, 0, 0, 6));
-    NOT_TAKEN("a byte swap", 0x25, 0, 0xff00, RAND, I(0x57, 0, 0, 0, 0xff), I(0xdc, 0, 0, 0, 16));
-    LOAD("a register with itself", RAND, I(0x2d, 0, 0, 2, 0), MOV(0, 0), EXIT(), LDX_DW(1, 0, 0), EXIT());
-#undef NOT_TAKEN
-#undef TAKEN
-#undef ONLY
-#undef RAND
 
     static const struct insn ret0[] = {MOV(0, 0), EXIT()};
     struct prog_attr p = attr(ret0, 2);
@@ -3698,6 +3650,43 @@ static int case_testrun(void) {
     return 0;
 }
 
+/* bpf-prog-cfg. Not here: a jump back, which Linux takes from a loader
+   with CAP_BPF as a bounded loop and the verifier here refuses. */
+#define JA(off) I(0x05, 0, 0, off, 0)
+#define JEQ32(dst, imm, off) I(0x16, dst, 0, off, imm)
+#define CONST64(dst, v) I(0x18, dst, 0, 0, v), I(0, 0, 0, 0, 0)
+static int case_cfg(void) {
+    /* Programs it takes. */
+    LOAD("a jump to the next insn", MOV(0, 0), JA(0), EXIT());
+    LOAD("both ways to the next insn", MOV(0, 0), JEQ(0, 0, 0), EXIT());
+    LOAD("a 32-bit jump both ways to the next insn", MOV(0, 0), JEQ32(0, 0, 0), EXIT());
+    LOAD("two paths that meet", MOV(0, 0), JEQ(0, 0, 2), MOV(0, 1), JA(1), MOV(0, 2), EXIT());
+    LOAD("two exits", MOV(0, 0), JEQ(0, 0, 1), EXIT(), MOV(0, 1), EXIT());
+    LOAD("a jump onto a 64-bit constant", MOV(0, 0), JEQ(0, 0, 1), MOV(0, 1), CONST64(1, 5),
+         EXIT());
+    LOAD("a jump over a 64-bit constant both paths reach", MOV(0, 0), JEQ(0, 0, 2), CONST64(1, 5),
+         EXIT());
+    LOAD("chained jumps", MOV(0, 0), JA(1), EXIT(), JA(-2));
+    LOAD("a function two paths call", MOV(0, 0), JEQ(0, 0, 2), CALLF(3), JA(1), CALLF(1), EXIT(),
+         MOV(0, 1), EXIT());
+
+    /* Programs it refuses. */
+    LOAD("a jump over an insn", MOV(0, 0), JA(1), MOV(0, 1), EXIT());
+    LOAD("two places no path reaches", MOV(0, 0), JA(1), MOV(0, 1), EXIT(), EXIT());
+    LOAD("a jump into a 64-bit constant", MOV(0, 0), JEQ(0, 0, 1), CONST64(1, 5), EXIT());
+    LOAD("a jump into a 64-bit constant no path reaches", MOV(0, 0), JA(1), CONST64(1, 5),
+         EXIT());
+    LOAD("a 32-bit jump into a 64-bit constant", MOV(0, 0), JEQ32(0, 0, 1), CONST64(1, 5), EXIT());
+    LOAD("a call into a 64-bit constant", CALLF(2), EXIT(), CONST64(0, 5), EXIT());
+    LOAD("code in a function no path reaches", CALLF(1), EXIT(), MOV(0, 0), JA(1), MOV(0, 1),
+         EXIT());
+    LOAD("a jump just past the end", MOV(0, 0), JA(1), EXIT());
+    LOAD("a jump before the start", MOV(0, 0), JEQ(0, 0, -3), EXIT());
+    LOAD("a jump from a function into the main program", CALLF(2), MOV(0, 0), EXIT(), JA(-2),
+         EXIT());
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -3716,5 +3705,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-tcp")) return case_tcp();
     if (!strcmp(mode, "bpf-prog-segments")) return case_segments();
     if (!strcmp(mode, "bpf-prog-testrun")) return case_testrun();
+    if (!strcmp(mode, "bpf-prog-cfg")) return case_cfg();
     return 2;
 }

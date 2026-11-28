@@ -941,7 +941,9 @@ fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<
     let Some(id) = group.upgrade().and_then(|g| g.ask(event)) else {
         return Ok(());
     };
+    // `fanotify_get_response` waits `TASK_KILLABLE`.
     let _sleeps = c.inbox.tif().sleep_killable();
+    let _shown = c.inbox.tif().sleep_uninterruptible();
     loop {
         let ticket = c.files.readiness.token.value();
         let Some(strong) = group.upgrade() else {

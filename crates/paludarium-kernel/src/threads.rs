@@ -2107,6 +2107,15 @@ impl ThreadGroup {
             .map(|(&tid, inbox)| (tid, inbox.blocked()))
             .collect()
     }
+    /// Whether thread `tid` is in a wait Linux's task sleeps
+    /// `TASK_KILLABLE` in ([`crate::targets::Tif::sleep_uninterruptible`]).
+    pub(crate) fn sleeps_uninterruptible(&self, tid: u32) -> bool {
+        self.members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .is_some_and(|inbox| inbox.tif().uninterruptible())
+    }
     /// Whether a thread of this group runs in `space`, as it last published.
     pub(crate) fn uses_memory(&self, space: &paludarium_mmu::AddressSpace) -> bool {
         self.public
@@ -3199,6 +3208,7 @@ impl Kernel {
             tid,
             flags,
         );
+        state.cpu.made();
         self.pending_child = Some((Box::new(child), Thread { tid, cpu, state }));
         Ok(u64::from(tid))
     }

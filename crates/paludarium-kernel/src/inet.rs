@@ -53,7 +53,6 @@ const IPPROTO_ICMPV6: u64 = 58;
 /// the `u8` of `flowi6_proto`.
 const FLOW_TCP: u8 = 6;
 const FLOW_UDP: u8 = 17;
-const FLOW_ICMPV6: u8 = 58;
 const ENOTSOCK: Errno = Errno(88);
 const EDESTADDRREQ: Errno = Errno(89);
 const ENOPROTOOPT: Errno = Errno(92);
@@ -1109,17 +1108,28 @@ impl Network {
             0 if from.is_unicast_link_local() => peer_index.unsigned_abs(),
             oif => oif,
         };
-        let back = self.back6(&there, from, to, oif, flow.keys().reversed(), now);
+        // A datagram's answer is ICMPv6's port unreachable, routed with the
+        // datagram (`icmp6_send`), as IPv4's ([`Self::reach`]).
+        let keys = if flow.proto == FLOW_UDP {
+            crate::multipath::Flow {
+                packet: true,
+                socket_hash: flow.socket_hash,
+                ..crate::multipath::Flow::socket(FLOW_UDP, flow.own_port, flow.dport)
+            }
+        } else {
+            flow.keys().reversed()
+        };
+        let back = self.back6(&there, from, to, oif, keys, now);
         Self::answered(there, flow, oif, back)
     }
     /// [`Self::back4`] of an IPv6 answer of the protocol and ports `keys`, routed
     /// with the device `oif` named (0 for none): its next hop must be an
     /// address of the end it comes in on, as neighbour discovery finds it
     /// ([`crate::interface::Addresses::nd_target`]), and this namespace must
-    /// have `from`, not tentative. An ICMPv6 error of Linux's takes the hop
-    /// of the packet it tells of (`icmp6_send`), whose flow label is random,
-    /// and from 7.2 TCP's answer its own random one
-    /// (`ip6_ecmp_set_mp_hash`); here both take the answer's flow's.
+    /// have `from`, not tentative. An ICMPv6 error takes the hop of the
+    /// packet it tells of (`icmp6_send`); from 7.2 TCP's answer takes its
+    /// own random flow label (`ip6_ecmp_set_mp_hash`), and here the
+    /// answer's flow's.
     fn back6(
         &self,
         there: &Network,
@@ -1334,7 +1344,8 @@ impl Network {
     /// The flow of a packet from `from` (the address a socket is bound
     /// to, none for an unbound one) of the protocol and ports `keys`, which
     /// chooses among an IPv6 multipath route's hops (`rt6_multipath_hash`):
-    /// its IPv6 source, or `::`, and no flow label.
+    /// its IPv6 source, or `::`, and no flow label; whether they come in a
+    /// packet, and its hash.
     fn flow6(from: Option<IpAddr>, keys: crate::multipath::Flow) -> Flow6 {
         Flow6 {
             src: match from.map(plain) {
@@ -1345,6 +1356,8 @@ impl Network {
             proto: keys.proto,
             sport: keys.sport,
             dport: keys.dport,
+            packet: keys.packet,
+            socket_hash: keys.socket_hash,
         }
     }
     /// The neighbour an IPv4 packet to `to` out through the veth end
@@ -3787,19 +3800,15 @@ impl InetSocket {
                     .receiver(plain_to, from, self.network.peer_index(index));
             // ICMP's port unreachable comes back, where answers come, through
             // the peer's neighbour of `from`, out through the end its route
-            // takes. IPv4's is routed with the datagram it tells of
-            // (`icmp_route_lookup`).
+            // takes, routed with the datagram it tells of
+            // (`icmp_route_lookup`, `icmp6_send`).
             if receiver.is_none()
                 && let Some(answer) = &answer
             {
-                let keys = if v6 {
-                    crate::multipath::Flow::of(FLOW_ICMPV6)
-                } else {
-                    crate::multipath::Flow {
-                        packet: true,
-                        socket_hash: flow.socket_hash,
-                        ..crate::multipath::Flow::socket(FLOW_UDP, from.port(), to.port())
-                    }
+                let keys = crate::multipath::Flow {
+                    packet: true,
+                    socket_hash: flow.socket_hash,
+                    ..crate::multipath::Flow::socket(FLOW_UDP, from.port(), to.port())
                 };
                 there.reply(answer, from.ip(), to.ip(), keys, self.now());
                 let icmp = frames::unreachable(v6, bytes.len(), frames::ETHERNET);
@@ -7442,7 +7451,7 @@ mod tests {
                     SocketAddr::new(IpAddr::V4(ip), 9),
                     None,
                     (0, false),
-                    crate::multipath::Flow::of(0),
+                    crate::multipath::Flow::default(),
                     Some(3 * SECOND)
                 )
                 .is_err()

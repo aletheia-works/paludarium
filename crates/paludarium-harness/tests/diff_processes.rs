@@ -360,6 +360,7 @@ mod linux {
                     | "perf-fault-signals"
                     | "perf-side-band-exec"
                     | "perf-side-band-namespaces"
+                    | "perf-side-band-switch"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -462,6 +463,7 @@ mod linux {
                     | "veth-hash-policy"
                     | "veth-use-neigh"
                     | "veth-icmp-hop"
+                    | "veth-icmp6-hop"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-unicast-if"
@@ -744,6 +746,7 @@ mod linux {
         veth_hash_policy => ("veth-hash-policy","veth-hash-policy"),
         veth_use_neigh => ("veth-use-neigh","veth-use-neigh"),
         veth_icmp_hop => ("veth-icmp-hop","veth-icmp-hop"),
+        veth_icmp6_hop => ("veth-icmp6-hop","veth-icmp6-hop"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_unicast_if => ("veth-unicast-if","veth-unicast-if"),
@@ -860,6 +863,7 @@ mod linux {
         perf_fault_signals => ("perf-fault-signals","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
         perf_side_band_namespaces => ("perf-side-band-namespaces","perf"),
+        perf_side_band_switch => ("perf-side-band-switch","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -1220,6 +1224,7 @@ mod linux {
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_dev_tty_node => ("dev-tty-node","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),
+        processes_named_fifo_statfs => ("named-fifo-statfs","process"),
         processes_shmem_populate => ("shmem-populate","process"),
         processes_tmpfs_huge => ("tmpfs-huge","process"),
         processes_tmpfs_huge_placement => ("tmpfs-huge-placement","process"),
@@ -1307,6 +1312,7 @@ mod linux {
         processes_io_uring_multishot => ("io-uring-multishot","process"),
         processes_io_uring_splice => ("io-uring-splice","process"),
         vfork_exit => ("vfork-exit","process"),
+        vfork_state => ("vfork-state","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),
         clone_vm => ("clone-vm","process"),

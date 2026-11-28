@@ -2021,6 +2021,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   要求に許す操作、付けてよいフラグ、付けなければならないフラグで、合わない要求は `EACCES` で
   失敗します。1 つもない制限は何も許しません。
 
+- タスクの制限は、Linux 7.0 の `io_register_restrictions_task` と同じく、記述子 -1 の
+  `IORING_REGISTER_RESTRICTIONS` で付け、スレッドがその後に作るどのリングにも付きます。無効な
+  リングも、テストを走らせるカーネルにある Linux master の 6da8f402e362 と同じく、すぐにそれに
+  従います。自分の制限は取らず、許された登録だけを取る（`EACCES`）ので、有効にするには
+  `IORING_REGISTER_ENABLE_RINGS` が許されていなければなりません。新しいスレッドや
+  プロセスはそれを写し、exec は保ちます。すでに持つスレッドは断られ（`EPERM`）、
+  `no_new_privs` か `CAP_SYS_ADMIN` が要ります（`EACCES`）。引数は 1 つで（`EINVAL`）、
+  読む（`EFAULT`）`struct io_uring_task_restriction` にフラグも予約ビットもなく（`EINVAL`）、
+  その後に続く制限はリングのものと同じく読みます。記述子 -1 でほかの登録をすると `EINVAL` です。
+
 - `IORING_REGISTER_PERSONALITY` はスレッドの資格情報を Landlock のドメインごと保ち、1 から
   始まる ID を返します（`xa_alloc_cyclic`）。それを指す要求（なければ `EINVAL`）は、待った後に
   続くときも含めてその資格情報で実行し（`override_creds`）、
@@ -3035,7 +3045,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `fib_multipath_hash_fields` が挙げるフィールド（3）で、`RTM_GETROUTE` が求めるフローも
     同じです。ソケットのパケットは、結び付いたアドレス（なければ `::`）
     で、フローラベルなしでハッシュします。何にもバインドしていないソケットの送り元は、
-    そうして選んだホップのものです（`ip6_dst_lookup_tail`）。答えは自分の引き当てで選ばれる端を通って返ります。
+    そうして選んだホップのものです（`ip6_dst_lookup_tail`）。ICMPv6 の port unreachable
+    は、それが知らせるデータグラムで経路を引き当て（`icmp6_send`）、IPv4 のものと同じく
+    ハッシュします。ポリシー 1 では connect されたソケットのフローのハッシュで、ポリシー 3
+    では内側のハッシュなしで混ぜます。答えは自分の引き当てで選ばれる端を通って返ります。
     リスナーがバインドされている端があればそこを、リンクローカルのアドレスへはパケットが
     入った端を通ります（`inet6_csk_route_req`、`icmp6_send`）。
     端の `disable_ipv6` を 1 にすると、落ちるときと同じく IPv6 の経路とアドレスを失い、
@@ -3836,7 +3849,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   memfd・`memfd_secret` のファイル・名前空間のファイル・匿名 inode（eventfd や epoll
   など）は、Linux と同じく、それぞれのファイルシステム（pipefs・sockfs・pidfs・内部の
   tmpfs・secretmem・nsfs・anon_inodefs）が持つデバイスにあり、どれもマウントのもの
-  ではありません。`ustat` は、マウントの `st_dev` なら空きブロックと空き inode の数を
+  ではありません。名前から開いた FIFO はそれを持つファイルシステムのファイルで、
+  `fstatfs` は名前を消したあともそのファイルシステムを返します。`ustat` は、マウントの `st_dev` なら空きブロックと空き inode の数を
   返し、それらのデバイスなら何も空いていない（0）と返します。Linux の `simple_statfs`
   と、制限のない内部の tmpfs も 0 を返すからです。ほかのデバイスなら `EINVAL` です。
 
@@ -4033,7 +4047,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、Linux が動いていない
   タスクをそう見せるのと同じく、スレッドが待ちで眠っている間（パイプ、futex、タイマーなど
-  何を待っていても）は `S (sleeping)`、それ以外は `R` です。待たないシステムコールの中に
+  何を待っていても）は `S (sleeping)` です。ただし、Linux のタスクが `TASK_KILLABLE` で眠る
+  待ち（子を待つ `vfork` の親、fanotify のリスナーの答えを待つ open、userfaultfd の
+  イベントが読まれるのを待つタスク、`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` で kill だけで
+  終わるようになった seccomp の通知の待ち）では `D (disk sleep)` です。それ以外は `R` です。待たないシステムコールの中に
   いる間も `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
   持ちません。Linux と同じく、`cmdline`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。
@@ -5232,6 +5249,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>/ns` のファイルそれぞれのデバイスと inode を含みます。新しいスレッドや子のものは
   作ったスレッドが書きます。スレッドのものは、成功した `unshare` のたびに（新しい名前空間が
   なくても）、また `setns` のたびに書きます。
+  `context_switch` では、スレッドが眠るたびに `PERF_RECORD_SWITCH`（CPU のイベントには、
+  代わりに動いたスレッドを含む `SWITCH_CPU_WIDE`）を書きます。
+  `PERF_RECORD_MISC_SWITCH_OUT` の付いたものと、ふたたび動くときの付かないものの二つです。
+  新しいスレッドや子が初めて動くときには、付かないものを一つだけ書き、
+  継承したイベントがそれを受け取ります。
   `cpu-clock` と `task-clock` のイベントは、ティックの割り込みが
   `perf_event_max_sample_rate` を `HZ` で割った数に届くと次のティックまで抑えられ、
   そのあいだは数えません。グループのリーダーの `PERF_RECORD_THROTTLE` と `UNTHROTTLE`

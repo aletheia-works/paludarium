@@ -2492,6 +2492,44 @@ fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
     assert_eq!(link(&mut f), b"/l1 (deleted)");
     assert!(f.ret(2, &[name + 0x100, 0]) < 1 << 31);
 }
+/// `fstatfs` of a fifo opened by its name is its file system's, the same
+/// as `statfs` of its directory gives, after it is removed too; only a
+/// `pipe`'s is pipefs.
+#[test]
+fn fstatfs_of_a_named_fifo_is_its_file_system_s() {
+    let mut f = fixture();
+    let (name, dir, out, mine) = (DATA, DATA + 0x40, DATA + 0x100, DATA + 0x200);
+    let words = |f: &Fixture, at: u64| -> Vec<u64> {
+        // f_type, f_fsid and f_flags.
+        [0, 56, 80]
+            .iter()
+            .map(|&i| f.mem.read_u64(GuestAddr(at + i)).unwrap())
+            .collect()
+    };
+    for (place, fifo) in [
+        (&b"/tmp\0"[..], &b"/tmp/fifo\0"[..]),
+        (b"/dev/shm\0", b"/dev/shm/fifo\0"),
+    ] {
+        f.mem.write(GuestAddr(name), fifo).unwrap();
+        f.mem.write(GuestAddr(dir), place).unwrap();
+        assert_eq!(f.ret(133, &[name, 0o010_600, 0]), 0);
+        let fd = f.ret(2, &[name, 2]);
+        assert!(fd < 1024, "{fd:#x}");
+        assert_eq!(f.ret(137, &[dir, out]), 0);
+        assert_eq!(f.ret(138, &[fd, mine]), 0);
+        assert_eq!(words(&f, mine), words(&f, out));
+        assert_ne!(words(&f, mine)[0], 0x5049_5045);
+        assert_eq!(f.ret(87, &[name]), 0);
+        assert_eq!(f.ret(138, &[fd, mine]), 0);
+        assert_eq!(words(&f, mine), words(&f, out), "removed");
+        assert_eq!(f.ret(3, &[fd]), 0);
+    }
+    // pipe(2): pipefs.
+    assert_eq!(f.ret(22, &[out]), 0);
+    let read_end = f.mem.read_u64(GuestAddr(out)).unwrap() & 0xffff_ffff;
+    assert_eq!(f.ret(138, &[read_end, mine]), 0);
+    assert_eq!(words(&f, mine)[0], 0x5049_5045);
+}
 #[test]
 fn dev_reports_its_devices_and_lists_them() {
     let mut f = fixture();
@@ -5632,6 +5670,8 @@ mod io_uring {
         // The probe: NOP, the transfers and EPOLL_CTL, of 65 operations.
         let probe = DATA + 0x400;
         f.mem.write(GuestAddr(probe), &[0; 16 + 8 * 65]).unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 8, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 8, probe, 257]), errno(Errno::EINVAL));
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 70]), 0);
         let mut head = [0; 2];
         f.mem.read(GuestAddr(probe), &mut head).unwrap();
@@ -8722,6 +8762,74 @@ mod io_uring {
         assert_eq!(one(&mut f, &r, &nop(0)), 0);
         assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);
         assert_eq!(f.ret(427, &[r.fd, 10, 0, 1]), eacces);
+    }
+
+    /// `io_uring_register` with descriptor -1.
+    const NO_RING: u64 = u32::MAX as u64;
+
+    /// A task's `IORING_REGISTER_RESTRICTIONS`: a `struct
+    /// io_uring_task_restriction` with `flags`, then `list`.
+    fn restrict_task(f: &mut Fixture, flags: u16, list: &[(u16, u8)]) -> u64 {
+        let at = DATA + 0x200;
+        let mut head = [0; 16];
+        head[..2].copy_from_slice(&flags.to_le_bytes());
+        head[2..4].copy_from_slice(&(list.len() as u16).to_le_bytes());
+        f.mem.write(GuestAddr(at), &head).unwrap();
+        for (i, (op, value)) in list.iter().enumerate() {
+            let mut entry = [0; 16];
+            entry[..2].copy_from_slice(&op.to_le_bytes());
+            entry[2] = *value;
+            f.mem
+                .write(GuestAddr(at + 16 + 16 * i as u64), &entry)
+                .unwrap();
+        }
+        f.ret(427, &[NO_RING, 11, at, 1])
+    }
+
+    #[test]
+    fn a_task_s_restrictions_go_to_each_ring_it_sets_up_after() {
+        let mut f = fixture();
+        let before = ring(&mut f);
+        let (einval, eacces) = (errno(Errno::EINVAL), errno(Errno::EACCES));
+        // Descriptor -1 takes only a task's restrictions, after the opcode.
+        assert_eq!(f.ret(427, &[NO_RING, 38, 0, 0]), einval);
+        assert_eq!(f.ret(427, &[NO_RING, 8, DATA, 1]), einval);
+        // `no_new_privs` or `CAP_SYS_ADMIN`, then one argument, read, with
+        // no flags or reserved bits, then its restrictions.
+        let admin = f.thread.state.credentials.effective;
+        f.thread.state.credentials.effective = 0;
+        assert_eq!(restrict_task(&mut f, 0, &[(1, 0)]), eacces);
+        f.thread.state.credentials.effective = admin;
+        assert_eq!(f.ret(427, &[NO_RING, 11, DATA, 0]), einval);
+        assert_eq!(f.ret(427, &[NO_RING, 11, 8, 1]), errno(Errno::EFAULT));
+        assert_eq!(restrict_task(&mut f, 1, &[(1, 0)]), einval);
+        f.mem.write(GuestAddr(DATA + 0x20c), &[1]).unwrap();
+        assert_eq!(f.ret(427, &[NO_RING, 11, DATA + 0x200, 1]), einval);
+        assert_eq!(restrict_task(&mut f, 0, &[(1, 0), (1, 65)]), einval);
+        assert_eq!(restrict_task(&mut f, 0, &[(9, 0)]), einval);
+        // With `no_new_privs`: NOPs, and registering personalities.
+        f.thread.state.credentials.effective = 0;
+        assert_eq!(f.ret(157, &[38, 1, 0, 0, 0]), 0);
+        assert_eq!(restrict_task(&mut f, 0, &[(1, 0), (0, 9)]), 0);
+        f.thread.state.credentials.effective = admin;
+        assert_eq!(restrict_task(&mut f, 0, &[(1, 0)]), errno(Errno::EPERM));
+        // A ring from before has none.
+        let read = rw(READ, 0, HERE, DATA, 1);
+        assert_eq!(one(&mut f, &before, &nop(1, 0, 0, 0, 0)), 0);
+        assert_eq!(f.ret(427, &[before.fd, 12, 0, 0]), errno(EBADFD));
+        // A new one has them, enabled at once or not.
+        let r = ring(&mut f);
+        assert_eq!(one(&mut f, &r, &nop(1, 0, 0, 0, 0)), 0);
+        assert_eq!(one(&mut f, &r, &read), EACCES);
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);
+        assert_eq!(f.ret(427, &[r.fd, 8, DATA, 1]), eacces);
+        // A disabled one is held to them at once, as Linux master is since
+        // 6da8f402e362: no restrictions of its own, and no enabling here.
+        let d = ring_with(&mut f, R_DISABLED);
+        assert_eq!(restrict(&mut f, &d, &[(1, 22)]), eacces);
+        assert_eq!(f.ret(427, &[d.fd, 12, 0, 0]), eacces);
+        assert_eq!(f.ret(427, &[d.fd, 9, 0, 0]), 1);
+        assert_eq!(f.ret(426, &[d.fd, 0, 0, 0]), errno(EBADFD));
     }
 
     #[test]

@@ -2339,6 +2339,20 @@ kernel.
   requests, each of which fails with `EACCES` otherwise. None at all allows
   nothing.
 
+- A task's restrictions, `IORING_REGISTER_RESTRICTIONS` with descriptor -1
+  as Linux 7.0's `io_register_restrictions_task` takes them, go to every
+  ring the thread sets up after. A disabled ring is held to them at once,
+  as Linux master is since 6da8f402e362, which the test runners' kernel
+  has: it takes no restrictions of its own, and only the registrations they
+  allow (`EACCES`), so enabling it needs `IORING_REGISTER_ENABLE_RINGS`
+  among them. A new thread or process copies them,
+  and exec keeps them. A thread with them already is refused (`EPERM`), and
+  one needs `no_new_privs` or `CAP_SYS_ADMIN` (`EACCES`). There must be one
+  argument (`EINVAL`), a `struct io_uring_task_restriction` that is read
+  (`EFAULT`) with no flags or reserved bits (`EINVAL`), whose restrictions
+  follow it and are read as a ring's are. Descriptor -1 with another
+  registration is `EINVAL`.
+
 - `IORING_REGISTER_PERSONALITY` keeps the thread's credentials, with its
   Landlock domain, and gives their ID, from 1 on (`xa_alloc_cyclic`). A
   request that names one (`EINVAL` for none) runs with them, again as it
@@ -3535,8 +3549,11 @@ kernel.
     the protocol (0 and 2); the addresses, the protocol and the ports (1);
     or the fields `fib_multipath_hash_fields` names (3), of the flow
     `RTM_GETROUTE` asks for too; a socket's packets hash as it is bound,
-    `::` unbound, with no flow label, and one unbound takes the source of the hop that gives
-    (`ip6_dst_lookup_tail`). An answer goes back by a lookup of its own,
+    `::` unbound, with no flow label, and one unbound takes the source of
+    the hop that gives (`ip6_dst_lookup_tail`). ICMPv6's port unreachable is
+    looked up with the datagram it tells of (`icmp6_send`), hashed as IPv4's
+    is: under policy 1 by the flow hash of a connected socket, and under
+    policy 3 mixed with no inner hash. An answer goes back by a lookup of its own,
     through whichever end that takes: the one its listener is bound to, or
     to a link-local address the one the packet came in on
     (`inet6_csk_route_req`, `icmp6_send`). Turning `disable_ipv6` on for an end
@@ -4482,7 +4499,9 @@ kernel.
   inode (an eventfd, an epoll and the like) that no path opened are each on
   a device of their file system's own (pipefs, sockfs, pidfs, the internal
   tmpfs, secretmem, nsfs, anon_inodefs), as on Linux, none of them a
-  mount's. `ustat` of a mount's `st_dev` gives its free blocks and inodes,
+  mount's. A fifo opened by its name is a file of the file system that
+  holds it, and `fstatfs` gives that one, after the name is removed too.
+  `ustat` of a mount's `st_dev` gives its free blocks and inodes,
   of one of those devices none (0, as Linux's `simple_statfs` and the
   internal tmpfs, which has no limits, give), and of any other device
   `EINVAL`.
@@ -4717,7 +4736,12 @@ kernel.
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
   a futex, a timer or anything else it sleeps on), as Linux shows a task
-  that is not running, and `R` otherwise, also while it runs in a system
+  that is not running, `D (disk sleep)` instead in a wait Linux's task
+  sleeps `TASK_KILLABLE` in (a `vfork` parent waiting for its child, an
+  open waiting for a fanotify listener's answer, a task waiting for its
+  userfaultfd event to be read, and a seccomp notification's wait once
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` makes it killable), and `R`
+  otherwise, also while it runs in a system
   call that does not wait. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
   `maps` and `smaps` are empty, and open for any reader their mode lets,
@@ -6121,14 +6145,19 @@ kernel.
   (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack
   and mappings; and
   `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
-  that is made or ends; and with `namespaces` (which takes `CAP_PERFMON`),
+  that is made or ends; with `namespaces` (which takes `CAP_PERFMON`),
   `PERF_RECORD_NAMESPACES` of a thread's namespaces, the device and inode
   of each of its `/proc/<pid>/ns` files of net, uts, ipc, pid, user, mnt
   and cgroup: of a new thread or child, written by its creator, and of a
   thread after each `unshare` that succeeds, new namespaces or not, and
-  each `setns`. A `cpu-clock` or `task-clock` event whose
-  interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
-  throttled until the next tick, its count stopped meanwhile, with
+  each `setns`; and with `context_switch`, `PERF_RECORD_SWITCH`
+  (`SWITCH_CPU_WIDE` for an event of a CPU, with the thread that ran
+  instead) of each sleep of a thread, one with `PERF_RECORD_MISC_SWITCH_OUT`
+  and one without it as it runs again, and one without it alone for a new
+  thread's or child's first run, which inherited events take. A
+  `cpu-clock` or `task-clock` event whose interrupts in a tick reach
+  `perf_event_max_sample_rate` over `HZ` is throttled until the next tick,
+  its count stopped meanwhile, with
   `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,
   ID and `stream_id`). It stops its group's other clocks too
   (`perf_event_throttle_group`): they leave that time out of their counts,

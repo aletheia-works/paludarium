@@ -4557,6 +4557,7 @@ fn lookup(
         proto: proto.unwrap_or(0),
         sport,
         dport,
+        ..crate::interface::Flow6::default()
     };
     let flow4 = crate::multipath::Flow {
         proto: proto.unwrap_or(17),

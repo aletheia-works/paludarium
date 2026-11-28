@@ -13257,7 +13257,10 @@ static int io_uring_multishot_case(void) {
        no group is ENOENT; a ring gives as many buffers as the length needs,
        and one filled whole while more waits tries once more for it, in the
        same completion; a provided buffer is one at most; a multishot one
-       ends once it took the group's last buffers. */
+       ends once it took the group's last buffers. (Not one whose length
+       runs out on the last buffer, which ends only on Linux master's
+       8742f4b5a472: the multishot one asks for 12 bytes, more than the two
+       buffers left.) */
     if (write(sp[1], "abcdef", 6) != 6) return 87;
     sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 8, 0, 16);
     sqe[1] = 1 << 5;
@@ -13316,7 +13319,7 @@ static int io_uring_multishot_case(void) {
     }
     __atomic_store_n((unsigned short *)(rring + 14), 8, __ATOMIC_RELEASE);
     if (write(sp[1], "qrstuv", 6) != 6) return 90;
-    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 8, 0, 2 | 16);
+    sqe = unet_push(&u, 27, 1, sp[0], 0, 0, 12, 0, 2 | 16);
     sqe[1] = 1 << 5;
     sqe[40] = 8;
     um_run(&u, 1, 1, "recv-bundle-multishot");

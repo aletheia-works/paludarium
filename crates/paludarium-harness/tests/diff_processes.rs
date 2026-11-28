@@ -1213,6 +1213,7 @@ mod linux {
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),
+        processes_named_fifo_statfs => ("named-fifo-statfs","process"),
         processes_shmem_populate => ("shmem-populate","process"),
         processes_tmpfs_huge => ("tmpfs-huge","process"),
         processes_tmpfs_huge_placement => ("tmpfs-huge-placement","process"),

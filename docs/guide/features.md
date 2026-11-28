@@ -4438,7 +4438,9 @@ kernel.
   inode (an eventfd, an epoll and the like) that no path opened are each on
   a device of their file system's own (pipefs, sockfs, pidfs, the internal
   tmpfs, secretmem, nsfs, anon_inodefs), as on Linux, none of them a
-  mount's. `ustat` of a mount's `st_dev` gives its free blocks and inodes,
+  mount's. A fifo opened by its name is a file of the file system that
+  holds it, and `fstatfs` gives that one, after the name is removed too.
+  `ustat` of a mount's `st_dev` gives its free blocks and inodes,
   of one of those devices none (0, as Linux's `simple_statfs` and the
   internal tmpfs, which has no limits, give), and of any other device
   `EINVAL`.

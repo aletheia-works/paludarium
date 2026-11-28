@@ -19215,6 +19215,41 @@ static int grl_inner(const char *self) {
  * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
  * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
  * `self/mounts` (`proc_symlink`). */
+/* The named-fifo-statfs case: fstatfs of a fifo opened by its name is the
+   file system that holds it, the same as statfs of its directory (type,
+   fsid and flags), by a descriptor open for reading and writing and by an
+   O_PATH one, and after the name is removed; a pipe(2)'s is pipefs. Only
+   whether they agree is printed, as /tmp's file system differs. */
+static int nfs_same(const struct statfs *a, const struct statfs *b) {
+    return a->f_type == b->f_type && !memcmp(&a->f_fsid, &b->f_fsid, sizeof a->f_fsid) &&
+           a->f_flags == b->f_flags;
+}
+static int named_fifo_statfs_case(void) {
+    int p[2];
+    if (pipe2(p, O_CLOEXEC)) return 1;
+    struct statfs ps;
+    printf("pipe pipefs=%d\n", !fstatfs(p[0], &ps) && ps.f_type == 0x50495045);
+    close(p[0]);
+    close(p[1]);
+    const char *const dirs[] = {"/tmp", "/dev/shm"};
+    for (unsigned i = 0; i < 2; i++) {
+        char name[96];
+        snprintf(name, sizeof name, "%s/paludarium-fifo-%d", dirs[i], (int)getpid());
+        if (mknod(name, S_IFIFO | 0600, 0)) return 2;
+        int fd = open(name, O_RDWR | O_CLOEXEC);
+        int pathfd = open(name, O_PATH | O_CLOEXEC);
+        struct statfs dir, a, b, c, d;
+        int ok = fd >= 0 && pathfd >= 0 && !statfs(dirs[i], &dir);
+        int r1 = ok && !fstatfs(fd, &a), r2 = ok && !fstatfs(pathfd, &b);
+        unlink(name);
+        int r3 = ok && !fstatfs(fd, &c), r4 = ok && !fstatfs(pathfd, &d);
+        printf("%s opened=%d path=%d removed=%d removed-path=%d\n", dirs[i], r1 && nfs_same(&a, &dir),
+               r2 && nfs_same(&b, &dir), r3 && nfs_same(&c, &dir), r4 && nfs_same(&d, &dir));
+        if (fd >= 0) close(fd);
+        if (pathfd >= 0) close(pathfd);
+    }
+    return 0;
+}
 static int proc_links_case(const char *self) {
     char exe[4096], dir[4096];
     if (!realpath(self, exe)) return 1;
@@ -45926,6 +45961,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
+    if (!strcmp(mode, "named-fifo-statfs")) return named_fifo_statfs_case();
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();

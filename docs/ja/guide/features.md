@@ -3799,7 +3799,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   memfd・`memfd_secret` のファイル・名前空間のファイル・匿名 inode（eventfd や epoll
   など）は、Linux と同じく、それぞれのファイルシステム（pipefs・sockfs・pidfs・内部の
   tmpfs・secretmem・nsfs・anon_inodefs）が持つデバイスにあり、どれもマウントのもの
-  ではありません。`ustat` は、マウントの `st_dev` なら空きブロックと空き inode の数を
+  ではありません。名前から開いた FIFO はそれを持つファイルシステムのファイルで、
+  `fstatfs` は名前を消したあともそのファイルシステムを返します。`ustat` は、マウントの `st_dev` なら空きブロックと空き inode の数を
   返し、それらのデバイスなら何も空いていない（0）と返します。Linux の `simple_statfs`
   と、制限のない内部の tmpfs も 0 を返すからです。ほかのデバイスなら `EINVAL` です。
 

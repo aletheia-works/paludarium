@@ -2492,6 +2492,44 @@ fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
     assert_eq!(link(&mut f), b"/l1 (deleted)");
     assert!(f.ret(2, &[name + 0x100, 0]) < 1 << 31);
 }
+/// `fstatfs` of a fifo opened by its name is its file system's, the same
+/// as `statfs` of its directory gives, after it is removed too; only a
+/// `pipe`'s is pipefs.
+#[test]
+fn fstatfs_of_a_named_fifo_is_its_file_system_s() {
+    let mut f = fixture();
+    let (name, dir, out, mine) = (DATA, DATA + 0x40, DATA + 0x100, DATA + 0x200);
+    let words = |f: &Fixture, at: u64| -> Vec<u64> {
+        // f_type, f_fsid and f_flags.
+        [0, 56, 80]
+            .iter()
+            .map(|&i| f.mem.read_u64(GuestAddr(at + i)).unwrap())
+            .collect()
+    };
+    for (place, fifo) in [
+        (&b"/tmp\0"[..], &b"/tmp/fifo\0"[..]),
+        (b"/dev/shm\0", b"/dev/shm/fifo\0"),
+    ] {
+        f.mem.write(GuestAddr(name), fifo).unwrap();
+        f.mem.write(GuestAddr(dir), place).unwrap();
+        assert_eq!(f.ret(133, &[name, 0o010_600, 0]), 0);
+        let fd = f.ret(2, &[name, 2]);
+        assert!(fd < 1024, "{fd:#x}");
+        assert_eq!(f.ret(137, &[dir, out]), 0);
+        assert_eq!(f.ret(138, &[fd, mine]), 0);
+        assert_eq!(words(&f, mine), words(&f, out));
+        assert_ne!(words(&f, mine)[0], 0x5049_5045);
+        assert_eq!(f.ret(87, &[name]), 0);
+        assert_eq!(f.ret(138, &[fd, mine]), 0);
+        assert_eq!(words(&f, mine), words(&f, out), "removed");
+        assert_eq!(f.ret(3, &[fd]), 0);
+    }
+    // pipe(2): pipefs.
+    assert_eq!(f.ret(22, &[out]), 0);
+    let read_end = f.mem.read_u64(GuestAddr(out)).unwrap() & 0xffff_ffff;
+    assert_eq!(f.ret(138, &[read_end, mine]), 0);
+    assert_eq!(words(&f, mine)[0], 0x5049_5045);
+}
 #[test]
 fn dev_reports_its_devices_and_lists_them() {
     let mut f = fixture();

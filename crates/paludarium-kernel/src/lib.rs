@@ -235,8 +235,10 @@ pub(crate) struct CpuAccount {
     /// looked ([`Kernel::scheduled_in`]).
     resumed: bool,
     /// The times it has slept since then, each a switch out and back in
-    /// for the events with `context_switch` ([`perf::switched`]).
+    /// for the events with `context_switch` ([`perf::switched`]), and the
+    /// CPU it slept on.
     slept: u64,
+    slept_on: u32,
     /// Whether perf has seen it run: a new thread's first run is a switch
     /// in alone.
     ran: bool,
@@ -953,6 +955,7 @@ pub(crate) fn account_cpu(
     if switches != 0 {
         account.resumed = true;
         account.slept = account.slept.saturating_add(switches);
+        account.slept_on = account.on.map_or(0, |(cpu, _)| cpu);
         usage.switches.fetch_add(switches, Ordering::SeqCst);
         // Its sleeps since its last account were on the CPU it was on
         // then, though another thread's `sched_setaffinity` moved its
@@ -1798,10 +1801,9 @@ impl Kernel {
         // sampling perf events, whose clocks overflow as it runs.
         let sampling = perf::sampling(&self.processes.perf_events);
         // So does a thread that slept, whose events' user pages and
-        // switch records show it.
-        let slept = (perf::buffers_mapped(&self.processes.perf_events)
-            || perf::switches(&self.processes.perf_events))
-            && paludarium_host::switches::pending();
+        // switch records show it: its sleeps are taken now, so that an
+        // event opened or enabled after them takes none of them.
+        let slept = paludarium_host::switches::pending();
         if self.group.cpu_timers_armed() || sampling || slept {
             account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
             self.scheduled_in(thread);
@@ -2535,12 +2537,13 @@ impl Kernel {
                 tid: thread.tid,
                 cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
             };
+            let slept_on = thread.state.cpu.slept_on;
             perf::switched(
                 &self.processes.perf_events,
                 &self.group,
                 &who,
-                started,
-                sleeps,
+                slept_on,
+                (started, sleeps),
             );
         }
     }

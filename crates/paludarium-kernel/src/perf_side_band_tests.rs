@@ -993,3 +993,43 @@ fn a_sleep_is_a_switch_out_and_back_in() {
         ],
     );
 }
+
+/// A thread that another thread's `sched_setaffinity` moved while it slept
+/// is switched out on the CPU it slept on and in on the one it runs on now.
+#[test]
+fn a_moved_sleeper_is_switched_out_where_it_slept() {
+    const ATTR_CONTEXT_SWITCH: u64 = 1 << 26;
+    let mut env = Env::new();
+    let tid = env.call(GETTID, [0; 6]) as u32;
+    env.pin();
+    let (on_0, first) = env.open_side_band(-1, 0, ATTR_CONTEXT_SWITCH).unwrap();
+    let (on_1, second) = env.open_side_band(-1, 1, ATTR_CONTEXT_SWITCH).unwrap();
+    env.ioctl(on_0, IOC_ENABLE);
+    env.ioctl(on_1, IOC_ENABLE);
+    let _ = paludarium_host::switches::take();
+    paludarium_host::switches::sleep(&mut false);
+    env.k.group.set_affinity(tid, vec![2]);
+    env.call(GETPID, [0; 6]);
+    for page in [first, second] {
+        let mut outs = Vec::new();
+        env.each_record(page, |_, record| outs.push(record[0] >> 32 & 1 << 13 != 0));
+        env.say(format!("{outs:?}"));
+    }
+    check(&env.lines, &["[true]", "[false]"]);
+}
+
+/// The sleeps of a call are taken as it returns, so that an event opened
+/// after them takes none of them.
+#[test]
+fn a_call_s_sleeps_are_taken_as_it_returns() {
+    const NANOSLEEP: u64 = 35;
+    let mut env = Env::new();
+    env.call(GETPID, [0; 6]);
+    let _ = paludarium_host::switches::take();
+    env.put(
+        ARG,
+        &[0u64.to_le_bytes(), 1_000_000u64.to_le_bytes()].concat(),
+    );
+    assert_eq!(env.call(NANOSLEEP, [ARG, 0, 0, 0, 0, 0]), 0);
+    assert!(!paludarium_host::switches::pending());
+}

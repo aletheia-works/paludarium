@@ -6024,9 +6024,10 @@ kernel.
   (`SWITCH_CPU_WIDE` for an event of a CPU, with the thread that ran
   instead) of each sleep of a thread, one with `PERF_RECORD_MISC_SWITCH_OUT`
   and one without it as it runs again, and one without it alone for a new
-  thread's or child's first run, which inherited events take. A `cpu-clock` or `task-clock` event whose
-  interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
-  throttled until the next tick, its count stopped meanwhile, with
+  thread's or child's first run, which inherited events take. A
+  `cpu-clock` or `task-clock` event whose interrupts in a tick reach
+  `perf_event_max_sample_rate` over `HZ` is throttled until the next tick,
+  its count stopped meanwhile, with
   `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,
   ID and `stream_id`). It stops its group's other clocks too
   (`perf_event_throttle_group`): they leave that time out of their counts,

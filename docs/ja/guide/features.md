@@ -5146,7 +5146,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `context_switch` では、スレッドが眠るたびに `PERF_RECORD_SWITCH`（CPU のイベントには、
   代わりに動いたスレッドを含む `SWITCH_CPU_WIDE`）を書きます。
   `PERF_RECORD_MISC_SWITCH_OUT` の付いたものと、ふたたび動くときの付かないものの二つです。
-  新しいスレッドや子が初めて動くときには、付かないものを一つだけ書き、継承したイベントがそれを受け取ります。
+  新しいスレッドや子が初めて動くときには、付かないものを一つだけ書き、
+  継承したイベントがそれを受け取ります。
   `cpu-clock` と `task-clock` のイベントは、ティックの割り込みが
   `perf_event_max_sample_rate` を `HZ` で割った数に届くと次のティックまで抑えられ、
   そのあいだは数えません。グループのリーダーの `PERF_RECORD_THROTTLE` と `UNTHROTTLE`

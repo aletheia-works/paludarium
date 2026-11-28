@@ -25,7 +25,7 @@ mod build_id;
 mod sample;
 mod side_band;
 
-pub(crate) use buffer::{buffers_mapped, scheduled_in};
+pub(crate) use buffer::scheduled_in;
 pub(crate) use sample::{Task, Who, clock_due, overflow, samples_faults, sampling};
 pub(crate) use side_band::{Space, comm, switched, switches, wanted};
 

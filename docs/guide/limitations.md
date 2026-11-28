@@ -1170,10 +1170,6 @@ verified.
   than those 10 ms can go unseen and send none, unless a read or write told
   the guest `EAGAIN`, which always gets its signal. In WebAssembly, which has
   no thread to look, they send none.
-- **Edge-triggered `epoll` on a signalfd, in part**: a signal queued for
-  another thread of the process is the waiting thread's edge as it is sent,
-  but a thread already waiting sees it within 10 ms, where Linux's
-  `signalfd_notify` wakes the file at once.
 - **A POSIX timer's signal, in part**: a timer on a clock of real time
   sends to the process's leader first, where Linux's `posixtimer_get_target`
   sends to a thread of the process that its interrupt finds running. One

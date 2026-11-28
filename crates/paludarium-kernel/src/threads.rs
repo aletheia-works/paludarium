@@ -108,7 +108,7 @@ pub struct ThreadGroup {
     discards: Arc<signals::Discards>,
     /// The signals the threads' drains made pending, for the signal files
     /// of the other threads ([`SignalInbox::others_arrivals`]).
-    arrivals: Arc<AtomicU64>,
+    arrivals: Arc<crate::signalfd::Arrivals>,
     timer_generation: AtomicU64,
     /// The RLIMIT_NOFILE soft limit, which bounds the descriptor numbers this
     /// process allocates, and the RLIMIT_FSIZE one, which bounds the files it
@@ -2498,6 +2498,11 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .drain_process(&mut pending);
         pending.pending.clone()
+    }
+    /// The count of the signals the threads made pending, and the waits
+    /// each wakes.
+    pub(crate) fn signal_arrivals(&self) -> &crate::signalfd::Arrivals {
+        &self.arrivals
     }
     /// The process-directed signals waiting here, as a signal set, and how
     /// many have come so far.

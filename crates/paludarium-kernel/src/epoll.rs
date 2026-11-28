@@ -489,6 +489,8 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .ok_or(Errno::EINVAL)?;
             loop {
                 let ticket = c.files.readiness.token.value();
+                // A signal file's edge wakes the wait as the signal is sent.
+                crate::signalfd::waiting(c);
                 if let Some(count) = write_events(c, epoll, a[1], max as usize)? {
                     return Ok(count);
                 }

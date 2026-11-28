@@ -26,7 +26,7 @@ pub struct SignalInbox {
     /// ([`ThreadState::arrivals`]), which this inbox's thread adds its own
     /// to ([`Self::publish`]); the thread's count when it last did, and how
     /// much it has added in all.
-    arrivals: Mutex<Option<Arc<AtomicU64>>>,
+    arrivals: Mutex<Option<Arc<crate::signalfd::Arrivals>>>,
     /// The thread group's actions, which decide whether a signal sent here
     /// for the thread is ignored ([`Self::send_to`]).
     actions: Mutex<Option<crate::threads::ActionSlot>>,
@@ -395,7 +395,11 @@ impl SignalInbox {
     }
     /// Joins the thread group whose discards this inbox's thread follows,
     /// and whose count of arrivals its drains add to.
-    pub(crate) fn attach(&self, discards: Arc<signals::Discards>, arrivals: Arc<AtomicU64>) {
+    pub(crate) fn attach(
+        &self,
+        discards: Arc<signals::Discards>,
+        arrivals: Arc<crate::signalfd::Arrivals>,
+    ) {
         *self.discards.lock().unwrap_or_else(PoisonError::into_inner) = Some(discards);
         *self.arrivals.lock().unwrap_or_else(PoisonError::into_inner) = Some(arrivals);
     }
@@ -439,7 +443,7 @@ impl SignalInbox {
             return false;
         }
         if let Some(count) = &*self.arrivals.lock().unwrap_or_else(PoisonError::into_inner) {
-            count.fetch_add(1, Ordering::SeqCst);
+            count.add(1);
         }
         true
     }
@@ -455,7 +459,7 @@ impl SignalInbox {
         }
         self.contributed.fetch_add(added, Ordering::SeqCst);
         if let Some(count) = &*self.arrivals.lock().unwrap_or_else(PoisonError::into_inner) {
-            count.fetch_add(added, Ordering::SeqCst);
+            count.add(added);
         }
     }
     /// The arrivals the group's other threads made: the group's count less
@@ -466,7 +470,7 @@ impl SignalInbox {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map_or(0, |count| count.load(Ordering::SeqCst));
+            .map_or(0, |count| count.count());
         total.wrapping_sub(self.contributed.load(Ordering::SeqCst))
     }
     /// The signals queued here, as a signal set, and how many of them a
@@ -569,7 +573,7 @@ mod signals_time_tests {
 
     #[test]
     fn a_threads_arrivals_reach_the_others() {
-        let count = Arc::<AtomicU64>::default();
+        let count = Arc::<crate::signalfd::Arrivals>::default();
         let [one, two] = [SignalInbox::default(), SignalInbox::default()];
         for inbox in [&one, &two] {
             inbox.attach(Arc::default(), Arc::clone(&count));
@@ -600,7 +604,7 @@ mod signals_time_tests {
     /// already pending for it.
     #[test]
     fn a_signal_for_another_thread_counts_as_it_is_sent() {
-        let count = Arc::<AtomicU64>::default();
+        let count = Arc::<crate::signalfd::Arrivals>::default();
         let actions = crate::threads::ActionSlot::default();
         let [one, two] = [SignalInbox::default(), SignalInbox::default()];
         for inbox in [&one, &two] {
@@ -649,12 +653,45 @@ mod signals_time_tests {
         assert_eq!(one.others_arrivals(), 4);
     }
 
+    /// A signal counted for the group's signal files wakes, as it is sent,
+    /// each file table a thread waited on in `epoll` with a signal file
+    /// open, once for each signal; one not counted wakes none.
+    #[test]
+    fn a_counted_signal_wakes_the_waits_at_once() {
+        let count = Arc::<crate::signalfd::Arrivals>::default();
+        let [one, two] = [SignalInbox::default(), SignalInbox::default()];
+        for inbox in [&one, &two] {
+            inbox.attach(Arc::default(), Arc::clone(&count));
+            inbox.follow_actions(crate::threads::ActionSlot::default());
+        }
+        let hub = Arc::<crate::events::ReadinessHub>::default();
+        count.wait_on(&hub);
+        count.wait_on(&hub);
+        let ticket = hub.token.value();
+        let mut state = ThreadState::default();
+        two.drain(&mut state);
+        two.send_thread(40, 0).unwrap();
+        assert_eq!(hub.token.value(), ticket.wrapping_add(1));
+        assert_eq!(one.others_arrivals(), 1);
+        // SIGURG is ignored by default and unblocked: nothing comes.
+        two.send_thread(23, 0).unwrap();
+        assert_eq!(hub.token.value(), ticket.wrapping_add(1));
+        // What the kernel queues for the thread itself, as it publishes it.
+        signals::queue(&mut state, signals::PendingSignal::thread(41, 0));
+        two.publish(&state);
+        assert_eq!(hub.token.value(), ticket.wrapping_add(2));
+        // A file table that is gone is woken no more.
+        drop(hub);
+        two.send_thread(42, 0).unwrap();
+        assert_eq!(one.others_arrivals(), 3);
+    }
+
     /// A standard signal its thread has taken, by delivery or a wait, is no
     /// longer pending for it: one sent next counts as it is sent, before
     /// the thread's next drain.
     #[test]
     fn a_signal_taken_without_a_drain_is_pending_no_more() {
-        let count = Arc::<AtomicU64>::default();
+        let count = Arc::<crate::signalfd::Arrivals>::default();
         let actions = crate::threads::ActionSlot::default();
         let [one, two] = [SignalInbox::default(), SignalInbox::default()];
         for inbox in [&one, &two] {
@@ -681,7 +718,7 @@ mod signals_time_tests {
     /// SIGCONT, or a stop signal, took away as it was queued.
     #[test]
     fn a_discarded_signal_is_pending_no_more() {
-        let count = Arc::<AtomicU64>::default();
+        let count = Arc::<crate::signalfd::Arrivals>::default();
         let actions = crate::threads::ActionSlot::default();
         let [one, two] = [SignalInbox::default(), SignalInbox::default()];
         for inbox in [&one, &two] {
@@ -723,7 +760,7 @@ mod signals_time_tests {
     /// drain counts it, unless it is blocked, SIGKILL, or a fault's.
     #[test]
     fn a_nested_inits_unhandled_signal_does_not_count() {
-        let count = Arc::<AtomicU64>::default();
+        let count = Arc::<crate::signalfd::Arrivals>::default();
         let actions = crate::threads::ActionSlot::default();
         let targets = Arc::<Targets>::default();
         let [one, two] = [SignalInbox::default(), SignalInbox::default()];

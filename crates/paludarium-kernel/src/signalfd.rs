@@ -12,8 +12,8 @@ use crate::{SignalInbox, ThreadGroup, ThreadState, signals};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use std::cell::Cell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 /// `sizeof(struct signalfd_siginfo)`.
 const RECORD: usize = 128;
@@ -77,6 +77,66 @@ pub(crate) fn observe(process: &ThreadState, inbox: &SignalInbox, group: &Thread
             epoch,
         });
     });
+}
+
+/// A thread group's count of the signals its threads made pending, for the
+/// signal files of the other threads ([`SignalInbox::others_arrivals`]), and
+/// the readiness of the file tables a thread of the group waited on in
+/// `epoll` while a signal file was open. Each signal counted wakes those
+/// waits, as Linux's `signalfd_notify` wakes every waiter on a signal file
+/// of the process as the signal is sent; a waiter otherwise saw it only as
+/// its wait timed out.
+#[derive(Default)]
+pub(crate) struct Arrivals {
+    count: AtomicU64,
+    waiters: Mutex<Vec<Weak<crate::events::ReadinessHub>>>,
+}
+impl Arrivals {
+    pub(crate) fn count(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+    /// Counts `added` more and wakes the waits.
+    pub(crate) fn add(&self, added: u64) {
+        if added == 0 {
+            return;
+        }
+        self.count.fetch_add(added, Ordering::SeqCst);
+        // Woken after the list's lock is let go, which no wait holds.
+        let hubs: Vec<_> = self
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for hub in hubs {
+            hub.changed();
+        }
+    }
+    /// The waits on `hub` are woken by each signal counted from now on.
+    pub(crate) fn wait_on(&self, hub: &Arc<crate::events::ReadinessHub>) {
+        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        waiters.retain(|waiter| waiter.strong_count() != 0);
+        if !waiters
+            .iter()
+            .any(|waiter| std::ptr::eq(waiter.as_ptr(), Arc::as_ptr(hub)))
+        {
+            waiters.push(Arc::downgrade(hub));
+        }
+    }
+}
+
+/// Before an `epoll` wait looks at its files, with `ticket` already taken:
+/// the waits of `c`'s file table are woken by each signal its thread group
+/// counts from now on, and what is pending for the caller is looked at
+/// again, so a signal counted before this is seen by the look and one after
+/// it changes the ticket.
+pub(crate) fn waiting(c: &Context<'_>) {
+    if LIVE.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    c.group.signal_arrivals().wait_on(&c.files.readiness);
+    observe(c.process, c.inbox, c.group);
 }
 
 fn set_of(pending: &[signals::PendingSignal]) -> u64 {

@@ -210,8 +210,9 @@ const HUGETLB_SHARED: u32 = 1 << 6;
 /// memfd, a file unlinked since), else for its file-backed one; a private
 /// mapping whole for the anonymous bit once a page of its VMA was written
 /// (its `anon_vma`), else, for a file mapping, whole for the file-backed
-/// bit, else its first page with the ELF headers bit when it is readable
-/// and starts an ELF file. Of a loaded program, the stack and a writable
+/// bit, else its first page with the ELF headers bit when it is readable,
+/// starts at the file's start and the file is executable now or starts with
+/// the ELF magic. Of a loaded program, the stack and a writable
 /// segment count as written, and the first page of its image is its ELF
 /// header. Only the ELF headers ask for a mapping that can be read
 /// (`VM_READ`): Linux reads the rest whatever its protection.
@@ -269,7 +270,14 @@ fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool, filter: u
             } else if filter & MAPPED_PRIVATE != 0 {
                 mapping.length
             } else {
-                header(state.file_offset == Some(0) && elf_header(mem, mapping.start))
+                // `vma_dump_size` takes the page of a file with an execute
+                // bit as it is; only of another one does `dump_vma_snapshot`
+                // look for the magic, as an ELF library need not be
+                // executable.
+                header(
+                    state.file_offset == Some(0)
+                        && (state.executable || elf_header(mem, mapping.start)),
+                )
             }
         }
     }
@@ -283,7 +291,8 @@ fn special_mapping(mem: &AddressSpace, at: GuestAddr) -> bool {
         .is_some_and(|name| name.first() == Some(&b'['))
 }
 /// Whether the mapping at `at` starts with the ELF magic, as Linux's
-/// `dump_vma_snapshot` checks a file mapping that may be a library's.
+/// `dump_vma_snapshot` checks a file mapping whose file is not executable,
+/// which may be a library's.
 fn elf_header(mem: &AddressSpace, at: GuestAddr) -> bool {
     let mut magic = [0u8; 4];
     mem.read(at, &mut magic).is_ok() && magic == *b"\x7fELF"
@@ -639,6 +648,38 @@ mod coredump_tests {
         // The ELF header's page only of a file that starts with one, which
         // this one does not.
         assert_eq!(lengths(ELF_HEADERS), [0; 5]);
+    }
+
+    #[test]
+    fn the_first_page_of_an_executable_file_is_its_header_without_the_magic() {
+        struct Executable;
+        impl PageSource for Executable {
+            fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+                Ok(buf.len())
+            }
+            fn executable(&self) -> bool {
+                true
+            }
+        }
+        let mut mem = AddressSpace::new();
+        let pages = SharedPages::new().with_source(Arc::new(Executable));
+        let mut map = |prot: Prot, offset: u64| {
+            let at = mem.map(None, 2 * PAGE, prot, MappingKind::File).unwrap();
+            mem.back_with_cache(at, 2 * PAGE, &pages, offset).unwrap();
+            at
+        };
+        let start = map(Prot::READ, 0);
+        let later = map(Prot::READ, 2 * PAGE);
+        let unreadable = map(Prot::NONE, 0);
+        let length = |at: GuestAddr| {
+            let mapping = mem.mappings().find(|m| m.start == at).unwrap();
+            dump_length(&mem, &mapping, false, ELF_HEADERS)
+        };
+        // Zeros, no ELF magic: the file's execute bit is enough.
+        assert_eq!(length(start), PAGE);
+        // Only where the file starts, and only of a mapping that can be read.
+        assert_eq!(length(later), 0);
+        assert_eq!(length(unreadable), 0);
     }
 
     #[test]

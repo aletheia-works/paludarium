@@ -7057,7 +7057,9 @@ kernel.
     a writable one's pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a
     lock not on fault; a `fork`ed child's VMAs each get their own), else, for
     a file mapping, whole for the file-backed private bit, else only its first
-    page for the ELF headers bit when it starts an ELF file; a shared mapping
+    page for the ELF headers bit when it maps the file from its start and the
+    file has an execute bit when the core is written, or else starts with
+    the ELF magic (an ELF library need not be executable); a shared mapping
     is there whole for the anonymous shared bit when no name links its file
     (an anonymous one, a memfd, a file unlinked since), else for the
     file-backed shared bit. Of the program's own image, the stack and a

@@ -1580,6 +1580,18 @@ fn a_test_run_s_copy_out_stops_at_the_page_that_faults() {
     assert_eq!((ran.result, ran.retval, ran.size_out), (-14, 0, 0));
     // The Ethernet header comes back as zeros, over the 0xee bytes.
     assert_eq!(e.get(end - 10, 10), [0; 10]);
+    // A packet in pages, copied out to 4,000 bytes before the page: past
+    // its linear part, into its pages.
+    e.packet([0; 6], 0x0800, 5000);
+    e.put(end - 4000, &[0xee; 4000]);
+    let ran = e.test_run(&TestRun {
+        data_out: end - 4000,
+        ..TestRun::of(len, 5000)
+    });
+    assert_eq!((ran.result, ran.size_out), (-14, 0));
+    let mut expected = vec![0; 14];
+    expected.extend((0..3986).map(|n| n as u8));
+    assert_eq!(e.get(end - 4000, 4000), expected);
     // A context copied out the same way.
     e.put(CTX_IN, &[0; 192]);
     let ran = e.test_run(&TestRun {

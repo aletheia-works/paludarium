@@ -3393,13 +3393,14 @@ static int case_testrun(void) {
         !memcmp(run_out + 14, run_in + 14, 6), run_out[20] == 0xee);
     /* A data_out or ctx_out that runs into an unmapped page: the copy
        writes up to that page and the run is EFAULT, its sizes and result
-       not written. Once in the linear part, once in the pages. */
+       not written. Once in the linear part, and once in the pages: 4000
+       bytes reach past the linear part's 3712 + 14. */
     unsigned char *pages = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (pages != MAP_FAILED && munmap(pages + 4096, 4096) == 0) {
         static const struct {
             const char *name;
             uint32_t size, room;
-        } cuts[] = {{"cut linear", 64, 10}, {"cut pages", 5000, 3000}};
+        } cuts[] = {{"cut linear", 64, 10}, {"cut pages", 5000, 4000}};
         for (size_t c = 0; c < sizeof cuts / sizeof cuts[0]; c++) {
             frame(zero, 0x0800, cuts[c].size);
             memset(pages, 0xee, 4096);

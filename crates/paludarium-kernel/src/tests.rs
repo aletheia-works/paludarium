@@ -2085,7 +2085,7 @@ fn inode_flags_read_back_and_refuse_what_linux_refuses() {
     assert_eq!(getflags(&mut f, fd), 0x40);
     assert_eq!(f.ret(332, &[at, file, 0, 0x7ff, out]), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(out + 8)).unwrap(), 0x40);
-    assert_eq!(f.mem.read_u64(GuestAddr(out + 56)).unwrap(), 0x70);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 56)).unwrap(), 0x0020_3070);
     // What tmpfs does not keep, and what Linux does not know.
     set_attr(&mut f, 0x20, 0, 0);
     assert_eq!(f.ret(469, &[at, file, attr, 24, 0]), eopnotsupp);
@@ -2929,6 +2929,69 @@ fn statfs_and_the_generated_mount_table() {
 /// `/proc/mounts` is a link to `self/mounts`, as Linux's `proc_symlink`
 /// makes it: `readlink` and `lstat` give the link, and the calls that follow
 /// it give the reader's mount table.
+/// `statx` gives `stx_attributes_mask` as Linux 7.0 does for every file
+/// (`STATX_ATTR_AUTOMOUNT`, `STATX_ATTR_MOUNT_ROOT`, `STATX_ATTR_DAX`), with
+/// tmpfs's flags for a tmpfs or devtmpfs file, and `STATX_ATTR_MOUNT_ROOT`
+/// for a mount's root by any path, not for a link or a chroot's root.
+#[test]
+fn statx_gives_the_known_attributes_and_the_mount_root() {
+    let mut f = fixture();
+    let (path, out) = (DATA, DATA + 0x100);
+    let at = (-100i64) as u64;
+    let statx = |f: &mut Fixture, name: &[u8], flags: u64| {
+        f.mem.write(GuestAddr(path), name).unwrap();
+        assert_eq!(f.ret(332, &[at, path, flags, 0x7ff, out]), 0, "{name:?}");
+        (
+            f.mem.read_u64(GuestAddr(out + 8)).unwrap(),
+            f.mem.read_u64(GuestAddr(out + 56)).unwrap(),
+        )
+    };
+    let (known, tmpfs, root) = (0x0020_3000, 0x0020_3070, 0x2000);
+    assert_eq!(statx(&mut f, b"/proc\0", 0), (root, known));
+    assert_eq!(statx(&mut f, b"/proc/self/..\0", 0), (root, known));
+    assert_eq!(statx(&mut f, b"/proc/self\0", 0), (0, known));
+    assert_eq!(statx(&mut f, b"/proc/self\0", 0x100), (0, known));
+    assert_eq!(statx(&mut f, b"/proc/self/status\0", 0), (0, known));
+    assert_eq!(statx(&mut f, b"/dev\0", 0), (root, tmpfs));
+    assert_eq!(statx(&mut f, b"/dev/null\0", 0), (0, tmpfs));
+    assert_eq!(statx(&mut f, b"/dev/shm/.\0", 0), (root, tmpfs));
+    assert_eq!(statx(&mut f, b"/\0", 0), (root, tmpfs));
+    // A link on tmpfs keeps no flags but says it knows them.
+    f.mem.write(GuestAddr(path), b"/statx-dir\0").unwrap();
+    assert_eq!(f.ret(83, &[path, 0o755]), 0);
+    f.mem
+        .write(GuestAddr(path + 0x40), b"/statx-link\0")
+        .unwrap();
+    assert_eq!(f.ret(88, &[path, path + 0x40]), 0);
+    assert_eq!(statx(&mut f, b"/statx-link\0", 0x100), (0, tmpfs));
+    assert_eq!(statx(&mut f, b"/statx-link\0", 0), (0, tmpfs));
+    // `.` in /proc, and the descriptor of a pipe.
+    f.mem.write(GuestAddr(path), b"/proc\0").unwrap();
+    assert_eq!(f.ret(80, &[path]), 0);
+    assert_eq!(statx(&mut f, b".\0", 0), (root, known));
+    assert_eq!(f.ret(22, &[out]), 0);
+    let read_end = f.mem.read_u64(GuestAddr(out)).unwrap() as u32;
+    f.mem.write(GuestAddr(path), b"\0").unwrap();
+    assert_eq!(
+        f.ret(332, &[u64::from(read_end), path, 0x1000, 0x7ff, out]),
+        0
+    );
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 8)).unwrap(), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 56)).unwrap(), known);
+    // A named fifo opened and then removed is still tmpfs's.
+    f.mem.write(GuestAddr(path), b"/statx-fifo\0").unwrap();
+    assert_eq!(f.ret(133, &[path, 0o10_600, 0]), 0);
+    let fifo = f.ret(2, &[path, 2, 0]);
+    assert!(fifo < 1024, "{fifo}");
+    assert_eq!(f.ret(87, &[path]), 0);
+    f.mem.write(GuestAddr(path), b"\0").unwrap();
+    assert_eq!(f.ret(332, &[fifo, path, 0x1000, 0x7ff, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 56)).unwrap(), tmpfs);
+    // A chroot's root is not its mount's root.
+    f.mem.write(GuestAddr(path), b"/statx-dir\0").unwrap();
+    assert_eq!(f.ret(161, &[path]), 0);
+    assert_eq!(statx(&mut f, b"/\0", 0), (0, tmpfs));
+}
 #[test]
 fn proc_mounts_is_a_link_to_the_reader_s_own() {
     let mut f = fixture();

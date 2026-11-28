@@ -77,6 +77,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   これを拒みます（`EINVAL`）。Linux master は符号なしの位置のファイル
   （`FOP_UNSIGNED_OFFSET`）では受け付けます。ランナーのカーネルに master の変更が入るまで、
   v7.0 に従います。
+- **`statx` の `stx_attributes_mask` の `STATX_ATTR_VERITY`**：Linux master の
+  `vfs_getattr_nosec`（f9e450420da2 から）はどのファイルもこれを知っているとし、Linux 7.0
+  では fs-verity のあるファイルシステムだけがそうします。ここに fs-verity のファイルは
+  なく、差分テストが比べる v7.0 に従います。ランナーのカーネルに master の変更が入るまで
+  このままです。
 - **`/proc/<pid>/pagemap` の一部**：エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
   読み込んだプログラムのセグメントにはページキャッシュがないので、そのページは、
   ページではなくマッピングに書き込むまでファイルのもの（ビット 61）です。フレーム番号は、Linux が物理

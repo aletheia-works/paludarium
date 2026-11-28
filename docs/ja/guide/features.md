@@ -270,6 +270,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   mountinfo の ID は 21 から始まり、Linux の内部のマウントも mountinfo に出ません。
   `AT_EMPTY_PATH` はディスクリプタを、`AT_FDCWD` なら作業ディレクトリを指し、Linux 6.11
   からと同じく、それとともに渡した空ポインタのパスも同じ扱いです。
+  `stx_attributes_mask` には、Linux 7.0 がどのファイルにも知っているとする属性
+  （`STATX_ATTR_AUTOMOUNT`、`STATX_ATTR_MOUNT_ROOT`、`STATX_ATTR_DAX`。ここでは最初と
+  最後を持つファイルはありません）が入ります。tmpfs と devtmpfs のファイル（シンボリック
+  リンク・特殊ファイル・memfd も）は、`shmem_getattr` と同じく `STATX_ATTR_IMMUTABLE`、
+  `STATX_ATTR_APPEND`、`STATX_ATTR_NODUMP` を加えます。`STATX_ATTR_MOUNT_ROOT` は、
+  マウントのルートなら、どのパス（`.`、`..`、途中のリンク、そのディスクリプタ）で指しても
+  立ちます。シンボリックリンク、マウントのルートでない chroot のルート、パイプやソケットの
+  ファイルには立ちません。`/proc/<pid>` のディレクトリは inode が `S_IMMUTABLE` でも、
+  Linux の proc の `getattr` が返さないのと同じく、`STATX_ATTR_IMMUTABLE` を持ちません。
 
 - `name_to_handle_at` はファイルのハンドルを返し、Linux（6.13 以降）と同じ順に確かめます。
   まずフラグ（`EINVAL`。`AT_HANDLE_CONNECTABLE` と `AT_HANDLE_FID` か `AT_EMPTY_PATH` を

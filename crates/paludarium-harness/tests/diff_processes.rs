@@ -1068,6 +1068,7 @@ mod linux {
         processes_statfs => ("statfs", "process"),
         processes_status_memory => ("status-memory", "process"),
         processes_status_space => ("status-space", "process"),
+        processes_statx_attributes => ("statx-attributes", "process"),
         processes_stdio_flags => ("stdio-flags", "process"),
         processes_stop_cont_handler => ("stop-cont-handler", "process"),
         processes_stop_restart => ("stop-restart", "process"),

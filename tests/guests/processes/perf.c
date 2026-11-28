@@ -1885,8 +1885,10 @@ static int case_throttle(void) {
        measured against the outside clock's. A thread that other work on
        its CPU preempts is unthrottled each time it runs again
        (event_sched_in), so that a busy machine showed no stop in 20 ms
-       of it: Linux gets up to 100 tries of 20 ms, 2 ms apart, until one
-       shows both clocks stopped. */
+       of it: the case takes up to 100 tries of 20 ms, 2 ms apart, until
+       one shows both clocks stopped. The emulator, which runs the same
+       loop, stops the group in its first; the lines give the last try's
+       results and not the number of tries, which would differ. */
     struct attr counting = software(0);
     counting.read_format = FORMAT_RUNNING;
     counting.flags |= DISABLED;

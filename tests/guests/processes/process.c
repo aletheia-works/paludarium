@@ -19275,6 +19275,73 @@ static int proc_links_case(const char *self) {
     if (fb >= 0) close(fb);
     return 0;
 }
+/* statx's stx_attributes and stx_attributes_mask, as vfs_getattr_nosec,
+   shmem_getattr and vfs_statx_path give them: the mask every file has
+   (STATX_ATTR_AUTOMOUNT, STATX_ATTR_MOUNT_ROOT and STATX_ATTR_DAX), tmpfs's
+   and devtmpfs's flags besides, and STATX_ATTR_MOUNT_ROOT on a mount's root
+   however its path names it, never on a link or a descriptor of an internal
+   mount. */
+static void statx_attributes_show(const char *name, int dir, const char *path, int flags) {
+    struct statx sx;
+    memset(&sx, 0, sizeof sx);
+    int r = (int)syscall(SYS_statx, dir, path, flags, 0x7ff, &sx);
+    printf("%s r=%d attributes=%#llx mask=%#llx\n", name, r < 0 ? -errno : r,
+           (unsigned long long)sx.stx_attributes, (unsigned long long)sx.stx_attributes_mask);
+}
+static int statx_attributes_case(void) {
+    const char *paths[] = {"/proc", "/proc/self", "/proc/self/status", "/proc/self/task",
+                           "/proc/self/fd", "/proc/thread-self", "/proc/self/..", "/proc/./",
+                           "/dev", "/dev/null", "/dev/shm", "/dev/shm/."};
+    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++)
+        statx_attributes_show(paths[i], AT_FDCWD, paths[i], 0);
+    statx_attributes_show("/proc/self nofollow", AT_FDCWD, "/proc/self", AT_SYMLINK_NOFOLLOW);
+    char dir[64];
+    snprintf(dir, sizeof dir, "/dev/shm/statx-attributes-%d", (int)getpid());
+    if (mkdir(dir, 0700)) return 1;
+    char file[96], link[96], fifo[96], gone[96];
+    snprintf(file, sizeof file, "%s/file", dir);
+    snprintf(link, sizeof link, "%s/link", dir);
+    snprintf(fifo, sizeof fifo, "%s/fifo", dir);
+    snprintf(gone, sizeof gone, "%s/gone", dir);
+    int f = open(file, O_CREAT | O_WRONLY, 0600);
+    int made = f >= 0 && !symlink("file", link) && !mkfifo(fifo, 0600) && !mkfifo(gone, 0600);
+    /* A fifo opened, then removed: still tmpfs's, by its descriptor. */
+    int g = made ? open(gone, O_RDWR) : -1;
+    int pipes[2] = {-1, -1};
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    int memfd = (int)syscall(SYS_memfd_create, "statx", 0);
+    int efd = eventfd(0, 0);
+    int proc = open("/proc", O_PATH | O_DIRECTORY);
+    int null = open("/dev/null", O_RDONLY);
+    int r = 0;
+    if (!made || g < 0 || unlink(gone)) r = 2;
+    else if (pipe(pipes) || sock < 0 || memfd < 0 || efd < 0 || proc < 0 || null < 0) r = 3;
+    if (!r) {
+        statx_attributes_show("tmpfs dir", AT_FDCWD, dir, 0);
+        statx_attributes_show("tmpfs file", AT_FDCWD, file, 0);
+        statx_attributes_show("tmpfs link", AT_FDCWD, link, AT_SYMLINK_NOFOLLOW);
+        statx_attributes_show("tmpfs fifo", AT_FDCWD, fifo, 0);
+        statx_attributes_show("tmpfs descriptor", f, "", AT_EMPTY_PATH);
+        statx_attributes_show("removed tmpfs fifo", g, "", AT_EMPTY_PATH);
+        statx_attributes_show("pipe", pipes[0], "", AT_EMPTY_PATH);
+        statx_attributes_show("socket", sock, "", AT_EMPTY_PATH);
+        statx_attributes_show("memfd", memfd, "", AT_EMPTY_PATH);
+        statx_attributes_show("eventfd", efd, "", AT_EMPTY_PATH);
+        statx_attributes_show("/proc descriptor", proc, "", AT_EMPTY_PATH);
+        statx_attributes_show("/dev/null descriptor", null, "", AT_EMPTY_PATH);
+    }
+    unlink(file);
+    unlink(link);
+    unlink(fifo);
+    unlink(gone);
+    rmdir(dir);
+    if (r) return r;
+    if (chdir("/proc")) return 4;
+    statx_attributes_show("cwd /proc", AT_FDCWD, "", AT_EMPTY_PATH);
+    statx_attributes_show("/proc as .", AT_FDCWD, ".", 0);
+    statx_attributes_show("/proc as self/..", AT_FDCWD, "self/..", 0);
+    return 0;
+}
 
 static int generated_rooted_links_case(const char *self) {
     if (!mkdtemp(grl_base)) return 1;
@@ -45793,6 +45860,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-rooted-links")) return generated_rooted_links_case(self);
     if (!strcmp(mode, "proc-links")) return proc_links_case(self);
     if (!strcmp(mode, "proc-links-ran")) return 7;
+    if (!strcmp(mode, "statx-attributes")) return statx_attributes_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

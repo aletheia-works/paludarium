@@ -59,7 +59,10 @@ const OUTER: u32 = 0x3f;
 /// What a flow has besides its addresses that a hash may take: its
 /// protocol and ports (`flowi4_proto`, `fl4_sport`, `fl4_dport`), and for
 /// IPv6 its flow label; and whether they come in a packet (an `skb`), as
-/// `inet_rtm_getroute` builds one for IPv4, rather than a flow alone.
+/// `inet_rtm_getroute` builds one for IPv4 and an ICMP error's lookup takes
+/// the one it tells of (`icmp_route_lookup`), rather than a flow alone,
+/// with the flow hash that packet carries, 0 for none: its sender's
+/// (`skb_set_hash_from_sk` of `sk_txhash`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Flow {
     pub proto: u8,
@@ -67,6 +70,7 @@ pub(crate) struct Flow {
     pub dport: u16,
     pub label: u32,
     pub packet: bool,
+    pub l4_hash: u32,
 }
 
 impl Flow {
@@ -161,10 +165,14 @@ impl Seed {
     }
     /// `fib_multipath_hash` of `flow` from `src` to `dst`, as `policy`
     /// takes it: the addresses (0 and 2, which only a packet's inner
-    /// headers set apart); those, the protocol and the ports (1); or the
-    /// fields `fields` names (3), of a packet then mixed with no inner
-    /// hash (`fib_multipath_custom_hash_skb`).
+    /// headers set apart); those, the protocol and the ports (1), or the
+    /// hash a packet carries, if it has one; or the fields `fields` names
+    /// (3), of a packet then mixed with no inner hash
+    /// (`fib_multipath_custom_hash_skb`).
     pub(crate) fn hash4(self, policy: Policy, src: Ipv4Addr, dst: Ipv4Addr, flow: Flow) -> u32 {
+        if policy.policy == 1 && flow.packet && flow.l4_hash != 0 {
+            return flow.l4_hash >> 1;
+        }
         let before = |a: &[u8; 4], b: &[u8; 4]| u32::from_le_bytes(*a) < u32::from_le_bytes(*b);
         let (sport, dport) = flow.ports();
         let all = Keys {
@@ -358,6 +366,7 @@ mod tests {
             dport,
             label: 0,
             packet,
+            l4_hash: 0,
         };
         let h = |p, f| seed.hash4(p, a, b, f);
         // 0 and 2 take the addresses alone, 1 the ports too, either way.
@@ -407,6 +416,49 @@ mod tests {
             h(policy(3, DST_PORT), udp(9, 2, false)),
             h(policy(3, DST_PORT), udp(8, 2, false))
         );
+    }
+
+    #[test]
+    fn policy_1_takes_the_hash_a_packet_carries() {
+        let seed = Seed {
+            machine: 5,
+            user: 0,
+        };
+        let policy = |policy| Policy {
+            policy,
+            fields: FIELDS_ALL,
+        };
+        let (a, b) = (Ipv4Addr::new(10, 5, 0, 1), Ipv4Addr::new(10, 2, 0, 1));
+        let packet = Flow {
+            packet: true,
+            ..Flow::socket(17, 7100, 9)
+        };
+        let carried = Flow {
+            l4_hash: 0x8765_4321,
+            ..packet
+        };
+        // `skb_get_hash_raw(skb) >> 1`, before all else.
+        assert_eq!(seed.hash4(policy(1), a, b, carried), 0x8765_4321 >> 1);
+        assert_ne!(
+            seed.hash4(policy(1), a, b, packet),
+            seed.hash4(policy(1), a, b, carried)
+        );
+        // A flow's lookup has no packet's hash, and the other policies
+        // dissect the packet.
+        let flow = Flow {
+            packet: false,
+            ..carried
+        };
+        assert_eq!(
+            seed.hash4(policy(1), a, b, flow),
+            seed.hash4(policy(1), a, b, Flow::socket(17, 7100, 9))
+        );
+        for other in [0, 2, 3] {
+            assert_eq!(
+                seed.hash4(policy(other), a, b, carried),
+                seed.hash4(policy(other), a, b, packet)
+            );
+        }
     }
 
     #[test]

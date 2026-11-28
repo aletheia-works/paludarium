@@ -1240,6 +1240,8 @@ mod linux {
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
         veth_hash_seed => ("veth-hash-seed", "veth-hash-seed", root),
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
+        veth_icmp_hop => ("veth-icmp-hop", "veth-icmp-hop", root),
+        // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
         veth_igmp_neighbours => ("veth-igmp-neighbours", "veth-igmp-neighbours", root),
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
         veth_iif => ("veth-iif", "veth-iif", root),

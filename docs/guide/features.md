@@ -3214,10 +3214,15 @@ kernel.
     (`ip_route_connect`). A socket's flow hashes its own port, which a UDP
     socket has before its route (`inet_send_prepare`, `inet_dgram_connect`),
     and a connection with none yet a random one (`FLOWI_FLAG_ANY_SPORT`);
-    an answer hashes its own ports. A packet may come in on the device of any hop of
-    the route back to its source (`fib_info_nh_uses_dev`), and its answer
-    goes back by a lookup of its own, through whichever end that takes, or
-    the one its listener is bound to. An output lookup that goes through
+    an answer hashes its own ports. IPv4's port unreachable is looked up
+    with the datagram it tells of (`icmp_route_lookup`), hashed as the
+    packet of an `RTM_GETROUTE` is. Under policy 1, a datagram from a
+    connected socket is hashed instead by the random flow hash that socket
+    gave it (`sk_txhash`, `skb_set_hash_from_sk`). A packet may come in
+    on the device of any hop of the route back to its source
+    (`fib_info_nh_uses_dev`), and its answer goes back by a lookup of its
+    own, through whichever end that takes, or the one its listener is bound
+    to. An output lookup that goes through
     an end leaves from its first primary address, else from the first of
     the other devices' in the order they were made
     (`inet_select_addr`), and names it as `RTA_OIF`,
@@ -5183,8 +5188,9 @@ kernel.
     loopback to an own address, through a veth end to its peer, or once
     for a broadcast or a group whoever takes it, the sender's own copy
     looping back uncounted (`dev_loopback_xmit`); ICMP's port unreachable
-    that answers one, quoting at most what fits in 576 bytes or, of IPv6,
-    1280 (`icmp_send`, `icmp6_send`); and an ARP request and its answer
+    that answers one, out through the end its own route takes, quoting at
+    most what fits in 576 bytes or, of IPv6, 1280 (`icmp_send`,
+    `icmp6_send`); and an ARP request and its answer
     (`arp_send`). What they leave out is in the
     [limitations](./limitations).
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest

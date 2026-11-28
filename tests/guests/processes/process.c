@@ -19215,6 +19215,32 @@ static int grl_inner(const char *self) {
  * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
  * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
  * `self/mounts` (`proc_symlink`). */
+/* The dev-tty-node case: /dev/tty is a node of devtmpfs with or without a
+   controlling terminal. Its type, permission bits, owner and number, what
+   the calls that do not open it give, and whether /dev lists it. Not its
+   group, which udev may change, nor what an open finds. */
+static int dev_tty_node_case(void) {
+    struct stat st, ls;
+    struct statfs sf;
+    char b[8];
+    int s = stat("/dev/tty", &st);
+    int l = lstat("/dev/tty", &ls);
+    printf("stat=%d mode=%o uid=%d rdev=%u:%u nlink=%lu lstat=%d same=%d\n", s < 0 ? -errno : 0,
+           s ? 0 : st.st_mode, s ? -1 : (int)st.st_uid, s ? 0 : major(st.st_rdev),
+           s ? 0 : minor(st.st_rdev), s ? 0 : (unsigned long)st.st_nlink, l < 0 ? -errno : 0,
+           !s && !l && st.st_ino == ls.st_ino);
+    printf("access=%d,%d statfs=%d readlink=%d chdir=%d\n",
+           access("/dev/tty", R_OK | W_OK) < 0 ? -errno : 0, access("/dev/tty", X_OK) < 0 ? -errno : 0,
+           statfs("/dev/tty", &sf) < 0 ? -errno : 0, readlink("/dev/tty", b, sizeof b) < 0 ? -errno : 0,
+           chdir("/dev/tty") < 0 ? -errno : 0);
+    DIR *d = opendir("/dev");
+    if (!d) return 1;
+    int listed = 0;
+    for (struct dirent *e; (e = readdir(d));) listed |= !strcmp(e->d_name, "tty") && e->d_type == DT_CHR;
+    closedir(d);
+    printf("listed=%d\n", listed);
+    return 0;
+}
 static int proc_links_case(const char *self) {
     char exe[4096], dir[4096];
     if (!realpath(self, exe)) return 1;
@@ -45925,6 +45951,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "statx-attributes")) return statx_attributes_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
+    if (!strcmp(mode, "dev-tty-node")) return dev_tty_node_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();

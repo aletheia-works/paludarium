@@ -1212,6 +1212,7 @@ mod linux {
         processes_statx_attributes => ("statx-attributes","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
+        processes_dev_tty_node => ("dev-tty-node","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),
         processes_shmem_populate => ("shmem-populate","process"),
         processes_tmpfs_huge => ("tmpfs-huge","process"),

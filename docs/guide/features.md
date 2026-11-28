@@ -5529,7 +5529,9 @@ kernel.
   mapping of `zero` is anonymous memory, shared with `MAP_SHARED`.
   `userfaultfd` is root's misc device (10:122, mode 0600), which opens for
   whoever its mode lets (`EACCES`) and makes `userfaultfd` contexts (see
-  `userfaultfd` above). `fd`,
+  `userfaultfd` above). `tty` (5:0, mode 0666, root's) is there with or
+  without a controlling terminal, as devtmpfs makes it; its `open` is the
+  controlling terminal's (see the pseudo-terminals below). `fd`,
   `stdin`, `stdout` and `stderr` are links (0777) to `/proc/self/fd` and its
   first three entries, followed by `open`, `stat` and paths through them
   (`/dev/fd/3`); `O_NOFOLLOW` on one gives `ELOOP`, and with `O_PATH` opens
@@ -5583,7 +5585,8 @@ kernel.
     `TIOCSCTTY` or by opening the slave for reading without `O_NOCTTY`;
     its children inherit it and `setsid` drops it. `/dev/tty` opens the
     controlling terminal (`ENXIO` without one; a process of the session
-    outside the emulator keeps the host's `/dev/tty`). `TIOCSPGRP`,
+    outside the emulator opens the host's `/dev/tty` where a mount shows
+    it, else `ENXIO` too). `TIOCSPGRP`,
     `TIOCGPGRP` and `TIOCGSID` set and give the foreground group and the
     session. A background group's read gets `SIGTTIN`, and its write with
     `TOSTOP` or its `termios` change `SIGTTOU`, which restarts the call

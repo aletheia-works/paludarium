@@ -4720,6 +4720,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   受け取ります。`zero` のマッピングは無名のメモリで、`MAP_SHARED` なら共有です。
   `userfaultfd` は root の misc デバイス（10:122、モード 0600）で、モードが許す者だけが
   開け（`EACCES`）、`userfaultfd` のコンテキストを作ります（上の `userfaultfd` を参照）。
+  `tty`（5:0、モード 0666、root のもの）は、devtmpfs が作るのと同じく、制御端末の有無に
+  かかわらずあります。その `open` は制御端末を開きます（下の疑似端末を参照）。
   `fd`、`stdin`、`stdout`、`stderr` は `/proc/self/fd` とその最初の 3 つへのリンク
   （0777）で、`open` や `stat`、それを通るパス（`/dev/fd/3`）はリンクをたどります。
   リンクに `O_NOFOLLOW` を付けると `ELOOP` で、`O_PATH` も付けると `/proc/self/fd` と
@@ -4770,7 +4772,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - 制御端末のないセッションリーダーは、`TIOCSCTTY` か、スレーブを `O_NOCTTY`
     なしに読み込み用に開くと、それを制御端末にします。子はそれを継ぎ、`setsid` で
     なくなります。`/dev/tty` は制御端末を開きます（なければ `ENXIO`。エミュレーターの
-    外のセッションのプロセスは、ホストの `/dev/tty` のままです）。`TIOCSPGRP`、
+    外のセッションのプロセスは、マウントがホストの `/dev/tty` を見せていればそれを開き、
+    なければやはり `ENXIO` です）。`TIOCSPGRP`、
     `TIOCGPGRP`、`TIOCGSID` はフォアグラウンドのグループとセッションを決めて返します。
     バックグラウンドのグループが読むと `SIGTTIN`、`TOSTOP` のもとで書くか
     `termios` を変えると `SIGTTOU` を受け、グループが再開すると呼び出しをやり直します。

@@ -8323,6 +8323,13 @@ fn open_path(
             }
             crate::devices::Entry::Ptmx { .. } => crate::pty::open_master(c, flags)?,
             crate::devices::Entry::Slave(Some(n)) => crate::pty::open_named(c, n, flags)?,
+            // No controlling terminal here, in the session outside the
+            // emulator: the host's `/dev/tty` where a mount shows it, else
+            // none to open (`ENXIO`), as Linux's `tty_open_current_tty`.
+            crate::devices::Entry::Tty => match c.files.fs().open(p, flags, mode) {
+                Err(Errno::ENOENT) => return Err(Errno(6)),
+                opened => opened?,
+            },
             // A directory opens only for reading, a device not as one.
             crate::devices::Entry::Directory if flags & 3 != 0 => return Err(Errno::EISDIR),
             crate::devices::Entry::Directory => Arc::new(crate::proc::OwnDirectory::opened(

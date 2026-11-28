@@ -2529,12 +2529,29 @@ fn dev_reports_its_devices_and_lists_them() {
             "stderr",
             "stdin",
             "stdout",
+            "tty",
             "urandom",
             "userfaultfd",
             "zero"
         ]
     );
     assert_eq!(f.ret(217, &[dir, out, 0x1000]), 0); // the end
+}
+/// `/dev/tty` is there without a controlling terminal, as devtmpfs makes
+/// it: a character device of 5:0, 0666 and root's. Opening it then finds
+/// no terminal (`ENXIO`).
+#[test]
+fn dev_tty_is_there_without_a_controlling_terminal() {
+    let mut f = fixture();
+    let (name, out) = (DATA, DATA + 0x100);
+    f.mem.write(GuestAddr(name), b"/dev/tty\0").unwrap();
+    assert_eq!(f.ret(4, &[name, out]), 0);
+    // st_mode and st_uid, then st_rdev.
+    let mode_uid = f.mem.read_u64(GuestAddr(out + 24)).unwrap();
+    let rdev = f.mem.read_u64(GuestAddr(out + 40)).unwrap();
+    assert_eq!((mode_uid, rdev), (0o020_666, 5 << 8));
+    assert_eq!(f.ret(21, &[name, 2]), 0);
+    assert_eq!(f.ret(2, &[name, 2]), errno(Errno(6)));
 }
 #[test]
 fn file_size_limit_is_enforced_as_linux_does() {

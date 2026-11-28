@@ -1079,6 +1079,10 @@ pub struct ThreadState {
     pub(crate) seccomp_restart: Option<bool>,
     /// What the thread keeps of ptrace ([`ptrace::Local`]).
     pub(crate) ptrace: ptrace::Local,
+    /// The io_uring restrictions of the task (`task_struct.io_uring_restrict`),
+    /// which each ring it sets up starts with: a new thread or process copies
+    /// them, and exec keeps them.
+    pub(crate) io_uring_restrictions: Option<Arc<io_uring::Restrictions>>,
 }
 
 impl ThreadState {

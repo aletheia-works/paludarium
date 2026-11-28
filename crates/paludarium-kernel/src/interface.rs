@@ -1338,7 +1338,9 @@ pub(crate) struct Ask6 {
 }
 
 /// What a multipath route's hop is chosen by (`rt6_multipath_hash`): the
-/// flow's source, flow label, protocol and ports, with its destination.
+/// flow's source, flow label, protocol and ports, with its destination;
+/// and, as [`crate::multipath::Flow`] says, whether they come in a packet,
+/// and the hash it carries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Flow6 {
     pub src: Option<Ipv6Addr>,
@@ -1346,6 +1348,8 @@ pub(crate) struct Flow6 {
     pub proto: u8,
     pub sport: u16,
     pub dport: u16,
+    pub packet: bool,
+    pub socket_hash: u32,
 }
 /// The loopback's addresses and the routing tables, in Linux's orders.
 #[derive(Debug)]
@@ -4543,8 +4547,8 @@ impl Addresses {
             sport: flow.sport,
             dport: flow.dport,
             label: flow.label,
-            packet: false,
-            socket_hash: 0,
+            packet: flow.packet,
+            socket_hash: flow.socket_hash,
         };
         let hash = i64::from(self.multipath_seed.hash6(self.multipath6, src, ip, keys));
         let mut weight = 0u64;
@@ -5160,7 +5164,7 @@ mod tests {
         assert_eq!(
             a.source(
                 "10.1.2.77".parse().unwrap(),
-                crate::multipath::Flow::of(0),
+                crate::multipath::Flow::default(),
                 &[1]
             ),
             "10.1.2.3".parse::<IpAddr>().unwrap()
@@ -5315,7 +5319,7 @@ mod tests {
         assert_eq!(
             a.source(
                 "10.7.1.1".parse().unwrap(),
-                crate::multipath::Flow::of(0),
+                crate::multipath::Flow::default(),
                 &[1]
             ),
             "10.7.1.1".parse::<IpAddr>().unwrap()
@@ -5795,7 +5799,7 @@ mod tests {
                 .unwrap();
             let src = if route.oif == 1000 { own } else { other };
             assert_eq!(
-                Some(a.source(IpAddr::V4(to), crate::multipath::Flow::of(0), &order)),
+                Some(a.source(IpAddr::V4(to), crate::multipath::Flow::default(), &order)),
                 src.map(IpAddr::V4)
             );
         }

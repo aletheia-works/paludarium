@@ -592,8 +592,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_REGISTER_SYNC_CANCEL`、`IORING_REGISTER_PERSONALITY`、
   `IORING_UNREGISTER_PERSONALITY`、`IORING_REGISTER_RESTRICTIONS`、
   `IORING_REGISTER_ENABLE_RINGS`、`IORING_REGISTER_RING_FDS`、
-  `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。Linux 7.0 にあるタスクの制限は
-  ありません（記述子 -1 は `EBADF`）。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
+  `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。リングなし（記述子 -1）では
+  タスクの `IORING_REGISTER_RESTRICTIONS` だけがあります。`IORING_REGISTER_SEND_MSG_RING`、
+  `_QUERY`、`_BPF_FILTER` は `EINVAL` で、タスクの制限に BPF フィルターはありません。この制限は、
+  Linux 7.0 とテストを走らせるカーネルと同じく、リングなしの登録を制限しません。Linux master は
+  許されていないものをそこで断ります（`EACCES`、4a93427e99a8）。テストを走らせるカーネルが
+  追いつけば master に合わせます。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
   カーネルである Linux 7.0 と同じく、スロットごとに `iovec` をタグより先に読み、
   `IORING_RSRC_UPDATE_EXTENDED` を断ります。Linux master はタグを先に読み、そのフラグの
   `struct io_uring_regbuf_desc` を受け付けます。テストを走らせるカーネルが追いつけば master に

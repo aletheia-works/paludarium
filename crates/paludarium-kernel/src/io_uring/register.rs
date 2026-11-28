@@ -1,5 +1,6 @@
-//! io_uring's disabled rings (`IORING_SETUP_R_DISABLED`), restrictions and
-//! personalities, as Linux's `io_uring/register.c` has them.
+//! io_uring's disabled rings (`IORING_SETUP_R_DISABLED`), restrictions,
+//! a ring's and a task's, and personalities, as Linux's
+//! `io_uring/register.c` has them.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -29,15 +30,15 @@ pub(super) const EBADFD: Errno = Errno(77);
 const PERSONALITY_MAX: u32 = u16::MAX as u32;
 
 /// `struct io_restriction`: each half only once it is registered.
-#[derive(Default)]
-pub(super) struct Restrictions {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Restrictions {
     /// The registrations allowed, a bit each.
     register: Option<u64>,
     requests: Option<Requests>,
 }
 
 /// The requests allowed.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Requests {
     /// Their operations, a bit each.
     ops: u128,
@@ -89,9 +90,11 @@ impl Ring {
     }
 
     /// Whether the ring's restrictions allow a registration
-    /// (`__io_uring_register`), which they do of a disabled ring.
+    /// (`__io_uring_register`), which they do of a disabled ring, unless it
+    /// has them from its task (Linux master's 6da8f402e362, which the test
+    /// runners' kernel has).
     pub(super) fn allows_registration(&self, opcode: u64) -> bool {
-        self.disabled()
+        self.disabled() && !self.inherited
             || self
                 .restrictions()
                 .register
@@ -152,10 +155,9 @@ pub(super) fn enable_rings(c: &Context<'_>, ring: &Ring) -> Result<u64, Errno> {
 }
 
 /// `io_register_restrictions`: the ring must be disabled (`EBADFD`) and have
-/// none yet (`EBUSY`), then as `io_parse_restrictions`: an argument and at
-/// most `IORING_MAX_RESTRICTIONS` of them (`EINVAL`), which are read
-/// (`EFAULT`) before any is looked at (`EINVAL` for one unknown). None at
-/// all allows nothing. A failure leaves the ring without any.
+/// none yet (`EBUSY`), which a ring set up with its task's has, then the
+/// restrictions as [`parse`] reads them. A failure leaves the ring without
+/// any.
 pub(super) fn register_restrictions(
     c: &Context<'_>,
     ring: &Ring,
@@ -169,6 +171,68 @@ pub(super) fn register_restrictions(
     if registered.register.is_some() || registered.requests.is_some() {
         return Err(EBUSY);
     }
+    *registered = parse(c, arg, count)?;
+    Ok(0)
+}
+
+/// `io_register_restrictions_task`, `io_uring_register` with descriptor -1:
+/// restrictions the thread's rings set up from now on start with, which a
+/// new thread or process copies (`io_uring_fork`) and exec keeps. A thread
+/// that has them already may not change them (`EPERM`), and one needs
+/// `no_new_privs` or `CAP_SYS_ADMIN` (`EACCES`), as for a seccomp filter.
+/// Then there must be one argument (`EINVAL`), a `struct
+/// io_uring_task_restriction` that is read (`EFAULT`), without flags or
+/// reserved bits (`EINVAL`), whose restrictions follow it ([`parse`]).
+pub(super) fn register_task_restrictions(
+    c: &mut Context<'_>,
+    arg: u64,
+    count: u32,
+) -> Result<u64, Errno> {
+    if c.process.io_uring_restrictions.is_some() {
+        return Err(Errno::EPERM);
+    }
+    let no_new_privs = c.processes.status_of(c.process.pid).2;
+    if !no_new_privs && c.process.credentials.effective & crate::credentials::CAP_SYS_ADMIN == 0 {
+        return Err(Errno::EACCES);
+    }
+    if count != 1 {
+        return Err(Errno::EINVAL);
+    }
+    let mut head = [0; 16];
+    c.mem
+        .read(GuestAddr(arg), &mut head)
+        .map_err(|_| Errno::EFAULT)?;
+    if head[..2] != [0, 0] || head[4..].iter().any(|&b| b != 0) {
+        return Err(Errno::EINVAL);
+    }
+    let entries = u32::from(u16::from_le_bytes([head[2], head[3]]));
+    let restrictions = parse(c, arg.wrapping_add(16), entries)?;
+    c.process.io_uring_restrictions = Some(Arc::new(restrictions));
+    Ok(0)
+}
+
+impl Restrictions {
+    /// Whether they say which registrations are allowed.
+    pub(super) fn restricts_registrations(&self) -> bool {
+        self.register.is_some()
+    }
+}
+
+/// The restrictions a ring the thread sets up starts with: its task's, if
+/// it has any (`io_ctx_restriction_clone`).
+pub(super) fn of_task(c: &Context<'_>) -> Restrictions {
+    c.process
+        .io_uring_restrictions
+        .as_deref()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `io_parse_restrictions`: an argument and at most
+/// `IORING_MAX_RESTRICTIONS` of them (`EINVAL`), which are read (`EFAULT`)
+/// before any is looked at (`EINVAL` for one unknown). None at all allows
+/// nothing.
+fn parse(c: &Context<'_>, arg: u64, count: u32) -> Result<Restrictions, Errno> {
     if arg == 0 || count > MAX_RESTRICTIONS {
         return Err(Errno::EINVAL);
     }
@@ -199,6 +263,5 @@ pub(super) fn register_restrictions(
         new.register = Some(0);
         new.requests = Some(Requests::default());
     }
-    *registered = new;
-    Ok(0)
+    Ok(new)
 }

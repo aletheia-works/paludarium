@@ -712,7 +712,8 @@ fn known(code: u8) -> bool {
 }
 
 /// `check_and_resolve_insns` for the instruction at `i`: its registers,
-/// a BPF_LD_IMM64's second half, the opcode, and `check_insn_fields`.
+/// a BPF_LD_IMM64's second half, the opcode, and the other fields
+/// ([`insn_fields`]).
 /// Gives how many instructions it took.
 fn fields(
     insns: &[Insn],
@@ -792,154 +793,130 @@ fn fields(
     insn_fields(insn).map(|()| 1)
 }
 
-/// `check_insn_fields`.
-fn insn_fields(insn: Insn) -> Checked<()> {
+/// The values a field may hold: any, or one of these.
+type Values = Option<&'static [i32]>;
+const ANY: Values = None;
+const ZERO: Values = Some(&[0]);
+
+/// What the fields of an instruction Linux knows the code of may hold.
+enum Rule {
+    /// Each of `src_reg`, `dst_reg`, `off` and `imm` in its values, or
+    /// "`name` uses reserved fields".
+    Fields {
+        name: &'static str,
+        src: Values,
+        dst: Values,
+        off: Values,
+        imm: Values,
+    },
+    /// "`name` uses reserved fields", whatever the fields hold.
+    Never(&'static str),
+    /// A 64-bit `BPF_MOV` of a register with `off` [`ADDR_SPACE_CAST`]:
+    /// `imm` names the address spaces, 1 to 0 or 0 to 1.
+    AddrSpaceCast,
+    /// `may_goto`: `BPF_JMP | BPF_JCOND`, with no registers and an `imm` of
+    /// 0, or "invalid may_goto imm".
+    MayGoto,
+}
+
+/// The rule for `insn`'s fields. A source register goes with `BPF_X`, and
+/// an `imm` with `BPF_K`; what each instruction takes besides is its own.
+fn rule(insn: Insn) -> Rule {
+    let fields = |name, src, dst, off, imm| Rule::Fields {
+        name,
+        src,
+        dst,
+        off,
+        imm,
+    };
+    let wide = matches!(insn.class(), class::ALU64 | class::JMP);
+    let x = insn.x();
+    // The operand an operation does not have is 0.
+    let (src, imm) = if x { (ANY, ZERO) } else { (ZERO, ANY) };
     match insn.class() {
-        class::ALU | class::ALU64 => alu_fields(insn),
-        class::LDX => {
-            if !matches!(insn.mode(), mode::MEM | mode::MEMSX) || insn.imm != 0 {
-                return refuse(Errno::EINVAL, "BPF_LDX uses reserved fields");
-            }
-            Ok(())
+        class::ALU | class::ALU64 => match insn.op() {
+            alu::NEG if x => Rule::Never("BPF_NEG"),
+            alu::NEG => fields("BPF_NEG", ZERO, ANY, ZERO, ZERO),
+            alu::END if wide && x => Rule::Never("BPF_END"),
+            alu::END => fields("BPF_END", ZERO, ANY, ZERO, Some(&[16, 32, 64])),
+            // A move of a register may sign-extend its 8, 16 or 32 bits.
+            alu::MOV if x && wide && insn.off == ADDR_SPACE_CAST => Rule::AddrSpaceCast,
+            alu::MOV if x && wide => fields("BPF_MOV", ANY, ANY, Some(&[0, 8, 16, 32]), ZERO),
+            alu::MOV if x => fields("BPF_MOV", ANY, ANY, Some(&[0, 8, 16]), ZERO),
+            alu::MOV => fields("BPF_MOV", ZERO, ANY, ZERO, ANY),
+            // A division and a remainder may be signed.
+            alu::DIV | alu::MOD => fields("BPF_ALU", src, ANY, Some(&[0, 1]), imm),
+            _ => fields("BPF_ALU", src, ANY, ZERO, imm),
+        },
+        class::LDX if matches!(insn.mode(), mode::MEM | mode::MEMSX) => {
+            fields("BPF_LDX", ANY, ANY, ANY, ZERO)
         }
-        class::STX => {
-            if insn.mode() == mode::ATOMIC {
-                return Ok(());
+        class::LDX => Rule::Never("BPF_LDX"),
+        class::STX if insn.mode() == mode::ATOMIC => fields("", ANY, ANY, ANY, ANY),
+        class::STX if insn.mode() == mode::MEM => fields("BPF_STX", ANY, ANY, ANY, ZERO),
+        class::STX => Rule::Never("BPF_STX"),
+        class::ST if insn.mode() == mode::MEM => fields("BPF_ST", ZERO, ANY, ANY, ANY),
+        class::ST => Rule::Never("BPF_ST"),
+        class::JMP | class::JMP32 => match insn.op() {
+            // `callx`, of the register in dst_reg.
+            jmp::CALL if insn.code == class::JMP | jmp::CALL | X => {
+                fields("BPF_CALL|BPF_X", ZERO, ANY, ZERO, ZERO)
             }
-            if insn.mode() != mode::MEM || insn.imm != 0 {
-                return refuse(Errno::EINVAL, "BPF_STX uses reserved fields");
-            }
-            Ok(())
-        }
-        class::ST => {
-            if insn.mode() != mode::MEM || insn.src != 0 {
-                return refuse(Errno::EINVAL, "BPF_ST uses reserved fields");
-            }
-            Ok(())
-        }
-        class::JMP | class::JMP32 => jmp_fields(insn),
-        _ => {
-            // BPF_LD_ABS and BPF_LD_IND: BPF_LD_IMM64 was dealt with above.
-            if insn.dst != 0
-                || insn.off != 0
-                || insn.size() == size::DW
-                || (insn.mode() == mode::ABS && insn.src != 0)
-            {
-                return refuse(Errno::EINVAL, "BPF_LD_[ABS|IND] uses reserved fields");
-            }
-            Ok(())
-        }
+            jmp::CALL if x || !wide => Rule::Never("BPF_CALL"),
+            // A kfunc's `off` names the BTF it is in.
+            jmp::CALL if insn.src == pseudo::KFUNC_CALL => fields("BPF_CALL", ANY, ZERO, ANY, ANY),
+            jmp::CALL => fields("BPF_CALL", Some(&[0, pseudo::CALL as i32]), ZERO, ZERO, ANY),
+            jmp::JA if x => fields("BPF_JA|BPF_X", ZERO, ANY, ZERO, ZERO),
+            // `gotol` jumps by its `imm`, and `ja` by its `off`.
+            jmp::JA if wide => fields("BPF_JA", ZERO, ZERO, ANY, ZERO),
+            jmp::JA => fields("BPF_JA", ZERO, ZERO, ZERO, ANY),
+            jmp::EXIT if x || !wide => Rule::Never("BPF_EXIT"),
+            jmp::EXIT => fields("BPF_EXIT", ZERO, ZERO, ANY, ZERO),
+            jmp::JCOND => Rule::MayGoto,
+            _ => fields("BPF_JMP/JMP32", src, ANY, ANY, imm),
+        },
+        // BPF_LD_ABS and BPF_LD_IND: a BPF_LD_IMM64 has been dealt with.
+        _ if insn.size() == size::DW => Rule::Never("BPF_LD_[ABS|IND]"),
+        _ if insn.mode() == mode::ABS => fields("BPF_LD_[ABS|IND]", ZERO, ZERO, ZERO, ANY),
+        _ => fields("BPF_LD_[ABS|IND]", ANY, ZERO, ZERO, ANY),
     }
 }
 
-/// `check_alu_fields`.
-fn alu_fields(insn: Insn) -> Checked<()> {
-    let op = insn.op();
-    let wide = insn.class() == class::ALU64;
-    match op {
-        alu::NEG => {
-            if insn.x() || insn.src != 0 || insn.off != 0 || insn.imm != 0 {
-                return refuse(Errno::EINVAL, "BPF_NEG uses reserved fields");
-            }
+/// Refuses an instruction whose fields hold what its [`rule`] does not
+/// take.
+fn insn_fields(insn: Insn) -> Checked<()> {
+    let holds = |values: Values, value: i32| values.is_none_or(|v| v.contains(&value));
+    let reserved = |name: &str| refuse(Errno::EINVAL, format!("{name} uses reserved fields"));
+    match rule(insn) {
+        Rule::Fields {
+            name,
+            src,
+            dst,
+            off,
+            imm,
+        } => {
+            let taken = holds(src, i32::from(insn.src))
+                && holds(dst, i32::from(insn.dst))
+                && holds(off, i32::from(insn.off))
+                && holds(imm, insn.imm);
+            if taken { Ok(()) } else { reserved(name) }
         }
-        alu::END => {
-            if insn.src != 0
-                || insn.off != 0
-                || !matches!(insn.imm, 16 | 32 | 64)
-                || (wide && insn.x())
-            {
-                return refuse(Errno::EINVAL, "BPF_END uses reserved fields");
-            }
+        Rule::Never(name) => reserved(name),
+        Rule::AddrSpaceCast if matches!(insn.imm, 1 | 0x1_0000) => Ok(()),
+        Rule::AddrSpaceCast => refuse(
+            Errno::EINVAL,
+            "addr_space_cast insn can only convert between address space 1 and 0",
+        ),
+        Rule::MayGoto
+            if insn.code == class::JMP | jmp::JCOND
+                && insn.src == 0
+                && insn.dst == 0
+                && insn.imm == 0 =>
+        {
+            Ok(())
         }
-        alu::MOV => {
-            if insn.x() {
-                if !wide {
-                    if !matches!(insn.off, 0 | 8 | 16) || insn.imm != 0 {
-                        return refuse(Errno::EINVAL, "BPF_MOV uses reserved fields");
-                    }
-                } else if insn.off == ADDR_SPACE_CAST {
-                    if insn.imm != 1 && insn.imm != 1 << 16 {
-                        return refuse(
-                            Errno::EINVAL,
-                            "addr_space_cast insn can only convert between address space 1 and 0",
-                        );
-                    }
-                } else if !matches!(insn.off, 0 | 8 | 16 | 32) || insn.imm != 0 {
-                    return refuse(Errno::EINVAL, "BPF_MOV uses reserved fields");
-                }
-            } else if insn.src != 0 || insn.off != 0 {
-                return refuse(Errno::EINVAL, "BPF_MOV uses reserved fields");
-            }
-        }
-        _ => {
-            let signed = insn.off == 1 && matches!(op, alu::DIV | alu::MOD);
-            let bad = if insn.x() {
-                insn.imm != 0
-            } else {
-                insn.src != 0
-            };
-            if bad || (insn.off != 0 && !signed) {
-                return refuse(Errno::EINVAL, "BPF_ALU uses reserved fields");
-            }
-        }
+        Rule::MayGoto => refuse(Errno::EINVAL, format!("invalid may_goto imm {}", insn.imm)),
     }
-    Ok(())
-}
-
-/// `check_jmp_fields`. An exit's `src_reg` is 0, as 7.0 has it.
-fn jmp_fields(insn: Insn) -> Checked<()> {
-    let wide = insn.class() == class::JMP;
-    match insn.op() {
-        jmp::CALL => {
-            if insn.code == class::JMP | jmp::CALL | X {
-                if insn.src != 0 || insn.imm != 0 || insn.off != 0 {
-                    return refuse(Errno::EINVAL, "BPF_CALL|BPF_X uses reserved fields");
-                }
-                return Ok(());
-            }
-            if insn.x()
-                || (insn.src != pseudo::KFUNC_CALL && insn.off != 0)
-                || !matches!(insn.src, 0 | pseudo::CALL | pseudo::KFUNC_CALL)
-                || insn.dst != 0
-                || !wide
-            {
-                return refuse(Errno::EINVAL, "BPF_CALL uses reserved fields");
-            }
-        }
-        jmp::JA => {
-            if insn.x() {
-                if insn.src != 0 || insn.imm != 0 || insn.off != 0 {
-                    return refuse(Errno::EINVAL, "BPF_JA|BPF_X uses reserved fields");
-                }
-            } else if insn.src != 0
-                || insn.dst != 0
-                || (wide && insn.imm != 0)
-                || (!wide && insn.off != 0)
-            {
-                return refuse(Errno::EINVAL, "BPF_JA uses reserved fields");
-            }
-        }
-        jmp::EXIT => {
-            if insn.x() || insn.imm != 0 || insn.src != 0 || insn.dst != 0 || !wide {
-                return refuse(Errno::EINVAL, "BPF_EXIT uses reserved fields");
-            }
-        }
-        jmp::JCOND => {
-            if insn.code != class::JMP | jmp::JCOND
-                || insn.src != 0
-                || insn.dst != 0
-                || insn.imm != 0
-            {
-                return refuse(Errno::EINVAL, format!("invalid may_goto imm {}", insn.imm));
-            }
-        }
-        _ => {
-            if (insn.x() && insn.imm != 0) || (!insn.x() && insn.src != 0) {
-                return refuse(Errno::EINVAL, "BPF_JMP/JMP32 uses reserved fields");
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The check of the program's shape, before any path is walked: from the
@@ -2981,6 +2958,68 @@ mod tests {
     fn refused(insns: &[Insn]) -> (Errno, String) {
         let r = verify(insns, Options::default()).expect_err("accepted");
         (r.errno, r.line)
+    }
+
+    /// A digest of what the checks of each instruction's fields decide:
+    /// every code with registers, offsets and immediates at the edges the
+    /// checks look at, alone before `r0 = 0; exit` and, for a 64-bit load,
+    /// with its second half. A refusal of the field checks counts its errno
+    /// and line; anything else (taken, or refused later) only that it got
+    /// past them, so that the walk's own messages do not change it.
+    #[test]
+    fn the_field_checks_decide_as_they_did() {
+        let field_check = |line: &str| {
+            [
+                "uses reserved fields",
+                "unknown opcode",
+                " is invalid",
+                "bpf_ld_imm64",
+                "BPF_LD_IMM64",
+                "addr_space_cast",
+                "may_goto imm",
+                "fd_idx",
+                "paludarium: ",
+            ]
+            .iter()
+            .any(|p| line.contains(p))
+        };
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        let mut fnv = |bytes: &[u8]| {
+            for &b in bytes {
+                digest ^= u64::from(b);
+                digest = digest.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        let mut refusals = 0;
+        for code in 0..=u8::MAX {
+            for dst in [0, 1, 10, 11] {
+                for src in [0, 1, 2, 3, 4, 10, 11] {
+                    for off in [0, 1, 2, 8, 16, 32, -1] {
+                        for imm in [0, 1, 2, 8, 16, 32, 64, 1 << 16, -1] {
+                            let insn = i(code, dst, src, off, imm);
+                            let mut program = vec![insn];
+                            if insn.ldimm64() {
+                                program.push(i(0, 0, 0, 0, 0));
+                            }
+                            program.extend([mov(0, 0), exit()]);
+                            let outcome = match verify(&program, Options::default()) {
+                                Err(r) if field_check(&r.line) => {
+                                    refusals += 1;
+                                    format!("{} {}", r.errno.0, r.line)
+                                }
+                                _ => String::from("past"),
+                            };
+                            fnv(&[code, dst, src]);
+                            fnv(&off.to_le_bytes());
+                            fnv(&imm.to_le_bytes());
+                            fnv(outcome.as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        // Of 451,584 instructions, made before the checks were written anew.
+        assert_eq!((digest, refusals), (0x2dae_bfa7_7895_d275, 383_417));
     }
 
     #[test]

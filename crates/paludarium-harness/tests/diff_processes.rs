@@ -871,6 +871,7 @@ mod linux {
         processes_mseal => ("mseal", "process"),
         // Makes an IPC namespace of its own, for its counts.
         processes_msg => ("msg", "process", root),
+        processes_named_fifo_statfs => ("named-fifo-statfs", "process"),
         // Makes namespaces, and its checks depend on CAP_SYS_ADMIN.
         processes_namespaces => ("namespaces", "process", root),
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
@@ -1253,6 +1254,8 @@ mod linux {
         veth_hash_policy => ("veth-hash-policy", "veth-hash-policy", root),
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
         veth_hash_seed => ("veth-hash-seed", "veth-hash-seed", root),
+        // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
+        veth_icmp6_hop => ("veth-icmp6-hop", "veth-icmp6-hop", root),
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
         veth_icmp_hop => ("veth-icmp-hop", "veth-icmp-hop", root),
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.

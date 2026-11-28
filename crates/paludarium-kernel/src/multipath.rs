@@ -491,4 +491,120 @@ mod tests {
             seed.hash6(ports, b, a, flow.reversed())
         );
     }
+    /// Every hash as it stood before the hash was rewritten in a
+    /// structure of its own: the rewrite keeps each bit.
+    fn pinned_hashes() -> Vec<u32> {
+        let seeds = [
+            Seed {
+                machine: 5,
+                user: 0,
+            },
+            Seed {
+                machine: 5,
+                user: 0x1234_5678,
+            },
+            Seed {
+                machine: 0xdead_beef,
+                user: 0,
+            },
+        ];
+        let v4 = [
+            (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 2, 0, 7)),
+            (Ipv4Addr::new(192, 168, 9, 200), Ipv4Addr::new(10, 0, 0, 1)),
+        ];
+        let v6: [(Ipv6Addr, Ipv6Addr); 2] = [
+            (
+                "2001:db8::1".parse().unwrap(),
+                "2001:db8:2::7".parse().unwrap(),
+            ),
+            ("fe80::9".parse().unwrap(), "2001:db8::1".parse().unwrap()),
+        ];
+        let flows = [
+            Flow::default(),
+            Flow::socket(17, 7100, 9),
+            Flow::socket(6, 40000, 80),
+            Flow {
+                packet: true,
+                ..Flow::socket(17, 7100, 9)
+            },
+            Flow {
+                packet: true,
+                l4_hash: 0x8765_4321,
+                ..Flow::socket(17, 7100, 9)
+            },
+            Flow {
+                packet: true,
+                ..Flow::socket(1, 3, 4)
+            },
+            Flow {
+                label: 0xabcde,
+                ..Flow::socket(58, 0, 0)
+            },
+            Flow {
+                label: 0x12345,
+                ..Flow::socket(6, 1, 65535)
+            },
+        ];
+        let mut policies = vec![
+            Policy {
+                policy: 0,
+                fields: 0,
+            },
+            Policy {
+                policy: 1,
+                fields: 0,
+            },
+            Policy {
+                policy: 2,
+                fields: 0,
+            },
+        ];
+        for fields in [
+            0, 0x40, 0x7, 0x3f, 0x10, 0x20, 0x8, 0x37, 0x3, 0x30, FIELDS_ALL,
+        ] {
+            policies.push(Policy { policy: 3, fields });
+        }
+        let mut all = Vec::new();
+        for seed in seeds {
+            for policy in &policies {
+                for flow in flows {
+                    for (a, b) in v4 {
+                        all.push(seed.hash4(*policy, a, b, flow));
+                    }
+                    for (a, b) in v6 {
+                        all.push(seed.hash6(*policy, a, b, flow));
+                    }
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn the_hashes_keep_their_bits() {
+        let all = pinned_hashes();
+        let digest = all.iter().fold(0xcbf2_9ce4_8422_2325u64, |d, &h| {
+            (d ^ u64::from(h)).wrapping_mul(0x0100_0000_01b3)
+        });
+        assert_eq!(
+            (all.len(), digest),
+            (1344, 5_159_730_338_909_324_338),
+            "{:x?}",
+            &all[..16]
+        );
+        let mixed: Vec<u32> = [0, 1, 0x8000_0000, 0x1234_5678, u32::MAX]
+            .into_iter()
+            .map(|a| jhash_2words(a, 0, 0))
+            .collect();
+        assert_eq!(
+            mixed,
+            [
+                0x58c1_84bf,
+                0x5543_253f,
+                0xfefd_f3e7,
+                0xd134_ea9a,
+                0x05e7_a47a
+            ]
+        );
+    }
 }

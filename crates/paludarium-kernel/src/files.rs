@@ -4576,6 +4576,15 @@ const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 /// The attributes tmpfs's `shmem_getattr` reports: `STATX_ATTR_IMMUTABLE`,
 /// `STATX_ATTR_APPEND` and `STATX_ATTR_NODUMP`.
 const STATX_ATTR_FLAGS: u32 = 0x10 | 0x20 | 0x40;
+/// `STATX_ATTR_MOUNT_ROOT`: the file is the root of its mount.
+const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
+/// The attributes every `statx` says it knows, set or not: those of Linux
+/// 7.0's `vfs_getattr_nosec` (`STATX_ATTR_AUTOMOUNT` and `STATX_ATTR_DAX`,
+/// which no file here has) and `vfs_statx_path`'s `STATX_ATTR_MOUNT_ROOT`.
+/// Linux master's also has `STATX_ATTR_VERITY` (0x100000, since its
+/// f9e450420da2); this keeps the CI kernel's, which the differential tests
+/// compare.
+const STATX_ATTR_KNOWN: u64 = 0x1000 | STATX_ATTR_MOUNT_ROOT | 0x0020_0000;
 /// `statx(dirfd, path, flags, mask, buffer)`, with the checks of Linux's
 /// do_statx and vfs_statx. As since Linux 6.11, a null path with
 /// AT_EMPTY_PATH names the descriptor like an empty one.
@@ -4595,7 +4604,10 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // Whether the file keeps inode flags, as a tmpfs one does, whose
     // `shmem_getattr` gives them as attributes.
     let noop = &mut |_: &mut u32| {};
-    let (s, device, block_size, kept, at) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    // `place` is where the file is, to tell whether it is its mount's root,
+    // and `follow` whether a link there is followed.
+    let mut follow = false;
+    let (s, device, block_size, kept, at, place) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dir as i32 == -100 {
             let cwd = c
                 .files
@@ -4608,6 +4620,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 device(c, &cwd),
                 path_block_size(&cwd),
                 c.files.fs().with_attributes(&cwd, true, noop).is_ok(),
+                cwd.clone(),
                 cwd,
             )
         } else {
@@ -4618,36 +4631,48 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 descriptor_block_size(c, &d),
                 d.file.with_attributes(noop).is_ok(),
                 d.path.clone(),
+                d.path.clone(),
             )
         }
     } else {
-        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         let (p, _) = lookup(c, dir, raw, follow)?;
         match generated_stat(c, &p, follow)? {
-            Some((stat, device, block_size)) => (stat, device, block_size, false, Vec::new()),
+            Some((stat, device, block_size)) => (stat, device, block_size, false, Vec::new(), p),
             None => match c.files.fs().metadata(&p, follow) {
                 Err(e) => {
                     let (stat, device, block_size, _) = linked_generated(c, &p, follow, e)?;
-                    (stat, device, block_size, false, Vec::new())
+                    (stat, device, block_size, false, Vec::new(), p)
                 }
                 Ok(s) => (
                     s,
                     device(c, &p),
                     path_block_size(&p),
                     c.files.fs().with_attributes(&p, follow, noop).is_ok(),
+                    p.clone(),
                     p,
                 ),
             },
         }
     };
-    let attributes = u64::from(s.attributes & STATX_ATTR_FLAGS);
-    let mut b = encode_statx(shown(c, s), device, block_size)?;
+    let mut attributes = 0;
+    let mut known = STATX_ATTR_KNOWN;
     // STATX_ATTR_IMMUTABLE, STATX_ATTR_APPEND and STATX_ATTR_NODUMP, which
     // have the inode flags' values.
+    // A tmpfs file that keeps none, as a symbolic link, a special file or
+    // one of devtmpfs, says it knows them too, as `shmem_getattr` does.
     if kept {
-        b[8..16].copy_from_slice(&attributes.to_le_bytes());
-        b[56..64].copy_from_slice(&u64::from(STATX_ATTR_FLAGS).to_le_bytes());
+        attributes |= u64::from(s.attributes & STATX_ATTR_FLAGS);
     }
+    if kept || path_kind(c, &place, follow) == paludarium_vfs::TMPFS_MAGIC {
+        known |= u64::from(STATX_ATTR_FLAGS);
+    }
+    if mount_root(c, &place, s.mode) {
+        attributes |= STATX_ATTR_MOUNT_ROOT;
+    }
+    let mut b = encode_statx(shown(c, s), device, block_size)?;
+    b[8..16].copy_from_slice(&attributes.to_le_bytes());
+    b[56..64].copy_from_slice(&known.to_le_bytes());
     // As Linux's vfs_statx, the mount's ID whether or not it was asked for:
     // the unique one if that was, the one mountinfo shows otherwise, whose
     // IDs start at 21; an internal file system's mount has a small one that
@@ -4662,6 +4687,22 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     b[144..152].copy_from_slice(&id.to_le_bytes());
     output(c, out, &b)?;
     Ok(0)
+}
+/// Whether the file at `place`, of mode `mode`, is the root of its mount,
+/// as `vfs_statx_path`'s `path_mounted` tells: with `.`, `..` and links on
+/// the way resolved, and never a symbolic link itself, a file a mount
+/// covers, or a file of a pipe's or socket's internal mount, which has no
+/// path.
+fn mount_root(c: &Context<'_>, place: &[u8], mode: u32) -> bool {
+    if place.first() != Some(&b'/') || mode & 0o170000 == 0o120000 {
+        return false;
+    }
+    let Some(real) =
+        resolved(c.files, place).or_else(|| paludarium_vfs::normalize_path(place).ok())
+    else {
+        return false;
+    };
+    c.files.fs().mount_root(&real) == real
 }
 /// `MAX_HANDLE_SZ`: the most bytes a file handle's own part may have.
 const MAX_HANDLE_SZ: u32 = 128;

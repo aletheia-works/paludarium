@@ -87,6 +87,12 @@ verified.
   `ksys_pwrite64` do for every file, where Linux master takes them for a
   file of unsigned offsets (`FOP_UNSIGNED_OFFSET`). This follows v7.0
   until the runners' kernel has master's change.
+- **`statx`'s `STATX_ATTR_VERITY` in `stx_attributes_mask`**: Linux
+  master's `vfs_getattr_nosec` says every file knows it (since its
+  f9e450420da2), where Linux 7.0's says it only for a file system with
+  fs-verity. No file here has fs-verity, and the mask follows v7.0, which
+  the differential tests compare, until the runners' kernel has master's
+  change.
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do. A page of a loaded
   program's segment, which has no page cache, is a file's (bit 61) until

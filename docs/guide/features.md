@@ -308,6 +308,17 @@ kernel.
   whose IDs start at 21, does not show, as Linux's internal mounts are.
   `AT_EMPTY_PATH` names the descriptor, or the working directory for
   `AT_FDCWD`, and as since Linux 6.11 a null path with it does too.
+  `stx_attributes_mask` has the attributes Linux 7.0 knows for every file
+  (`STATX_ATTR_AUTOMOUNT`, `STATX_ATTR_MOUNT_ROOT` and `STATX_ATTR_DAX`, of
+  which no file here has the first or the last). A tmpfs or devtmpfs file,
+  a symbolic link, a special file or a memfd too, adds
+  `STATX_ATTR_IMMUTABLE`, `STATX_ATTR_APPEND` and `STATX_ATTR_NODUMP`, as
+  `shmem_getattr` does. `STATX_ATTR_MOUNT_ROOT` is set for a mount's root by
+  whatever path names it (`.`, `..`, a link on the way, its descriptor), and
+  not for a symbolic link, a chroot's root that is no mount's, or the file
+  of a pipe or socket. A `/proc/<pid>` directory has no
+  `STATX_ATTR_IMMUTABLE`, though its inode is `S_IMMUTABLE`, as proc's
+  `getattr` gives none on Linux.
 
 - `name_to_handle_at` gives a file's handle, checked in the order of
   Linux's (6.13 and later): the flags (`EINVAL`, also for

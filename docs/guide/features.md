@@ -6083,9 +6083,10 @@ kernel.
   `lpm_trie.c`: a key is a prefix length (a `u32`) and 1 to 256 bytes of
   data, the most significant first, and `LOOKUP_ELEM` gives the value of
   the longest prefix that holds the key's (`ENOENT` for none, and for a
-  prefix length past the data's bits). Its nodes are Linux's, with
-  intermediate ones where two prefixes part, so `GET_NEXT_KEY` gives the
-  keys in Linux's postorder, more specific prefixes first (from the first
+  prefix length past the data's bits). `GET_NEXT_KEY` gives the keys in
+  Linux's order: of two prefixes where one holds the other, the more
+  specific first, and otherwise the one whose first differing bit is 0
+  (from the first
   for no key, a prefix length past the data's bits, or a key that is no
   element's), each with the bytes past its prefix that its last update
   gave. `UPDATE_ELEM` takes `BPF_ANY`, `BPF_NOEXIST` and `BPF_EXIST`

@@ -5277,19 +5277,18 @@ kernel.
     none (`tcp_v4_send_reset`), the rest the timestamps and their SACK blocks
     (`tcp_options_write`). What they leave out is in the
     [limitations](./limitations).
-  - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
-    first, with their users, under a line of the device with how many it
-    has and the querier `V3`: no IGMP report is heard, and none is sent
-    again on a timer, so no timer runs and no device is the reporter.
-    `igmp6` (`igmp6_mc_seq_show`), each IPv6 group of each device with IPv6, the newest first, with its
-    users and its flags, `MAF_NOREPORT` for ff02::1 and a group of a scope
-    below a link's and `MAF_LOADED` for the rest from when they are joined
-    or their device comes up until it goes down, and no timer, as no MLDv1
-    report is waited for. `mcfilter` and `mcfilter6`
-    (`igmp_mcf_seq_show`, `igmp6_mcf_seq_show`), the sources the
-    memberships of each group name, with how many include and how many
-    exclude each, from the first device whose newest group names one, as
-    Linux's begin there.
+  - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest first,
+    with their users, under a line of the device with how many it has and the
+    querier `V3`: no IGMP report is heard, and none is sent again on a timer,
+    so no timer runs and no device is the reporter. `igmp6`
+    (`igmp6_mc_seq_show`), each IPv6 group of each device with IPv6, the
+    newest first, with its users and its flags, `MAF_NOREPORT` for ff02::1 and
+    a group of a scope below a link's and `MAF_LOADED` for the rest from when
+    they are joined or their device comes up until it goes down, and no timer,
+    as no MLDv1 report is waited for. `mcfilter` and `mcfilter6`
+    (`igmp_mcf_seq_show`, `igmp6_mcf_seq_show`), the sources the memberships
+    of each group name, with how many include and how many exclude each, from
+    the first device whose newest group names one, as Linux's begin there.
   - `dev_mcast` (`dev_mc_seq_show`), the link-layer multicast addresses
     each device takes packets to, in the order of their indexes, each
     device's in the order they came, with how many of its groups map to

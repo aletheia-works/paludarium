@@ -47,17 +47,6 @@ static I run(I *o) {
  /* 82 and 83 run with a stdout whose reader is gone, and report on stderr:
     a write there is EPIPE and raises SIGPIPE, which 82 blocks (pending
     after it) and 83 leaves to kill the process. */
- /* 87 sendfiles 8 KiB from a memfd into a blocking pipe that 60 KiB in
-    15 pages fill: it gives the one page that fits, not waiting for more,
-    as do_sendfile's splice_file_to_pipe (an alarm ends a wait). */
- if(CASE==87) {
-  static char page[8192];U at=0;int queued=0;I m=sc(319,(U)"s",0,0,0,0,0);
-  char *fill=(char *)sc(9,0,61440,3,0x22,(U)-1,0);
-  if(m<0||S(1,m,page,8192)!=8192||sc(293,(U)p,0,0,0,0,0)!=0)return 1;
-  o[0]=S(1,p[1],fill,61440);S(37,5,0,0);
-  o[1]=sc(40,p[1],m,(U)&at,8192,0,0);S(37,0,0,0);
-  S(16,p[0],0x541B,&queued);o[2]=queued;o[3]=(I)at;return 0;
- }
  /* 84 and 85 write 128 KiB to a pipe at once; a child holding its only
     read end waits until 64 KiB fill it, which the parent is still inside
     the write for, and exits. The write gives the 64 KiB with SIGPIPE, which
@@ -86,6 +75,46 @@ static I run(I *o) {
   sc(127,(U)&pending,8,0,0,0,0);o[1]=pending;
   sc(61,pid,(U)&status,0,0,0,0);o[3]=status;
   if(CASE==84)o[2]=S(1,p[1],big,1);
+  return 0;
+ }
+ /* 87 sendfiles 8 KiB from a memfd into a blocking pipe that 60 KiB in
+    15 pages fill: it gives the one page that fits, not waiting for more,
+    as do_sendfile's splice_file_to_pipe (an alarm ends a wait). */
+ if(CASE==87) {
+  static char page[8192];U at=0;int queued=0;I m=sc(319,(U)"s",0,0,0,0,0);
+  char *fill=(char *)sc(9,0,61440,3,0x22,(U)-1,0);
+  if(m<0||S(1,m,page,8192)!=8192||sc(293,(U)p,0,0,0,0,0)!=0)return 1;
+  o[0]=S(1,p[1],fill,61440);S(37,5,0,0);
+  o[1]=sc(40,p[1],m,(U)&at,8192,0,0);S(37,0,0,0);
+  S(16,p[0],0x541B,&queued);o[2]=queued;o[3]=(I)at;return 0;
+ }
+ /* 88 to 90 catch a signal with SA_RESTART while a blocking pipe write
+    waits. A child holding the only read end waits until 64 KiB fill it.
+    In 88 it then exits, and the 128 KiB write gives the 64 KiB with a
+    caught SIGPIPE; the next write is EPIPE with another. In 89 it sleeps
+    300 ms, then reads all, and a SIGALRM at 100 ms ends the waiting
+    128 KiB write with the 64 KiB: a part is not restarted. In 90 the pipe
+    is full before a 4 KiB write, which the same SIGALRM interrupts with
+    nothing written: it restarts and finishes once the child reads. */
+ if(CASE>=88&&CASE<=90) {
+  int queued=0;I pid;U pause[2]={0,300000000};
+  char *big=(char *)sc(9,0,131072,3,0x22,(U)-1,0);
+  action((U)handler,0x10000000);
+  if(sc(293,(U)p,0,0,0,0,0)!=0)return 1;
+  if(CASE==90)S(1,p[1],big,65536);
+  pid=S(57,0,0,0);
+  if(pid==0){
+   closefd(p[1]);
+   while(CASE!=90&&S(16,p[0],0x541B,&queued)==0&&queued<65536)S(24,0,0,0);
+   if(CASE!=88){S(35,pause,0,0);while(S(0,p[0],big,65536)>0){}}
+   S(60,0,0,0);__builtin_unreachable();
+  }
+  closefd(p[0]);
+  {U sigpipe[4]={(U)handler,0x14000000,(U)restorer,0};sc(13,13,(U)sigpipe,0,8,0,0);}
+  if(CASE!=88)alarm_us(100000);
+  o[0]=S(1,p[1],big,CASE==90?4096:131072);o[1]=signals;
+  o[2]=CASE==88?S(1,p[1],big,1):0;o[3]=signals;
+  closefd(p[1]);sc(61,pid,0,0,0,0,0);
   return 0;
  }
  if(CASE>=82) {

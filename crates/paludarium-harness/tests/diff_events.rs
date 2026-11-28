@@ -125,6 +125,8 @@ cases!(
     stdout_epipe_blocked=>82, stdout_sigpipe=>83,
     pipe_epipe_after_part_blocked=>84, pipe_sigpipe_after_part=>85,
     pipe_nosignal_after_part=>86, sendfile_pipe_takes_what_fits=>87,
+    pipe_restart_sigpipe_after_part=>88, pipe_restart_alarm_after_part=>89,
+    pipe_restart_alarm_nothing_written=>90,
 );
 #[test]
 fn tokio_timer() {

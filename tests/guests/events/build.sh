@@ -3,7 +3,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:-$here/../../../target/guests/events}"
 mkdir -p "$out"
-for case_id in {0..87}; do
+for case_id in {0..90}; do
   "${MUSL_CC:-musl-gcc}" -static -O1 -nostdlib -fno-stack-protector -fno-builtin \
     -fno-asynchronous-unwind-tables -fcf-protection=none -mno-red-zone -fno-pie -no-pie \
     -Wall -Wextra -Werror -DCASE="$case_id" -o "$out/event-$case_id" "$here/events.c"

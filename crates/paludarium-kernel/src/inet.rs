@@ -2543,7 +2543,11 @@ impl Signals {
     /// An urgent byte came, as Linux's `sk_send_sigurg`: `SIGURG` to the
     /// owner, if any, and then `POLL_PRI` with `O_ASYNC`.
     fn urgent(&self) {
-        let owner = *self.owner.lock().unwrap_or_else(PoisonError::into_inner);
+        let owner = self
+            .owner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if owner.id == 0 {
             return;
         }
@@ -2553,7 +2557,7 @@ impl Signals {
             .unwrap_or_else(PoisonError::into_inner)
             .upgrade();
         if let Some(processes) = processes {
-            processes.send_urgent(owner);
+            processes.send_urgent(&owner);
         }
         self.send(Reason::Priority);
     }
@@ -2571,7 +2575,11 @@ impl Signals {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(to) = to {
-            let owner = *self.owner.lock().unwrap_or_else(PoisonError::into_inner);
+            let owner = self
+                .owner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             Notice { to, owner, reason }.send();
         }
     }
@@ -2727,11 +2735,11 @@ impl InetSocket {
     }
     /// `F_GETOWN` and `F_GETSIG`.
     pub(crate) fn file_owner(&self) -> FileOwner {
-        *self
-            .signals
+        self.signals
             .owner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
     /// `F_SETOWN` and `F_SETSIG`, with where the owner lives.
     pub(crate) fn set_file_owner(

@@ -870,6 +870,17 @@ kernel.
   signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_ERR`,
   `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set
   through as `si_fd`.
+
+  Naming an owner keeps who named it, as `sigio_perm` checks: `F_SETOWN`,
+  `F_SETOWN_EX`, and dnotify, a lease or a terminal's `O_ASYNC` making the
+  caller the owner of a file that has none. The file's signals, and a
+  socket's `SIGURG`, reach a process (or the thread `F_OWNER_TID` names)
+  only when the effective user ID kept is root's, or either kept user ID is
+  that process's real or saved one. Who makes the file signal does not count,
+  nor does a later `F_SETSIG`. A Landlock domain of the one who named the
+  owner, if it scopes signals, keeps them from processes outside it, though
+  never from that one's own process; a domain entered after naming the owner
+  does not count.
   - **Pipes.** Every write signals the reader as it ends, even one that
     finds the pipe full, and also before each wait. Every read signals the
     writer as it ends, with data or not. The close of either end signals
@@ -6066,7 +6077,12 @@ kernel.
   (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack
   and mappings; and
   `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
-  that is made or ends. A `cpu-clock` or `task-clock` event whose
+  that is made or ends; and with `namespaces` (which takes `CAP_PERFMON`),
+  `PERF_RECORD_NAMESPACES` of a thread's namespaces, the device and inode
+  of each of its `/proc/<pid>/ns` files of net, uts, ipc, pid, user, mnt
+  and cgroup: of a new thread or child, written by its creator, and of a
+  thread after each `unshare` that succeeds, new namespaces or not, and
+  each `setns`. A `cpu-clock` or `task-clock` event whose
   interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
   throttled until the next tick, its count stopped meanwhile, with
   `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,
@@ -6638,8 +6654,12 @@ kernel.
 
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it
-  and converted as `bpf_convert_filter` converts it, instruction for
-  instruction, and the interpreter runs what it converts to.
+  and converted to eBPF, which the interpreter runs. The converted
+  program's instructions are paludarium's own, but each classic
+  instruction converts to as many as `bpf_convert_filter` converts it to,
+  with its jumps in the same places: the program's length is what the
+  socket is charged for, and with the jumps' places it decides which
+  programs are too long to convert.
   - It is `EINVAL` for no instructions or more than 4096, a code Linux
     does not know, a division or remainder by a constant 0, a constant
     shift of 32 or more, a scratch word past the 16th or one read where

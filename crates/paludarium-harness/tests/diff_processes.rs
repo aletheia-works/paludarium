@@ -651,6 +651,8 @@ mod linux {
         // Its events of the kernel and of CPUs need CAP_PERFMON.
         perf_side_band_exec => ("perf-side-band-exec", "perf", root),
         // Its events of the kernel and of CPUs need CAP_PERFMON.
+        perf_side_band_namespaces => ("perf-side-band-namespaces", "perf", root),
+        // Its events of the kernel and of CPUs need CAP_PERFMON.
         perf_software => ("perf-software", "perf", root),
         // Its events need CAP_PERFMON, and it writes a sysctl.
         perf_throttle => ("perf-throttle", "perf", root),
@@ -1037,6 +1039,8 @@ mod linux {
         processes_shm_hugetlb => ("shm-hugetlb", "process"),
         processes_shmem_fault_charge => ("shmem-fault-charge", "process"),
         processes_shmem_populate => ("shmem-populate", "process"),
+        // Changes IDs as root.
+        processes_sigio_owner => ("sigio-owner", "sigio-owner", root),
         processes_signal => ("signal", "process"),
         processes_signal_io => ("signal-io", "process"),
         processes_signal_io_wait => ("signal-io-wait", "process"),

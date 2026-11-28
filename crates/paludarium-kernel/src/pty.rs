@@ -1654,8 +1654,16 @@ pub(crate) fn set_async(
             Some(pgrp) => (OwnerKind::Group, pgrp),
             None => (OwnerKind::Process, c.process.pid),
         };
-        c.processes
-            .set_file_owner(file, FileOwner { kind, id, ..owner });
+        let setter = crate::fasync::Setter::of(c);
+        c.processes.set_file_owner(
+            file,
+            FileOwner {
+                kind,
+                id,
+                setter,
+                ..owner
+            },
+        );
     }
 }
 

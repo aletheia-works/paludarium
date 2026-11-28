@@ -181,7 +181,7 @@ mod pipe_tests {
             id: 7,
             ..FileOwner::default()
         };
-        r.set_file_owner(owner);
+        r.set_file_owner(owner.clone());
         r.set_async(Some(Registration {
             processes: Weak::new(),
             fd: 3,
@@ -459,7 +459,7 @@ impl PipeEnd {
     }
     /// `F_GETOWN`: who this description's signals go to.
     pub(crate) fn file_owner(&self) -> FileOwner {
-        self.signalling().owner
+        self.signalling().owner.clone()
     }
     /// `F_SETOWN` and `F_SETSIG`, for this description.
     pub(crate) fn set_file_owner(&self, owner: FileOwner) {
@@ -1772,7 +1772,7 @@ fn control_messages(c: &Context<'_>, control: &[u8]) -> Result<(Passed, Option<U
             let owner = FileOwner {
                 kind: crate::fasync::OwnerKind::Process,
                 id: pid,
-                signal: 0,
+                ..FileOwner::default()
             };
             // scm_check_creds takes the IDs in the sender's user namespace,
             // and refuses one it does not map (`-1` too) first.
@@ -1791,7 +1791,7 @@ fn control_messages(c: &Context<'_>, control: &[u8]) -> Result<(Passed, Option<U
             ) {
                 return Err(Errno::EPERM);
             }
-            if number.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
+            if number.cast_signed() <= 0 || !c.processes.owner_exists(&owner) {
                 return Err(Errno(3));
             }
             credentials = Some(Ucred { pid, uid, gid });
@@ -2154,7 +2154,7 @@ fn send_bytes(
     // `sk_send_sigurg`.
     let owner = socket.peer_owner();
     if urgent != 0 && owner.id != 0 {
-        c.processes.send_urgent(owner);
+        c.processes.send_urgent(&owner);
     }
     Ok(sent + urgent)
 }
@@ -4089,6 +4089,7 @@ impl SocketPairEnd {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)[self.side]
             .owner
+            .clone()
     }
     /// `F_SETOWN` and `F_SETSIG`.
     pub(crate) fn set_file_owner(&self, owner: FileOwner) {
@@ -4105,6 +4106,7 @@ impl SocketPairEnd {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)[1 - self.side]
             .owner
+            .clone()
     }
     /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off.
     pub(crate) fn set_async(&self, registration: Option<Registration>) {
@@ -4125,7 +4127,7 @@ impl SocketPairEnd {
         if side.closed {
             return Vec::new();
         }
-        let own = side.registration.clone().map(|to| (to, side.owner));
+        let own = side.registration.clone().map(|to| (to, side.owner.clone()));
         // The descriptions' latest registration first, as `kill_fasync`.
         let mut descriptions: Vec<_> = side
             .descriptions
@@ -4136,7 +4138,7 @@ impl SocketPairEnd {
                 Some((
                     description.since,
                     description.registration.clone()?,
-                    description.owner,
+                    description.owner.clone(),
                 ))
             })
             .collect();

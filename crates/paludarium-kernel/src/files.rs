@@ -7405,7 +7405,7 @@ impl StandardFile {
                     && let Some(processes) = to.processes.upgrade()
                 {
                     let owner = processes.file_owner(&file);
-                    processes.send_io(owner, to.fd, reason);
+                    processes.send_io(&owner, to.fd, reason);
                 }
                 was = ready;
             }

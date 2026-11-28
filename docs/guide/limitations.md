@@ -138,8 +138,15 @@ verified.
   the two that paludarium refuses ([decisions](../design/decisions)).
 - **Device counters, in part**: `/proc/net/dev` and a link's
   `IFLA_STATS64` and `IFLA_STATS` count UDP datagrams, ICMP's port
-  unreachable and ARP alone (see [features](./features)). TCP's segments
-  are not counted yet, nor the packets of IPv6 that the kernel sends of
+  unreachable, ARP and TCP's segments alone (see [features](./features)).
+  ICMP's port unreachable is sent, and counted, for each datagram to a
+  closed port, where Linux limits how many go (`icmp_ratelimit`,
+  `icmp_msgs_per_sec`, and per peer through a veth pair).
+  A SYN that a listener's full queue drops, or that nothing answers, is
+  not counted, nor are its retries; a connection's own retransmissions,
+  the SYN-ACK's sent again among them, are, as is its handshake once
+  the listener has answered, whether or not the request is dropped
+  later. Nor are the packets of IPv6 that the kernel sends of
   itself (neighbour discovery, MLD reports, router solicitations and
   duplicate address detection), nor ARP's probes of a neighbour whose
   entry ages, nor what goes to the host (a TCP connection to a port no
@@ -1159,9 +1166,7 @@ verified.
 - **Edge-triggered `epoll` on a signalfd, in part**: a signal queued for
   another thread of the process is the waiting thread's edge as it is sent,
   but a thread already waiting sees it within 10 ms, where Linux's
-  `signalfd_notify` wakes the file at once. A signal sent to the init of a
-  nested PID namespace, which it drops as it has no handler
-  (`SIGNAL_UNKILLABLE`), still counts as sent.
+  `signalfd_notify` wakes the file at once.
 - **A POSIX timer's signal, in part**: a timer on a clock of real time
   sends to the process's leader first, where Linux's `posixtimer_get_target`
   sends to a thread of the process that its interrupt finds running. One

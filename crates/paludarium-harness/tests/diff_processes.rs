@@ -592,6 +592,8 @@ mod linux {
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
         net_dev_counters => ("net-dev-counters", "net-dev-counters", root),
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
+        net_dev_tcp => ("net-dev-tcp", "net-dev-tcp", root),
+        // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
         netlink_link_netns => ("netlink-link-netns", "netlink-options", root),
         // Makes network namespaces, and its checks depend on CAP_SYS_ADMIN.
         netlink_listen_all_nsid => ("netlink-listen-all-nsid", "netlink-options", root),

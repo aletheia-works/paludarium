@@ -5201,8 +5201,11 @@ kernel.
     looping back uncounted (`dev_loopback_xmit`); ICMP's port unreachable
     that answers one, out through the end its own route takes, quoting at
     most what fits in 576 bytes or, of IPv6, 1280 (`icmp_send`,
-    `icmp6_send`); and an ARP request and its answer
-    (`arp_send`). What they leave out is in the
+    `icmp6_send`); an ARP request and its answer (`arp_send`); and each TCP
+    segment, a GSO buffer of several as one (`__tcp_transmit_skb`), with its
+    TCP header: the SYN's and SYN-ACK's options, a reset's to a closed port
+    none (`tcp_v4_send_reset`), the rest the timestamps and their SACK blocks
+    (`tcp_options_write`). What they leave out is in the
     [limitations](./limitations).
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
     first, with their users, under a line of the device with how many it
@@ -6681,7 +6684,9 @@ kernel.
   wakes the file for each, as it is sent, even when another thread has yet
   to take it in: another real-time signal of a number already
   waiting counts, a standard signal already pending or one ignored and
-  unblocked does not; a new mask is an edge too. `signalfd` on a
+  unblocked does not, nor one the init of a nested PID namespace drops
+  unblocked as it has no handler (`SIGNAL_UNKILLABLE`); a new mask is an
+  edge too. `signalfd` on a
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);
   `SIGKILL` and `SIGSTOP` never enter one, and neither a read nor a poll
   takes a signal whose action is `SA_IMMUTABLE` (below), as Linux master's

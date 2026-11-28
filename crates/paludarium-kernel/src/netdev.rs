@@ -20,7 +20,8 @@ pub(crate) const LOOPBACK_INDEX: i32 = 1;
 /// [`LOOPBACK_INDEX`] as the attributes of a `u32` carry it.
 pub(crate) const LOOPBACK_OIF: u32 = 1;
 
-use std::sync::Weak;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 /// What a device is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,18 +105,34 @@ pub(crate) struct Conf6 {
 }
 
 /// What a device has sent or taken in: its packets and their bytes
-/// (`pcpu_sw_netstats`, `pcpu_lstats`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// (`pcpu_sw_netstats`, `pcpu_lstats`), shared with what counts there
+/// without the devices' lock, as a connection's segments do
+/// ([`crate::loopback::Link`]).
+#[derive(Debug, Default)]
 pub(crate) struct Tally {
-    pub packets: u64,
-    pub bytes: u64,
+    packets: AtomicU64,
+    bytes: AtomicU64,
 }
 impl Tally {
-    fn add(&mut self, bytes: usize) {
-        self.packets += 1;
-        self.bytes += bytes as u64;
+    /// A packet of `bytes` more.
+    pub(crate) fn add(&self, bytes: usize) {
+        self.packets.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    /// Its packets and bytes.
+    pub(crate) fn read(&self) -> (u64, u64) {
+        (
+            self.packets.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
     }
 }
+impl PartialEq for Tally {
+    fn eq(&self, other: &Self) -> bool {
+        self.read() == other.read()
+    }
+}
+impl Eq for Tally {}
 
 /// One network device.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,9 +154,10 @@ pub(crate) struct Device {
     pub veth: Option<Veth>,
     /// What it has sent, and what it has taken in: a veth end takes in
     /// what its peer sends (`veth_get_stats64`), the loopback what it sends
-    /// (`loopback_get_stats64`).
-    pub tx: Tally,
-    pub rx: Tally,
+    /// (`loopback_get_stats64`), the two one tally. It goes with the device,
+    /// to another namespace too.
+    pub tx: Arc<Tally>,
+    pub rx: Arc<Tally>,
 }
 
 impl Device {
@@ -147,10 +165,11 @@ impl Device {
     /// it has taken in and sent; no error, drop or multicast is counted.
     pub(crate) fn stats64(&self) -> [u64; 25] {
         let mut stats = [0; 25];
-        stats[0] = self.rx.packets;
-        stats[1] = self.tx.packets;
-        stats[2] = self.rx.bytes;
-        stats[3] = self.tx.bytes;
+        let (rx, tx) = (self.rx.read(), self.tx.read());
+        stats[0] = rx.0;
+        stats[1] = tx.0;
+        stats[2] = rx.1;
+        stats[3] = tx.1;
         stats
     }
     /// [`Self::stats64`] as `IFLA_STATS64` carries it, and as `IFLA_STATS`
@@ -166,6 +185,7 @@ impl Device {
     }
     /// The loopback, as a namespace makes it (`loopback_net_init`).
     fn loopback() -> Self {
+        let lo = Arc::new(Tally::default());
         Self {
             index: LOOPBACK_INDEX,
             name: b"lo".to_vec(),
@@ -179,8 +199,8 @@ impl Device {
             groups6: crate::multicast::all_nodes(0),
             links: crate::multicast::Links::default(),
             veth: None,
-            tx: Tally::default(),
-            rx: Tally::default(),
+            tx: Arc::clone(&lo),
+            rx: lo,
         }
     }
     /// A veth end of `index` named `name`, of Ethernet address `mac` and
@@ -215,8 +235,8 @@ impl Device {
                 opened: false,
                 peer: None,
             }),
-            tx: Tally::default(),
-            rx: Tally::default(),
+            tx: Arc::default(),
+            rx: Arc::default(),
         }
     }
 }
@@ -302,15 +322,12 @@ impl Devices {
     }
     /// The device of `index` sends a packet of each of `frames`' lengths,
     /// as its driver counts them (`loopback_xmit`, `veth_xmit`): the
-    /// loopback takes each in itself; a veth end gives back its peer, which
-    /// takes them in.
+    /// loopback takes each in itself, its two tallies one; a veth end gives
+    /// back its peer, which takes them in.
     pub(crate) fn send(&mut self, index: i32, frames: &[usize]) -> Option<Peer> {
         let device = self.by_index_mut(index)?;
         for &frame in frames {
             device.tx.add(frame);
-            if device.veth.is_none() {
-                device.rx.add(frame);
-            }
         }
         device.veth.as_ref()?.peer.clone()
     }

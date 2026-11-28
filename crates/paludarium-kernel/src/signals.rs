@@ -385,7 +385,9 @@ pub(crate) fn refresh_own(process: &ThreadState) {
 }
 /// Whether Linux would queue `signal` for `process`, and so wake a signal
 /// file (`signalfd_notify`): not when it is unblocked and ignored, which
-/// `prepare_signal` drops as it is sent.
+/// `prepare_signal` drops as it is sent, as the init of a nested PID
+/// namespace drops one it has no handler for
+/// ([`crate::targets::Tif::drops_unhandled`]).
 pub(crate) fn wakes(process: &ThreadState, signal: &PendingSignal) -> bool {
     let blocked = process.signal_mask & (1u64 << (signal.number - 1)) != 0;
     let action = process
@@ -393,8 +395,13 @@ pub(crate) fn wakes(process: &ThreadState, signal: &PendingSignal) -> bool {
         .get(&signal.number)
         .copied()
         .unwrap_or_default();
-    let ignored =
-        action.handler == 1 || action.handler == 0 && matches!(signal.number, 17 | 18 | 23 | 28);
+    let ignored = action.handler == 1
+        || action.handler == 0
+            && (matches!(signal.number, 17 | 18 | 23 | 28)
+                || process
+                    .seat
+                    .tif()
+                    .is_some_and(|tif| tif.drops_unhandled(signal.number, signal.synchronous)));
     signal.synchronous || blocked || !ignored
 }
 

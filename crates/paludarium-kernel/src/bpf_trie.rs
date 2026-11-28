@@ -569,6 +569,158 @@ mod tests {
         assert_eq!(order, [32, 0]);
     }
 
+    /// A small generator, so that the runs below are the same every time.
+    struct Steps(u64);
+    impl Steps {
+        fn next(&mut self, below: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % below
+        }
+    }
+
+    /// A key of two data bytes, `length` bits of which count.
+    fn short(data: u16, length: u32) -> Vec<u8> {
+        let mut key = length.to_le_bytes().to_vec();
+        key.extend_from_slice(&data.to_be_bytes());
+        key
+    }
+
+    /// Whether the first `length` bits of `a` and `b` agree.
+    fn agree(a: &[u8], b: &[u8], length: u32) -> bool {
+        (0..length).all(|i| bit(a, i) == bit(b, i))
+    }
+
+    /// The elements as a list, with what the map's calls give said plainly:
+    /// a lookup gives the longest prefix that holds the key; an element is
+    /// a prefix length with its bits.
+    #[derive(Default)]
+    struct Plain {
+        list: Vec<(u32, Vec<u8>, u32)>,
+    }
+    impl Plain {
+        fn find(&self, length: u32, data: &[u8]) -> Option<usize> {
+            self.list
+                .iter()
+                .position(|(l, d, _)| *l == length && agree(d, data, length))
+        }
+        fn lookup(&self, key: &[u8]) -> Option<u32> {
+            let (length, data) = split(key);
+            if length > 16 {
+                return None;
+            }
+            self.list
+                .iter()
+                .filter(|(l, d, _)| *l <= length && agree(d, data, *l))
+                .max_by_key(|(l, _, _)| *l)
+                .map(|(_, _, v)| *v)
+        }
+        fn update(&mut self, key: &[u8], value: u32, flags: u64, room: usize) -> Result<(), Errno> {
+            let (length, data) = split(key);
+            if flags > EXIST || length > 16 {
+                return Err(Errno::EINVAL);
+            }
+            match self.find(length, data) {
+                Some(_) if flags == NOEXIST => Err(Errno::EEXIST),
+                Some(i) => {
+                    self.list[i] = (length, data.to_vec(), value);
+                    Ok(())
+                }
+                None if flags == EXIST => Err(Errno::ENOENT),
+                None if self.list.len() == room => Err(ENOSPC),
+                None => {
+                    self.list.push((length, data.to_vec(), value));
+                    Ok(())
+                }
+            }
+        }
+        fn delete(&mut self, key: &[u8]) -> Result<u32, Errno> {
+            let (length, data) = split(key);
+            if length > 16 {
+                return Err(Errno::EINVAL);
+            }
+            let i = self.find(length, data).ok_or(Errno::ENOENT)?;
+            Ok(self.list.remove(i).2)
+        }
+    }
+
+    /// Random updates, deletes and lookups of a 16-bit trie, each one's
+    /// result as the list gives it, and the trie's order of next keys: more
+    /// specific prefixes before those that hold them, and where two part,
+    /// the one with a 0 there first. What it all gave before the trie was
+    /// written in its own way is pinned by a hash of the run, which also
+    /// covers the bits past each prefix that the next keys give back.
+    #[test]
+    fn a_long_run_of_calls_gives_what_the_plain_list_and_the_pinned_run_give() {
+        const ROOM: u32 = 24;
+        let mut t: Trie<u32> = Trie::new(6, ROOM);
+        let mut plain = Plain::default();
+        let mut steps = Steps(0x9e37_79b9_7f4a_7c15);
+        // FNV-1a over what each call gave, written out byte by byte.
+        let mut run: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut record = |bytes: &[u8]| {
+            for &b in bytes {
+                run = (run ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        let errno = |e: Errno| [0xff, e.0 as u8];
+        for step in 0..20_000u32 {
+            // Few distinct prefixes, so that the calls meet each other.
+            let data = (steps.next(16) as u16) << 12 | steps.next(4) as u16;
+            let length = [0, 1, 2, 3, 4, 8, 12, 15, 16, 17][steps.next(10) as usize];
+            let key = short(data, length);
+            match steps.next(10) {
+                0..=3 => {
+                    let flags = steps.next(5);
+                    let got = t.update(&key, step, flags);
+                    assert_eq!(
+                        got,
+                        plain.update(&key, step, flags, ROOM as usize),
+                        "{step}"
+                    );
+                    record(&got.map_or_else(errno, |()| [0, 0]));
+                }
+                4..=5 => {
+                    let got = t.delete(&key);
+                    assert_eq!(got, plain.delete(&key), "{step}");
+                    match got {
+                        Ok(value) => record(&value.to_le_bytes()),
+                        Err(e) => record(&errno(e)),
+                    }
+                }
+                6..=8 => {
+                    let got = t.lookup(&key).copied();
+                    assert_eq!(got, plain.lookup(&key), "{step}");
+                    record(&got.map_or([0xff; 4], u32::to_le_bytes));
+                }
+                _ => match t.next(Some(&key)) {
+                    Ok(next) => record(&next),
+                    Err(e) => record(&errno(e)),
+                },
+            }
+            assert_eq!(t.len() as usize, plain.list.len());
+            if step % 97 == 0 {
+                let held = t.held();
+                for pair in held.windows(2) {
+                    let ((a, _), (b, _)) = (&pair[0], &pair[1]);
+                    let ((la, da), (lb, db)) = (split(a), split(b));
+                    let shorter = la.min(lb);
+                    match (0..shorter).find(|&i| bit(da, i) != bit(db, i)) {
+                        Some(i) => assert!(bit(da, i) < bit(db, i), "{step}"),
+                        None => assert!(la > lb, "{step}"),
+                    }
+                }
+                for (key, value) in held {
+                    record(&key);
+                    record(&value.to_le_bytes());
+                }
+            }
+        }
+        assert_eq!(run, PINNED_RUN);
+    }
+    const PINNED_RUN: u64 = 3_753_345_391_660_708_896;
+
     #[test]
     fn a_long_key_matches_past_its_first_eight_bytes() {
         let mut t: Trie<u8> = Trie::new(4 + 17, 10);

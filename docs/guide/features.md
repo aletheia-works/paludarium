@@ -3198,10 +3198,11 @@ kernel.
     with the datagram it tells of (`icmp_route_lookup`), hashed as the
     packet of an `RTM_GETROUTE` is. Under policy 1, a datagram from a
     connected socket is hashed instead by the random flow hash that socket
-    gave it (`sk_txhash`, `skb_set_hash_from_sk`). A packet may come in on the device of any hop of
-    the route back to its source (`fib_info_nh_uses_dev`), and its answer
-    goes back by a lookup of its own, through whichever end that takes, or
-    the one its listener is bound to. An output lookup that goes through
+    gave it (`sk_txhash`, `skb_set_hash_from_sk`). A packet may come in
+    on the device of any hop of the route back to its source
+    (`fib_info_nh_uses_dev`), and its answer goes back by a lookup of its
+    own, through whichever end that takes, or the one its listener is bound
+    to. An output lookup that goes through
     an end leaves from its first primary address, else from the first of
     the other devices' in the order they were made
     (`inet_select_addr`), and names it as `RTA_OIF`,

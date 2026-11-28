@@ -6598,8 +6598,12 @@ kernel.
 
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it
-  and converted as `bpf_convert_filter` converts it, instruction for
-  instruction, and the interpreter runs what it converts to.
+  and converted to eBPF, which the interpreter runs. The converted
+  program's instructions are paludarium's own, but each classic
+  instruction converts to as many as `bpf_convert_filter` converts it to,
+  with its jumps in the same places: the program's length is what the
+  socket is charged for, and with the jumps' places it decides which
+  programs are too long to convert.
   - It is `EINVAL` for no instructions or more than 4096, a code Linux
     does not know, a division or remainder by a constant 0, a constant
     shift of 32 or more, a scratch word past the 16th or one read where

@@ -121,13 +121,12 @@ mod func {
 
 /// What a classic program converts to and eBPF programs never reach.
 pub(crate) mod classic {
-    /// Linux's internal helpers of converted programs, by numbers no
-    /// helper of `enum bpf_func_id` has: `bpf_skb_load_helper_8`, `_16`
-    /// and `_32`, `bpf_skb_get_pay_offset`, `bpf_skb_get_nlattr`, its
-    /// `_nest`, `bpf_get_raw_cpu_id` and `bpf_user_rnd_u32`.
-    pub const LOAD_BYTE: i32 = -1;
-    pub const LOAD_HALF: i32 = -2;
-    pub const LOAD_WORD: i32 = -3;
+    /// The helpers of converted programs, by numbers no helper of `enum
+    /// bpf_func_id` has: the payload's offset, the netlink attribute
+    /// searches, the CPU and a random number, which Linux has as
+    /// `bpf_skb_get_pay_offset`, `bpf_skb_get_nlattr`, its `_nest`,
+    /// `bpf_get_raw_cpu_id` and `bpf_user_rnd_u32`. A converted program's
+    /// packet loads are eBPF's `BPF_LD | BPF_ABS` and `BPF_IND`.
     pub const PAY_OFFSET: i32 = -4;
     pub const NLATTR: i32 = -5;
     pub const NLATTR_NEST: i32 = -6;
@@ -947,15 +946,6 @@ impl Machine<'_, '_> {
                     .filter(|_| offset <= 0xffff)
                     .and_then(|start| self.packet.header_bytes(start, offset as usize, len, false));
                 self.give(r3, len, bytes.as_deref())?
-            }
-            classic::LOAD_BYTE | classic::LOAD_HALF | classic::LOAD_WORD => {
-                self.context_arg()?;
-                let size = match id {
-                    classic::LOAD_BYTE => 1,
-                    classic::LOAD_HALF => 2,
-                    _ => 4,
-                };
-                self.load(r4 as i32, size)
             }
             classic::NLATTR | classic::NLATTR_NEST => {
                 self.context_arg()?;

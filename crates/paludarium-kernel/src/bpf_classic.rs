@@ -3,18 +3,21 @@
 //! instructions that [`crate::bpf_interp`] runs, as Linux runs a classic
 //! program after it converts it.
 //!
-//! The converted program has the instructions Linux's has, so that it has
-//! Linux's length, which the socket is charged for and which decides
-//! whether a jump reaches; the conversion's own design is written from
-//! that output, which the tests fix. Only what the instructions read
-//! differs:
+//! What a program can see of the conversion is what Linux's gives: each
+//! classic instruction converts to as many instructions as Linux's does,
+//! with its jumps to other instructions in the same places, so that the
+//! program has Linux's length, which the socket is charged for, and the
+//! same jumps reach; and it returns what Linux's returns. The instructions
+//! themselves are this file's own:
+//! - packet loads are eBPF's `BPF_LD | BPF_ABS` and `BPF_IND`, and
+//!   comparisons 32-bit jumps;
 //! - the `sk_buff` fields are read from the context (`struct __sk_buff`)
 //!   where it has them, and from the fields the interpreter keeps after it
-//!   ([`crate::bpf_interp::classic`]): the data's address, `data_len`, and
-//!   `dev`, which an AF_UNIX message has none of;
-//! - the helpers that load packet bytes, search netlink attributes and the
-//!   rest are numbers of the interpreter's own, which no eBPF program can
-//!   call.
+//!   ([`crate::bpf_interp::classic`]), `dev` among them, which an AF_UNIX
+//!   message has none of;
+//! - the netlink attribute searches and the rest are helpers with numbers
+//!   of the interpreter's own, which no eBPF program can call;
+//! - a block shorter than Linux's ends with no-ops.
 use paludarium_types::Errno;
 
 use crate::bpf_interp::classic::{self as helper, field};
@@ -275,18 +278,19 @@ fn loads_after_stores(filter: &[SockFilter]) -> Result<(), Errno> {
     Ok(())
 }
 
-/// The registers of the converted program (`BPF_REG_A` and the rest).
+/// The registers of the converted program. A is R0, where packet loads and
+/// helpers leave what they give; the context is R6, where a packet load
+/// finds it; X is R7, and R8 keeps A while a header length is loaded,
+/// both kept across calls; R1 to R3 are a helper's arguments.
 mod reg {
     pub const A: u8 = 0;
     pub const ARG1: u8 = 1;
     pub const ARG2: u8 = 2;
     pub const ARG3: u8 = 3;
-    pub const ARG4: u8 = 4;
     pub const TMP: u8 = 2;
     pub const CTX: u8 = 6;
     pub const X: u8 = 7;
-    pub const D: u8 = 8;
-    pub const H: u8 = 9;
+    pub const SAVED: u8 = 8;
     pub const FP: u8 = 10;
 }
 
@@ -295,9 +299,8 @@ mod op {
     pub const ALU32: u8 = 0x04;
     pub const ALU64: u8 = 0x07;
     pub const JMP: u8 = 0x05;
+    pub const JMP32: u8 = 0x06;
     pub const X: u8 = 0x08;
-    pub const SUB: u8 = 0x10;
-    pub const ADD: u8 = 0x00;
     pub const AND: u8 = 0x50;
     pub const LSH: u8 = 0x60;
     pub const XOR: u8 = 0xa0;
@@ -306,12 +309,15 @@ mod op {
     pub const JA: u8 = 0x00;
     pub const JEQ: u8 = 0x10;
     pub const JNE: u8 = 0x50;
-    pub const JSGE: u8 = 0x70;
     pub const JLT: u8 = 0xa0;
     pub const JLE: u8 = 0xb0;
-    pub const JSLT: u8 = 0xc0;
     pub const CALL: u8 = 0x80;
     pub const EXIT: u8 = 0x90;
+    /// `BPF_LD | BPF_ABS` and `BPF_LD | BPF_IND`, the packet loads, which
+    /// take the context from R6, give the bytes in host order in R0, and
+    /// return 0 from the program where the packet has none.
+    pub const LD_ABS: u8 = 0x20;
+    pub const LD_IND: u8 = 0x40;
     /// `BPF_LDX | BPF_MEM` and `BPF_STX | BPF_MEM`, and the sizes.
     pub const LDX_MEM: u8 = 0x61;
     pub const STX_MEM: u8 = 0x63;
@@ -333,11 +339,11 @@ const fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> Insn {
 const fn mov64_reg(dst: u8, src: u8) -> Insn {
     insn(op::ALU64 | op::MOV | op::X, dst, src, 0, 0)
 }
+const fn mov32_reg(dst: u8, src: u8) -> Insn {
+    insn(op::ALU32 | op::MOV | op::X, dst, src, 0, 0)
+}
 const fn mov32_imm(dst: u8, imm: i32) -> Insn {
     insn(op::ALU32 | op::MOV, dst, 0, 0, imm)
-}
-const fn alu32_reg(o: u8, dst: u8, src: u8) -> Insn {
-    insn(op::ALU32 | o | op::X, dst, src, 0, 0)
 }
 const fn alu32_imm(o: u8, dst: u8, imm: i32) -> Insn {
     insn(op::ALU32 | o, dst, 0, 0, imm)
@@ -345,8 +351,10 @@ const fn alu32_imm(o: u8, dst: u8, imm: i32) -> Insn {
 const fn ldx(size: u8, dst: u8, src: u8, off: i16) -> Insn {
     insn(op::LDX_MEM | size, dst, src, off, 0)
 }
-const fn jmp_imm(o: u8, dst: u8, imm: i32, off: i16) -> Insn {
-    insn(op::JMP | o, dst, 0, off, imm)
+/// A jump on the low 32 bits of `dst` against `imm`, which is how classic
+/// programs compare.
+const fn jmp32_imm(o: u8, dst: u8, imm: i32, off: i16) -> Insn {
+    insn(op::JMP32 | o, dst, 0, off, imm)
 }
 const fn exit() -> Insn {
     insn(op::JMP | op::EXIT, 0, 0, 0, 0)
@@ -356,6 +364,10 @@ const fn call(id: i32) -> Insn {
 }
 const fn from_be(dst: u8, bits: i32) -> Insn {
     insn(op::ALU32 | op::END_BE, dst, 0, 0, bits)
+}
+/// A jump to the next instruction, which fills a block to its length.
+const fn nop() -> Insn {
+    insn(op::JMP | op::JA, 0, 0, 0, 0)
 }
 
 /// An instruction of the converted program, or a jump whose `off` goes to
@@ -382,6 +394,13 @@ impl Block {
     fn jump(&mut self, i: Insn, target: usize) {
         self.0.push(Piece::Jump(i, target));
     }
+    /// No-ops after the instructions, up to `length`.
+    fn pad(&mut self, length: usize) {
+        debug_assert!(self.0.len() <= length, "{} > {length}", self.0.len());
+        while self.0.len() < length {
+            self.push(nop());
+        }
+    }
 }
 
 /// The classic register's register in the converted program.
@@ -392,40 +411,85 @@ const fn register(r: Reg) -> u8 {
     }
 }
 
-/// An `sk_buff` field into A: the mark, the packet type (of its 3 bits),
-/// the queue, the VLAN tag, and else whether there is a VLAN tag, as 0 or
-/// 1.
-fn skb_field(which: u32) -> Vec<Insn> {
+/// How many instructions Linux converts a packet load of `size` bytes at
+/// `k`, or `X + k` when `indirect`, to: 8, or 9 for an indirect one with a
+/// `k`, through its helper; one at a constant offset from the start has 4
+/// more, 2 more again past what an `off` holds, one more for a `k` that is
+/// not 0, and one more for more than a byte.
+fn packet_length(size: u16, indirect: bool, k: u32) -> usize {
+    if indirect || (k as i32) < 0 {
+        return 8 + usize::from(indirect && k != 0);
+    }
+    let far = i16::try_from(k).is_err();
+    12 + usize::from(k != 0) + 2 * usize::from(far) + usize::from(size != B)
+}
+
+/// How many instructions Linux converts the ancillary load `which` (from
+/// [`AD_OFF`]) to.
+fn ancillary_length(which: u32) -> usize {
     match which {
-        ad::MARK => vec![ldx(op::W, reg::A, reg::CTX, field::MARK)],
-        ad::PKTTYPE => vec![
-            ldx(op::B, reg::A, reg::CTX, field::PKT_TYPE),
-            alu32_imm(op::AND, reg::A, 7),
-        ],
-        ad::QUEUE => vec![ldx(op::H, reg::A, reg::CTX, field::QUEUE_MAPPING)],
-        ad::VLAN_TAG => vec![ldx(op::H, reg::A, reg::CTX, field::VLAN_TCI)],
-        _ => vec![
-            ldx(op::W, reg::A, reg::CTX, field::VLAN_ALL),
-            jmp_imm(op::JEQ, reg::A, 0, 1),
-            alu32_imm(op::MOV, reg::A, 1),
-        ],
+        ad::PROTOCOL | ad::VLAN_TPID | ad::PKTTYPE => 2,
+        ad::VLAN_TAG_PRESENT => 3,
+        ad::IFINDEX | ad::HATYPE => 4,
+        ad::PAY_OFFSET | ad::NLATTR | ad::NLATTR_NEST | ad::CPU | ad::RANDOM => 4,
+        _ => 1,
+    }
+}
+
+/// How many instructions Linux converts the classic instruction `f`,
+/// which is `op`, to: the converted program's length, which the socket is
+/// charged for and which decides whether a jump reaches, is theirs sum.
+fn length(op: Op, f: SockFilter) -> usize {
+    match op {
+        Op::Packet {
+            indirect: false, ..
+        } if ancillary(f.k) => ancillary_length(f.k.wrapping_sub(AD_OFF)),
+        Op::Packet { size, indirect } => packet_length(size, indirect, f.k),
+        Op::HeaderLength => 6 + packet_length(B, false, f.k),
+        Op::Alu {
+            op: DIV | MOD,
+            x: true,
+        } => 5,
+        Op::Return { a: false } => 2,
+        Op::Conditional { op: o, x } => {
+            let constant = usize::from(!x && (f.k as i32) < 0);
+            let one = f.jf == 0 || f.jt == 0 && o != JSET;
+            constant + if one { 1 } else { 2 }
+        }
+        _ => 1,
     }
 }
 
 /// The ancillary load `which` (from [`AD_OFF`]) into A. The protocol and
-/// the VLAN protocol are in network order in the `sk_buff`; the interface's
-/// index and type come from its device, and without one the program
-/// returns A as it is; the rest that are no field of it, and the netlink
-/// attribute searches, are helper calls with the context, A and X.
+/// the VLAN protocol are in network order in the `sk_buff`; the packet
+/// type is its 3 bits; the interface's index and type come from its
+/// device, and without one the program returns A as it is; whether there
+/// is a VLAN tag is 0 or 1; the netlink attribute searches take the
+/// context, A and X, the payload offset the context, and the CPU and a
+/// random number nothing.
 fn ancillary_load(which: u32) -> Vec<Insn> {
+    let field = |size, at| vec![ldx(size, reg::A, reg::CTX, at)];
     match which {
-        ad::PROTOCOL => vec![
-            ldx(op::H, reg::A, reg::CTX, field::PROTOCOL),
-            from_be(reg::A, 16),
+        ad::MARK => field(op::W, field::MARK),
+        ad::QUEUE => field(op::H, field::QUEUE_MAPPING),
+        ad::VLAN_TAG => field(op::H, field::VLAN_TCI),
+        ad::RXHASH => field(op::W, field::HASH),
+        ad::PROTOCOL | ad::VLAN_TPID => {
+            let at = if which == ad::PROTOCOL {
+                field::PROTOCOL
+            } else {
+                field::VLAN_PROTO
+            };
+            vec![ldx(op::H, reg::A, reg::CTX, at), from_be(reg::A, 16)]
+        }
+        ad::PKTTYPE => vec![
+            ldx(op::B, reg::A, reg::CTX, field::PKT_TYPE),
+            alu32_imm(op::AND, reg::A, 7),
         ],
-        ad::VLAN_TPID => vec![
-            ldx(op::H, reg::A, reg::CTX, field::VLAN_PROTO),
-            from_be(reg::A, 16),
+        ad::VLAN_TAG_PRESENT => vec![
+            ldx(op::W, reg::A, reg::CTX, field::VLAN_ALL),
+            jmp32_imm(op::JEQ, reg::A, 0, 1),
+            mov32_imm(reg::A, 1),
         ],
         ad::IFINDEX | ad::HATYPE => {
             // `dev->ifindex` is the device's first word.
@@ -436,97 +500,52 @@ fn ancillary_load(which: u32) -> Vec<Insn> {
             };
             vec![
                 ldx(op::DW, reg::TMP, reg::CTX, field::DEV),
-                jmp_imm(op::JNE, reg::TMP, 0, 1),
+                // The device's address is 64 bits.
+                insn(op::JMP | op::JNE, reg::TMP, 0, 1, 0),
                 exit(),
                 ldx(size, reg::A, reg::TMP, at),
             ]
         }
-        ad::RXHASH => vec![ldx(op::W, reg::A, reg::CTX, field::HASH)],
-        ad::ALU_XOR_X => vec![alu32_reg(op::XOR, reg::A, reg::X)],
-        ad::PAY_OFFSET | ad::NLATTR | ad::NLATTR_NEST | ad::CPU | ad::RANDOM => {
-            let id = match which {
-                ad::PAY_OFFSET => helper::PAY_OFFSET,
-                ad::NLATTR => helper::NLATTR,
-                ad::NLATTR_NEST => helper::NLATTR_NEST,
-                ad::CPU => helper::CPU,
-                _ => helper::RANDOM,
+        ad::ALU_XOR_X => vec![insn(op::ALU32 | op::XOR | op::X, reg::A, reg::X, 0, 0)],
+        ad::NLATTR | ad::NLATTR_NEST => {
+            let id = if which == ad::NLATTR {
+                helper::NLATTR
+            } else {
+                helper::NLATTR_NEST
             };
             vec![
                 mov64_reg(reg::ARG1, reg::CTX),
-                mov64_reg(reg::ARG2, reg::A),
-                mov64_reg(reg::ARG3, reg::X),
+                mov32_reg(reg::ARG2, reg::A),
+                mov32_reg(reg::ARG3, reg::X),
                 call(id),
             ]
         }
-        ad::PKTTYPE | ad::MARK | ad::QUEUE | ad::VLAN_TAG | ad::VLAN_TAG_PRESENT => {
-            skb_field(which)
-        }
+        ad::PAY_OFFSET => vec![mov64_reg(reg::ARG1, reg::CTX), call(helper::PAY_OFFSET)],
+        ad::CPU => vec![call(helper::CPU)],
+        ad::RANDOM => vec![call(helper::RANDOM)],
         // [`ancillary`] takes no other.
         _ => Vec::new(),
     }
 }
 
 /// A load of the packet's `size` bytes at `k`, or at `X + k` (in 32 bits)
-/// when `indirect`, into A, in host order. A load at a constant offset
-/// from the start reads the linear data when the bytes are in it, and
-/// jumps over the rest; any other, and that one when the bytes are past
-/// the linear data, calls a helper that finds them, and the program
-/// returns 0 when the helper says there are none.
-fn packet_load(size: u16, indirect: bool, k: u32) -> Vec<Insn> {
-    let (bytes, width, load) = match size {
-        W => (4, op::W, helper::LOAD_WORD),
-        H => (2, op::H, helper::LOAD_HALF),
-        _ => (1, op::B, helper::LOAD_BYTE),
+/// when `indirect`, into A: eBPF's own packet load, which does what a
+/// classic one does.
+fn packet_load(size: u16, indirect: bool, k: u32) -> Insn {
+    let width = match size {
+        W => op::W,
+        H => op::H,
+        _ => op::B,
     };
-    let offset = k as i32;
-    let mut slow = vec![
-        mov64_reg(reg::ARG1, reg::CTX),
-        mov64_reg(reg::ARG2, reg::D),
-        mov64_reg(reg::ARG3, reg::H),
-    ];
-    if !indirect {
-        slow.push(insn(op::ALU64 | op::MOV, reg::ARG4, 0, 0, offset));
+    if indirect {
+        insn(op::LD_IND | width, 0, reg::X, 0, k as i32)
     } else {
-        slow.push(mov64_reg(reg::ARG4, reg::X));
-        if k != 0 {
-            slow.push(insn(op::ALU64 | op::ADD, reg::ARG4, 0, 0, offset));
-        }
+        insn(op::LD_ABS | width, 0, 0, 0, k as i32)
     }
-    slow.extend([
-        call(load),
-        jmp_imm(op::JSGE, reg::A, 0, 2),
-        alu32_reg(op::XOR, reg::A, reg::A),
-        exit(),
-    ]);
-    if indirect || offset < 0 {
-        return slow;
-    }
-    // The linear data's length is in H, and it starts at D; an offset an
-    // `off` cannot hold is added to a copy of D.
-    let mut fast = match i16::try_from(offset) {
-        Ok(off) => vec![ldx(width, reg::A, reg::D, off)],
-        Err(_) => vec![
-            mov64_reg(reg::TMP, reg::D),
-            insn(op::ALU64 | op::ADD, reg::TMP, 0, 0, offset),
-            ldx(width, reg::A, reg::TMP, 0),
-        ],
-    };
-    if bytes > 1 {
-        fast.push(from_be(reg::A, bytes * 8));
-    }
-    fast.push(jmp_imm(op::JA, 0, 0, slow.len() as i16));
-    let mut out = vec![mov64_reg(reg::TMP, reg::H)];
-    if offset != 0 {
-        out.push(insn(op::ALU64 | op::SUB, reg::TMP, 0, 0, offset));
-    }
-    out.push(jmp_imm(op::JSLT, reg::TMP, bytes, fast.len() as i16));
-    out.append(&mut fast);
-    out.append(&mut slow);
-    out
 }
 
 /// The converted block of the classic instruction `f` at `pc`, which is
-/// `op`.
+/// `op`: its instructions, and no-ops after them up to [`length`].
 fn block(pc: usize, op: Op, f: SockFilter) -> Block {
     let mut out = Block::default();
     let k = f.k as i32;
@@ -536,19 +555,15 @@ fn block(pc: usize, op: Op, f: SockFilter) -> Block {
         } if ancillary(f.k) => {
             out.extend(ancillary_load(f.k.wrapping_sub(AD_OFF)));
         }
-        Op::Packet { size, indirect } => out.extend(packet_load(size, indirect, f.k)),
-        Op::HeaderLength => {
-            // A is kept in X while the byte is loaded into A.
-            out.push(mov64_reg(reg::X, reg::A));
-            out.extend(packet_load(B, false, f.k));
-            out.extend([
-                alu32_imm(op::AND, reg::A, 0xf),
-                alu32_imm(op::LSH, reg::A, 2),
-                mov64_reg(reg::TMP, reg::X),
-                mov64_reg(reg::X, reg::A),
-                mov64_reg(reg::A, reg::TMP),
-            ]);
-        }
+        Op::Packet { size, indirect } => out.push(packet_load(size, indirect, f.k)),
+        Op::HeaderLength => out.extend([
+            mov64_reg(reg::SAVED, reg::A),
+            packet_load(B, false, f.k),
+            alu32_imm(op::AND, reg::A, 0xf),
+            alu32_imm(op::LSH, reg::A, 2),
+            mov32_reg(reg::X, reg::A),
+            mov32_reg(reg::A, reg::SAVED),
+        ]),
         Op::Immediate(to) => out.push(mov32_imm(register(to), k)),
         Op::Scratch(to) => out.push(ldx(op::W, register(to), reg::FP, scratch(f.k))),
         Op::Length(to) => out.push(ldx(op::W, register(to), reg::CTX, field::LEN)),
@@ -561,34 +576,36 @@ fn block(pc: usize, op: Op, f: SockFilter) -> Block {
         )),
         Op::Alu { op: o, x } => {
             if x && (o == DIV || o == MOD) {
-                // X is 32 bits, and a division by 0 returns 0.
+                // A division by 0 returns 0.
                 out.extend([
-                    insn(op::ALU32 | op::MOV | op::X, reg::X, reg::X, 0, 0),
-                    jmp_imm(op::JNE, reg::X, 0, 2),
-                    alu32_reg(op::XOR, reg::A, reg::A),
+                    jmp32_imm(op::JNE, reg::X, 0, 2),
+                    mov32_imm(reg::A, 0),
                     exit(),
                 ]);
             }
-            out.push(insn(f.code as u8, reg::A, reg::X, 0, k));
+            // A classic operation's code is eBPF's 32-bit one.
+            let src = if x { reg::X } else { 0 };
+            out.push(insn(f.code as u8, reg::A, src, 0, k));
         }
-        Op::Neg => out.push(insn(f.code as u8, reg::A, reg::X, 0, k)),
+        Op::Neg => out.push(insn(f.code as u8, reg::A, 0, 0, 0)),
         Op::Always => out.jump(insn(op::JMP | op::JA, 0, 0, 0, 0), pc + 1 + f.k as usize),
         Op::Conditional { op: o, x } => {
             let (jt, jf) = (pc + 1 + usize::from(f.jt), pc + 1 + usize::from(f.jf));
-            // eBPF immediates are signed, so a k above i32::MAX compares
-            // from TMP, where it is zero-extended.
-            // A jump on X keeps k too, which it does not read.
-            let mut j = insn(0, reg::A, 0, 0, k);
-            let source = if x {
-                j.src = reg::X;
-                op::X
-            } else if k < 0 {
-                out.push(mov32_imm(reg::TMP, k));
-                j.src = reg::TMP;
-                j.imm = 0;
-                op::X
-            } else {
-                0
+            // A 32-bit jump compares as a classic one does, a k above
+            // i32::MAX too; Linux has one more instruction there.
+            if !x && k < 0 {
+                out.push(nop());
+            }
+            let source = if x { op::X } else { 0 };
+            let src = if x { reg::X } else { 0 };
+            let jump = |o: u8| {
+                insn(
+                    op::JMP32 | o | source,
+                    reg::A,
+                    src,
+                    0,
+                    if x { 0 } else { k },
+                )
             };
             // A true case that is the next instruction takes the opposite
             // jump to the false one, where there is one.
@@ -599,17 +616,10 @@ fn block(pc: usize, op: Op, f: SockFilter) -> Block {
                 _ => None,
             };
             match (f.jt, f.jf, opposite) {
-                (_, 0, _) => {
-                    j.code = op::JMP | o as u8 | source;
-                    out.jump(j, jt);
-                }
-                (0, _, Some(opposite)) => {
-                    j.code = op::JMP | opposite | source;
-                    out.jump(j, jf);
-                }
+                (_, 0, _) => out.jump(jump(o as u8), jt),
+                (0, _, Some(opposite)) => out.jump(jump(opposite), jf),
                 _ => {
-                    j.code = op::JMP | o as u8 | source;
-                    out.jump(j, jt);
+                    out.jump(jump(o as u8), jt);
                     out.jump(insn(op::JMP | op::JA, 0, 0, 0, 0), jf);
                 }
             }
@@ -620,9 +630,10 @@ fn block(pc: usize, op: Op, f: SockFilter) -> Block {
             }
             out.push(exit());
         }
-        Op::Tax => out.push(mov64_reg(reg::X, reg::A)),
-        Op::Txa => out.push(mov64_reg(reg::A, reg::X)),
+        Op::Tax => out.push(mov32_reg(reg::X, reg::A)),
+        Op::Txa => out.push(mov32_reg(reg::A, reg::X)),
     }
+    out.pad(length(op, f));
     out
 }
 
@@ -631,8 +642,8 @@ const fn scratch(k: u32) -> i16 {
     -(k as i16 * 4 + 4)
 }
 
-/// Whether `op` with `k` reads the packet, which makes the program start
-/// with the data's address and the linear data's length.
+/// Whether `op` with `k` reads the packet, which gives Linux's converted
+/// program 4 more instructions at its start.
 fn reads_packet(op: Op, k: u32) -> bool {
     match op {
         Op::Packet { indirect, .. } => indirect || !ancillary(k),
@@ -641,11 +652,14 @@ fn reads_packet(op: Op, k: u32) -> bool {
     }
 }
 
-/// The eBPF program a checked classic one runs as on Linux, instruction for
-/// instruction, so that it has Linux's length, which the socket is charged
-/// for. It starts by clearing A and X and keeping the context, and, if the
-/// program reads the packet, the data's address and the linear data's
-/// length; then each classic instruction's block follows.
+/// The eBPF program a checked classic one runs as. Its instructions are
+/// this file's own, but each classic instruction's block has as many as
+/// Linux's, and the jumps to other instructions are where Linux has them:
+/// the program's length is what the socket is charged for, and it and
+/// the jumps' places decide whether a jump reaches. It starts by clearing
+/// A and X and keeping the context, with no-ops for Linux's 4 more when
+/// the program reads the packet; then each classic instruction's block
+/// follows.
 ///
 /// EINVAL for a jump an `off` cannot hold, and for any jump placed past
 /// 32,767, however near it goes: Linux places the jumps once with every
@@ -656,17 +670,12 @@ pub(crate) fn convert(filter: &[SockFilter]) -> Result<Vec<Insn>, Errno> {
         .map(|f| decode(f.code).ok_or(Errno::EINVAL))
         .collect::<Result<Vec<_>, _>>()?;
     let mut program = vec![
-        alu32_reg(op::XOR, reg::A, reg::A),
-        alu32_reg(op::XOR, reg::X, reg::X),
+        mov32_imm(reg::A, 0),
+        mov32_imm(reg::X, 0),
         mov64_reg(reg::CTX, reg::ARG1),
     ];
     if ops.iter().zip(filter).any(|(&op, f)| reads_packet(op, f.k)) {
-        program.extend([
-            ldx(op::DW, reg::D, reg::CTX, field::DATA),
-            ldx(op::W, reg::H, reg::CTX, field::LEN),
-            ldx(op::W, reg::TMP, reg::CTX, field::DATA_LEN),
-            alu32_reg(op::SUB, reg::H, reg::TMP),
-        ]);
+        program.extend([nop(); 4]);
     }
     let blocks: Vec<Block> = ops
         .iter()

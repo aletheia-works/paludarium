@@ -44,9 +44,6 @@ static I fill_stream(int fd,I *partial,U *queued) {
 }
 static I run(I *o) {
  U x=0;struct Ev out[4]={{0,0}};I fd=-1,e=-1,d=-1;int p[2]={-1,-1};char b[8]={0};int id=CASE;
- /* 82 and 83 run with a stdout whose reader is gone, and report on stderr:
-    a write there is EPIPE and raises SIGPIPE, which 82 blocks (pending
-    after it) and 83 leaves to kill the process. */
  /* 84 and 85 write 128 KiB to a pipe at once; a child holding its only
     read end waits until 64 KiB fill it, which the parent is still inside
     the write for, and exits. The write gives the 64 KiB with SIGPIPE, which
@@ -117,6 +114,9 @@ static I run(I *o) {
   closefd(p[1]);sc(61,pid,0,0,0,0,0);
   return 0;
  }
+ /* 82 and 83 run with a stdout whose reader is gone, and report on stderr:
+    a write there is EPIPE and raises SIGPIPE, which 82 blocks (pending
+    after it) and 83 leaves to kill the process. */
  if(CASE>=82) {
   U blocked=1UL<<12,pending=0;struct{const char *base;U len;}iov={"b",1};
   if(CASE==82)sc(14,0,(U)&blocked,0,8,0,0);

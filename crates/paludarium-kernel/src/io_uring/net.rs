@@ -157,14 +157,17 @@ impl Net {
         let Some(file) = self.found.as_ref().map(|found| Arc::clone(&found.file)) else {
             return;
         };
+        // `io_mshot_prep_retry`: each completion starts anew.
         if let Op::Transfer {
             send: false,
             bundle: true,
             ref mut done,
+            ref mut retried,
             ..
         } = self.op
         {
             *done = 0;
+            *retried = None;
         }
         let unknown = match self.op {
             // Only TCP tells whether more connections wait (`is_empty`).
@@ -227,6 +230,10 @@ enum Op {
         /// What its socket last said it has left to read (`msg_inq`), which
         /// a receive's bundle takes buffers for when it asks for no length.
         inq: Option<u32>,
+        /// A receive's bundle that tried again and waited: the flags of its
+        /// first buffers, which its completion keeps (`req->cqe.flags` with
+        /// `IORING_RECV_RETRY`), so it does not try again.
+        retried: Option<u32>,
     },
 }
 
@@ -378,6 +385,7 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 vector: vectored.then(Vec::new),
                 picked: None,
                 inq: None,
+                retried: None,
             }
         }
         _ => return Err(super::EOPNOTSUPP),
@@ -1042,7 +1050,8 @@ fn transfer(
 /// it filled them all, the socket has more and the first was not cut, it
 /// tries again for that much and adds it to the same completion, which
 /// names the first buffer. Nothing to read gives the buffers back and
-/// waits, keeping what it received.
+/// waits, keeping what it received, and, after it tried again, the first
+/// buffers' flags, so that it does not try again.
 fn receive_bundle(
     c: &mut Context<'_>,
     ring: &Ring,
@@ -1058,6 +1067,7 @@ fn receive_bundle(
         group: Some(bgid),
         done,
         inq,
+        retried: kept,
         ..
     } = op
     else {
@@ -1075,9 +1085,13 @@ fn receive_bundle(
         return (Issued::Again(mask), false);
     }
     let asked = u64::from(*msg_flags | MSG_DONTWAIT);
-    let mut want = *len;
-    let mut cflags = None;
-    let mut retried = false;
+    let mut want = if kept.is_some() {
+        inq.unwrap_or(0)
+    } else {
+        *len
+    };
+    let mut cflags = *kept;
+    let mut retried = kept.is_some();
     loop {
         let mut max = if want != 0 {
             want
@@ -1115,6 +1129,9 @@ fn receive_bundle(
             Ok(n) => n,
             Err(Errno::EAGAIN) => {
                 super::put_received(c, ring, &received, 0);
+                if retried {
+                    *kept = cflags;
+                }
                 return (Issued::Again(mask), false);
             }
             Err(e) => {

@@ -978,6 +978,9 @@ struct Transfer {
     /// in a registered buffer, its entries as they were read, a length past
     /// `MAX_RW_COUNT` cut to one past it.
     segments: Vec<(u64, usize)>,
+    /// For a vector in a registered buffer, the most pieces of pages its
+    /// entries may take, from their whole lengths ([`within_vector`]).
+    page_pieces: u64,
     /// Protection information came with it (`REQ_F_HAS_METADATA`), which
     /// no file here takes.
     metadata: bool,
@@ -1304,6 +1307,7 @@ impl Ring {
                 attr_ptr: u64_at(sqe, 48),
                 attr_type_mask: u64_at(sqe, 56),
                 segments: Vec::new(),
+                page_pieces: 0,
                 metadata: false,
                 kept: None,
                 found: None,
@@ -1574,6 +1578,11 @@ fn prepare_transfer(c: &Context<'_>, transfer: &mut Transfer) -> Result<(), Errn
             }
             let entries =
                 crate::files::iovec_entries(c.mem, transfer.addr, u64::from(transfer.len))?;
+            // `io_estimate_bvec_size`: two more than the 4 KiB pages of
+            // each.
+            transfer.page_pieces = entries.iter().fold(0u64, |pieces, &(_, len)| {
+                pieces.saturating_add((len >> 12) + 2)
+            });
             let most = crate::files::MAX_RW_COUNT as u64 + 1;
             transfer.segments = entries
                 .into_iter()
@@ -1703,7 +1712,7 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
     if transfer.registered {
         let within = buffer.as_ref().ok_or(Errno::EFAULT).and_then(|node| {
             if transfer.vectored {
-                within_vector(node, &transfer.segments)
+                within_vector(node, &transfer.segments, transfer.page_pieces)
             } else {
                 within(node, transfer.addr, transfer.len)
             }
@@ -4705,10 +4714,23 @@ fn within(node: &Node, addr: u64, len: u32) -> Result<Registered, Errno> {
 }
 
 /// The pieces of the registered buffer `node` that a vector's entries name,
-/// in order, as `io_import_reg_vec` finds them: each as [`within`] finds
-/// one, but one of no bytes is `EFAULT` too, and more than `MAX_RW_COUNT`
-/// in all is `EINVAL`.
-fn within_vector(node: &Node, entries: &[(u64, usize)]) -> Result<Registered, Errno> {
+/// in order, as `io_import_reg_vec` finds them. Before any entry is looked
+/// at, room is made for the pieces of pages they may take (`page_pieces`,
+/// 16 bytes each): more than `INT_MAX` of them are `EOVERFLOW`, and more
+/// than `kmalloc` gives at once `ENOMEM`. Then each entry is found as
+/// [`within`] finds one, but one of no bytes is `EFAULT` too, and more than
+/// `MAX_RW_COUNT` in all is `EINVAL`.
+fn within_vector(
+    node: &Node,
+    entries: &[(u64, usize)],
+    page_pieces: u64,
+) -> Result<Registered, Errno> {
+    if page_pieces > i32::MAX as u64 {
+        return Err(EOVERFLOW);
+    }
+    if page_pieces * 16 > MAX_KMALLOC {
+        return Err(Errno::ENOMEM);
+    }
     let mut pieces = Vec::with_capacity(entries.len());
     let mut pages = None;
     for &(addr, len) in entries {
@@ -4720,7 +4742,7 @@ fn within_vector(node: &Node, entries: &[(u64, usize)]) -> Result<Registered, Er
         pieces.append(&mut piece.pieces);
         pages = Some(piece.pages);
     }
-    if pieces.iter().map(|&(_, len)| len).sum::<usize>() > crate::files::MAX_RW_COUNT {
+    if pieces.iter().map(|&(_, len)| len as u64).sum::<u64>() > crate::files::MAX_RW_COUNT as u64 {
         return Err(Errno::EINVAL);
     }
     let pages = match pages {

@@ -9964,7 +9964,11 @@ static int io_uring_transfers_case(void) {
         {"writev-fixed-before", {{page, 1}, {page - 1, 1}}, 2, 0},
         {"writev-fixed-past-end", {{page + 4095, 2}}, 1, 0},
         {"writev-fixed-zero", {{page, 1}, {page + 4, 0}}, 2, 0},
-        {"writev-fixed-too-long", {{page, 1UL << 31}}, 1, 0},
+        {"writev-fixed-too-long", {{page, 1UL << 20}}, 1, 0},
+        {"writev-fixed-many-pages", {{page, 1UL << 31}}, 1, 0},
+        {"writev-fixed-many-pages-two", {{page, 1UL << 29}, {page, 1UL << 29}}, 2, 0},
+        {"writev-fixed-pages-overflow", {{page, 1UL << 43}}, 1, 0},
+        {"writev-fixed-pages-empty-slot", {{page, 1UL << 43}}, 1, 1},
     };
     for (unsigned i = 0; i < sizeof apart / sizeof *apart; i++) {
         sqe = ut_entry(61, ffd, 0, apart[i].v, apart[i].count);

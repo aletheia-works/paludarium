@@ -5860,12 +5860,25 @@ mod io_uring {
             (&[(buf, 1), (buf - 1, 1)], 0),
             (&[(buf + 0xff, 2)], 0),
             (&[(buf, 1), (buf + 4, 0)], 0),
-            (&[(buf, 1 << 31)], 0),
+            (&[(buf, 1 << 20)], 0),
         ] {
             iovecs(&f, list, entries);
             let count = entries.len() as u32;
             let entry = fixed(WRITEV_FIXED, fd, 0, list, count, index);
             assert_eq!(one(&mut f, &r, &entry), -14, "{entries:x?} {index}");
+        }
+        // Before them, room for the pages they may take: more than 4 MiB
+        // of pieces, more than `INT_MAX`. An empty slot comes first.
+        for (entries, index, e) in [
+            (&[(buf, 1u64 << 31)][..], 0, -12),
+            (&[(buf, 1 << 29), (buf, 1 << 29)], 0, -12),
+            (&[(buf, 1 << 43)], 0, -75),
+            (&[(buf, 1 << 43)], 1, -14),
+        ] {
+            iovecs(&f, list, entries);
+            let count = entries.len() as u32;
+            let entry = fixed(WRITEV_FIXED, fd, 0, list, count, index);
+            assert_eq!(one(&mut f, &r, &entry), e, "{entries:x?} {index}");
         }
         // No buffer is selected.
         let mut select = fixed(READV_FIXED, fd, 0, list, 1, 0);

@@ -2256,9 +2256,12 @@ kernel.
   `IORING_OP_READV_FIXED` and `_WRITEV_FIXED` read their `iovec`s as the
   entry is prepared (`ENOMEM` for more than `kmalloc` makes room for at
   once, 4 MiB of them, then `EINVAL` for more than 1024, `EFAULT`, and
-  `EINVAL` for a negative length), then, after the file, each buffer must
-  lie in the registered one and have some bytes (`EFAULT`), and they may
-  have at most `MAX_RW_COUNT` in all (`EINVAL`). They move the bytes as
+  `EINVAL` for a negative length), then, after the file and the buffer
+  (`EFAULT`), room is made for the pieces of pages they may take, two more
+  than the 4 KiB pages of each: more than `INT_MAX` pieces are `EOVERFLOW`,
+  and more than `kmalloc` gives at once (4 MiB of 16-byte pieces) `ENOMEM`.
+  Then each buffer must lie in the registered one and have some bytes
+  (`EFAULT`), and they may have at most `MAX_RW_COUNT` in all (`EINVAL`). They move the bytes as
   `readv` and `writev` do.
 
 - `IORING_OP_EPOLL_WAIT` takes the events of the epoll its `fd` names, at

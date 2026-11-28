@@ -1951,9 +1951,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
   範囲がはみ出せば `EFAULT` です。`IORING_OP_READV_FIXED` と `_WRITEV_FIXED` は、エントリーを
   準備するときに `iovec` を読みます（`kmalloc` が一度に場所を作れる 4 MiB 分より多ければ `ENOMEM`、
-  次に 1024 より多ければ `EINVAL`、`EFAULT`、負の長さは `EINVAL`）。ファイルのあと、どの
-  バッファーも登録したものの中にあって 1 バイト以上なければならず（`EFAULT`）、合計は
-  `MAX_RW_COUNT` までです（`EINVAL`）。バイトは `readv` と `writev` と同じく転送します。
+  次に 1024 より多ければ `EINVAL`、`EFAULT`、負の長さは `EINVAL`）。ファイルと
+  バッファー（`EFAULT`）のあと、それらが取りうるページの断片の場所を作ります。断片はそれぞれの
+  4 KiB ページの数より 2 つ多く、`INT_MAX` を超えれば `EOVERFLOW`、`kmalloc` が一度に作れる
+  場所（16 バイトの断片で 4 MiB 分）を超えれば `ENOMEM` です。そのあと、どのバッファーも登録した
+  ものの中にあって 1 バイト以上なければならず（`EFAULT`）、合計は `MAX_RW_COUNT` までです
+  （`EINVAL`）。バイトは `readv` と `writev` と同じく転送します。
 
 - `IORING_OP_EPOLL_WAIT` は、`fd` が指す epoll のイベントを `len` 個まで `addr` に、
   タイムアウトなしの `epoll_wait` と同じく取ります。`off`、`rw_flags`、`buf_index`、

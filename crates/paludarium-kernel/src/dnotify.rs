@@ -176,7 +176,8 @@ impl Watches {
     /// file of a directory, `directories`, takes off that directory's mark
     /// with no watch left (`dnotify_flush`), whether or not it is a file
     /// that asked for a watch: a one-shot watch's signal may have left the
-    /// mark with none.
+    /// mark with none. The directory of each watch it ends is flushed too,
+    /// as its file is one of that directory's.
     pub(crate) fn release_table(
         &self,
         table: u64,
@@ -187,8 +188,15 @@ impl Watches {
             return;
         }
         let mut list = self.list();
-        list.retain(|w| w.table != table);
-        self.unmark(&list, directories.iter().copied(), connectors);
+        let mut flushed = directories.to_vec();
+        list.retain(|w| {
+            let ends = w.table == table;
+            if ends {
+                flushed.push(w.directory);
+            }
+            !ends
+        });
+        self.unmark(&list, flushed, connectors);
         self.recount(&list);
     }
     /// `attach_dn`: a table that already asked of the file adds the events
@@ -373,6 +381,17 @@ mod tests {
         // One that closes a file of it that asked for nothing takes it off,
         // as each close's `dnotify_flush` does.
         watches.release_table(3, &[directory], &connectors);
+        assert!(!watches.marking());
+    }
+
+    #[test]
+    fn a_tables_end_flushes_the_directory_of_each_watch_it_ends() {
+        let watches = Watches::default();
+        let connectors = crate::fanotify::Registry::default();
+        let directory = (1, 10);
+        watches.attach(one_shot(directory, 1), &connectors);
+        watches.release_table(1, &[], &connectors);
+        assert!(!watches.active());
         assert!(!watches.marking());
     }
 

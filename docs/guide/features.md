@@ -4460,6 +4460,9 @@ kernel.
   `rename` and an `open` with `O_CREAT`), even with a trailing slash. They
   find the link itself, as Linux's walk to the parent leaves it to them:
   `mkdir("/proc/self/fd/0/")` is `EEXIST`, and `unlink` of it `ENOTDIR`.
+  A link of `/dev` on the way is followed too, so a name in `/dev/fd` is
+  one of `/proc/self/fd`: a `rename` or `link` there is on procfs, not
+  `EXDEV`.
 
 - The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
   `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/version` and the other system files (below), `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only

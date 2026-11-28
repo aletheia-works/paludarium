@@ -15715,7 +15715,13 @@ fn the_name_calls_find_a_last_magic_link_itself() {
     let fd = f.ret(2, &[file, 0o101, 0o666]);
     assert!(fd < 1024, "{fd:#x}");
     let own = format!("/proc/self/fd/{fd}/");
-    for p in [own.as_bytes(), b"/proc/self/exe/", b"/proc/self/cwd/"] {
+    let dev = format!("/dev/fd/{fd}/");
+    for p in [
+        own.as_bytes(),
+        dev.as_bytes(),
+        b"/proc/self/exe/",
+        b"/proc/self/cwd/",
+    ] {
         let name = String::from_utf8_lossy(p).into_owned();
         let at = put(&mut f, 0x100, p);
         let x = put(&mut f, 0x200, b"x");
@@ -15738,6 +15744,12 @@ fn the_name_calls_find_a_last_magic_link_itself() {
         );
         assert_eq!(f.ret(87, &[at]), errno(Errno::ENOTDIR), "unlink {name}");
     }
+    // `/dev/fd` leads to `/proc/self/fd`, the same procfs: a rename or link
+    // there looks for the old name (`ENOENT`), not `EXDEV`.
+    let missing = put(&mut f, 0x300, b"/proc/self/nonesuch");
+    let new = put(&mut f, 0x340, b"/dev/fd/x9");
+    assert_eq!(f.ret(82, &[missing, new]), errno(Errno::ENOENT), "rename");
+    assert_eq!(f.ret(86, &[missing, new]), errno(Errno::ENOENT), "link");
     assert_eq!(f.ret(3, &[fd]), 0);
 }
 

@@ -3818,7 +3818,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変える呼び出し（`mkdir`、`mknod`、`symlink`、`link`、`unlink`、`rmdir`、`rename`、
   `O_CREAT` 付きの `open`）では、末尾にスラッシュがあっても飛び越えません。Linux の親までの
   探索と同じく、呼び出しはリンクそのものを見つけます。`mkdir("/proc/self/fd/0/")` は
-  `EEXIST`、その `unlink` は `ENOTDIR` です。
+  `EEXIST`、その `unlink` は `ENOTDIR` です。途中の `/dev` のリンクもたどるので、`/dev/fd` の
+  名前は `/proc/self/fd` の名前で、そこでの `rename` や `link` は `EXDEV` ではなく procfs の
+  上のものです。
 
 - `/proc` にあるのは、ほかには `/proc/cpuinfo`（後述）、`/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/version` などほかのシステムのファイル（後述）、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、

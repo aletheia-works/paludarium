@@ -1355,7 +1355,10 @@ fn name_path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
         .iter()
         .rposition(|&b| b != b'/')
         .map_or(p.len(), |at| at + 1);
-    let mut through = through_magic_links(c, p[..end].to_vec())?;
+    let through = through_magic_links(c, p[..end].to_vec())?;
+    // A link of `/dev` on the way (`/dev/fd/3`) is followed too, so the
+    // name is one of the directory it leads to (`/proc/self/fd`).
+    let mut through = crate::devices::through_link(&through).unwrap_or(through);
     through.extend_from_slice(&p[end..]);
     Ok(through)
 }

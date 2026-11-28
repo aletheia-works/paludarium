@@ -19213,10 +19213,12 @@ static int grl_inner(const char *self) {
 }
 /* The magic-link-names case: a link of /proc or /dev that is the last
    name, with a trailing slash, is the name the calls that make, remove or
-   rename it find (EEXIST, EISDIR, ENOTDIR), not the file it leads to. Only
-   errno values are printed. */
+   rename it find (EEXIST, EISDIR, ENOTDIR), not the file it leads to. As
+   nobody, in a child, so that the permission checks that come first
+   (EACCES to remove a name in /dev or /proc/self/ns) are the same whoever
+   runs the case. Only errno values are printed. */
 static int mln_e(int rc) { return rc < 0 ? errno : 0; }
-static int magic_link_names_case(void) {
+static int magic_link_names_rows(void) {
     char base[] = "/tmp/paludarium-magic-names-XXXXXX";
     if (!mkdtemp(base)) return 1;
     char file[96];
@@ -19242,15 +19244,25 @@ static int magic_link_names_case(void) {
         if (c >= 0) close(c);
         int u = mln_e(unlink(p));
         int r = mln_e(rmdir(p));
-        /* /dev/fd's names are procfs's, which a rename here does not yet
-           tell from devtmpfs's: left out. */
-        int rn = strncmp(p, "/dev/fd/", 8) ? mln_e(rename("/proc/self/nonesuch", p)) : -1;
+        int rn = mln_e(rename("/proc/self/nonesuch", p));
         printf("%s %d %d %d %d %d %d %d %d\n", i < 3 ? (i == 0 ? "own-fd/" : i == 1 ? "thread-fd/" : "dev-fd/") : p,
                m, k, s, l, ce, u, r, rn);
     }
     close(fd);
     unlink(file);
     printf("cleaned=%d\n", rmdir(base) == 0);
+    return 0;
+}
+static int magic_link_names_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        int rc = magic_link_names_rows();
+        fflush(stdout);
+        _exit(rc);
+    }
+    printf("status=%d\n", reaped(child));
     return 0;
 }
 /* `execve` through a magic link on the way (`/proc/self/fd/<n>/name`,

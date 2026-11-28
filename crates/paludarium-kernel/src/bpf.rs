@@ -3804,4 +3804,75 @@ mod tests {
         assert!(!value.same(&m.prog_lookup(&2u32.to_le_bytes()).unwrap()));
         assert!(m.prog_lookup(&4u32.to_le_bytes()).is_none());
     }
+
+    /// The keys an LRU hash holds after each of many operations, as a
+    /// digest: fixed before the lists were written again, so that the
+    /// rewrite evicts as before.
+    fn lru_trace(max_entries: u32, cpus: u64, per_cpu: bool, seed: u64) -> u64 {
+        let mut lru = Lru::new(max_entries, cpus, per_cpu);
+        let mut rng = seed | 1;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                digest = (digest ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        let span = u64::from(max_entries) * 2 + 2;
+        for _ in 0..4000 {
+            let r = next();
+            let key = ((r >> 8) % span).to_le_bytes().to_vec();
+            let outcome = match r % 8 {
+                0..=3 => {
+                    let mode = [0, 0, NOEXIST, EXIST][(r >> 40) as usize % 4];
+                    lru.update(&key, cell(vec![1]), mode).map(|()| 0)
+                }
+                4 => lru.delete(&key).map(|_| 1),
+                5 | 6 => Ok(u8::from(lru.reference(&key).is_some())),
+                _ => Ok(2 + u8::from(lru.get(&key).is_some())),
+            };
+            mix(&[match outcome {
+                Ok(v) => v,
+                Err(e) => 100 + e.0 as u8,
+            }]);
+            for k in lru.table.keys() {
+                mix(k);
+            }
+            mix(&[0xff]);
+        }
+        digest
+    }
+
+    #[test]
+    fn an_lru_hash_evicts_as_it_did() {
+        let cases: [(u32, u64, bool, [u64; 2]); 8] = [
+            (4, 1, false, [0x7af4_c27f_c587_7783, 0xffd6_d081_36fa_692a]),
+            (8, 1, false, [0x13e8_2637_29c0_21ef, 0xa2e5_3fc6_2208_77db]),
+            (16, 2, false, [0x1665_7061_8f84_7841, 0x873b_02a7_f346_b468]),
+            (
+                300,
+                1,
+                false,
+                [0xc5ac_61ab_0698_8eea, 0x899a_69ab_d5d4_bc65],
+            ),
+            (3, 1, true, [0x21f3_5ed3_567b_25ed, 0x673e_3a94_c3a4_f51a]),
+            (8, 2, true, [0x1b5b_e125_5ff1_c5c1, 0x6d66_5a63_af48_a1ac]),
+            (16, 4, true, [0x1129_162a_23c3_e4e3, 0x4bb7_a439_2a5f_db47]),
+            (40, 1, true, [0x754e_4fc3_89d0_642c, 0x5663_e938_674d_4378]),
+        ];
+        for (max_entries, cpus, per_cpu, expected) in cases {
+            for (seed, want) in [1, 2].into_iter().zip(expected) {
+                assert_eq!(
+                    lru_trace(max_entries, cpus, per_cpu, seed * 0x9e37_79b9),
+                    want,
+                    "{max_entries} entries, {cpus} CPUs, per CPU {per_cpu}, seed {seed}"
+                );
+            }
+        }
+    }
 }

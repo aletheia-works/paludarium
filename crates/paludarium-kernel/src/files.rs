@@ -2913,7 +2913,7 @@ fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (p, _) = lookup_linked(c, a[0], raw, follow)?;
     chown_path(c, &p, follow, a[2], a[3])
 }
-fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
+pub(crate) fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
 }
 /// Linux's largest single read or write (`MAX_RW_COUNT`).
@@ -3608,6 +3608,51 @@ pub(crate) fn iovecs(
         .map_err(|_| Errno::EFAULT)
     })
 }
+/// The two ends of a new pipe, as `create_pipe_files` makes them for
+/// `pipe2` and io_uring's `IORING_OP_PIPE`: `O_NONBLOCK` on both, packets
+/// with `O_DIRECT`, owned by the caller's file system IDs. There are no
+/// watch queues, so a notification pipe (`O_NOTIFICATION_PIPE`) is `EINVAL`,
+/// a limitation the guide lists.
+pub(crate) fn new_pipe(c: &Context<'_>, flags: u32) -> Result<[Arc<dyn FileHandle>; 2], Errno> {
+    if flags & O_NOTIFICATION_PIPE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let ends = crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
+    let creds = &c.process.credentials;
+    ends[0].set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
+    Ok(ends.map(|end| end as Arc<dyn FileHandle>))
+}
+/// The `count` entries of the `struct iovec` array at `at`, as
+/// `iovec_from_user` reads them: none for no entries, more than
+/// `UIO_MAXIOV` (1024) `EINVAL`, an array outside the user half or not
+/// mapped `EFAULT`, and a negative length `EINVAL`, in order. The buffers
+/// are not looked at.
+pub(crate) fn iovec_entries(
+    mem: &AddressSpace,
+    at: u64,
+    count: u64,
+) -> Result<Vec<(u64, u64)>, Errno> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    crate::sockets::access_ok(at, (count * 16) as usize)?;
+    (0..count)
+        .map(|index| {
+            let addr = at + index * 16;
+            let base = mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
+            let length = mem
+                .read_u64(GuestAddr(addr + 8))
+                .map_err(|_| Errno::EFAULT)?;
+            if (length as i64) < 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok((base, length))
+        })
+        .collect()
+}
 /// The `struct iovec` array at `at`, in Linux's `import_iovec` order: none
 /// for no entries; more than 1024 are EINVAL; the array must lie in the user
 /// half (EFAULT); then every entry is read (EFAULT) and a negative length is
@@ -3622,25 +3667,7 @@ pub(crate) fn iovecs_checked(
     count: u64,
     check: impl Fn(u64, usize) -> Result<(), Errno>,
 ) -> Result<Vec<(u64, usize)>, Errno> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    if count > 1024 {
-        return Err(Errno::EINVAL);
-    }
-    crate::sockets::access_ok(at, (count * 16) as usize)?;
-    let mut entries = Vec::with_capacity(count as usize);
-    for index in 0..count {
-        let addr = at + index * 16;
-        let base = mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
-        let length = mem
-            .read_u64(GuestAddr(addr + 8))
-            .map_err(|_| Errno::EFAULT)?;
-        if (length as i64) < 0 {
-            return Err(Errno::EINVAL);
-        }
-        entries.push((base, length));
-    }
+    let entries = iovec_entries(mem, at, count)?;
     // The lengths stay 64-bit until they are cut, as `usize` is 32 bits in
     // WebAssembly.
     let mut segments = Vec::with_capacity(entries.len());
@@ -3659,23 +3686,25 @@ pub(crate) fn iovecs_checked(
 }
 /// The memory an aio or io_uring transfer moves bytes to or from: the
 /// program's, at the addresses of `segments` as they are mapped at the
-/// time, or `len` bytes from `at` of a registered buffer's pinned pages
-/// ([`paludarium_mmu::Pinned`]), whatever maps them now.
+/// time, or pieces of a registered buffer's pinned pages
+/// ([`paludarium_mmu::Pinned`]), whatever maps them now: each piece is an
+/// offset into the pages and a length, in order.
 #[derive(Clone, Copy)]
 pub(crate) enum Memory<'a> {
     Guest(&'a [(u64, usize)]),
     Pinned {
         pages: &'a paludarium_mmu::Pinned,
-        at: usize,
-        len: usize,
+        pieces: &'a [(u64, usize)],
     },
 }
 
 impl Memory<'_> {
     fn total(&self) -> usize {
         match self {
-            Memory::Guest(segments) => segments.iter().map(|&(_, length)| length).sum(),
-            Memory::Pinned { len, .. } => *len,
+            Memory::Guest(segments)
+            | Memory::Pinned {
+                pieces: segments, ..
+            } => segments.iter().map(|&(_, length)| length).sum(),
         }
     }
     /// Checks that the first `len` bytes may be written (`EFAULT`), which
@@ -3688,48 +3717,51 @@ impl Memory<'_> {
     }
     /// Stores `bytes` from its byte `at` on; whether all of them were.
     pub(crate) fn store(&self, mem: &AddressSpace, at: usize, bytes: &[u8]) -> bool {
-        match self {
+        let mut done = 0;
+        let all = match self {
             Memory::Guest(segments) => {
-                let mut done = 0;
                 crate::sockets::spans(segments, at, bytes.len()).all(|(to, n)| {
                     let piece = &bytes[done..done + n];
                     done += n;
                     mem.write(to, piece).is_ok()
-                }) && done == bytes.len()
+                })
             }
-            Memory::Pinned {
-                pages, at: from, ..
-            } => {
-                pages.write(from + at, bytes);
+            Memory::Pinned { pages, pieces } => {
+                for (to, n) in crate::sockets::spans(pieces, at, bytes.len()) {
+                    pages.write(to.0 as usize, &bytes[done..done + n]);
+                    done += n;
+                }
                 true
             }
-        }
+        };
+        all && done == bytes.len()
     }
     /// Loads `bytes` from its byte `at` on; whether all of them were.
     pub(crate) fn load(&self, mem: &AddressSpace, at: usize, bytes: &mut [u8]) -> bool {
-        match self {
-            Memory::Guest(segments) => {
-                let (mut done, len) = (0, bytes.len());
-                crate::sockets::spans(segments, at, len).all(|(from, n)| {
-                    let piece = &mut bytes[done..done + n];
+        let (mut done, len) = (0, bytes.len());
+        let all = match self {
+            Memory::Guest(segments) => crate::sockets::spans(segments, at, len).all(|(from, n)| {
+                let piece = &mut bytes[done..done + n];
+                done += n;
+                mem.read(from, piece).is_ok()
+            }),
+            Memory::Pinned { pages, pieces } => {
+                for (from, n) in crate::sockets::spans(pieces, at, len) {
+                    pages.read(from.0 as usize, &mut bytes[done..done + n]);
                     done += n;
-                    mem.read(from, piece).is_ok()
-                }) && done == len
-            }
-            Memory::Pinned {
-                pages, at: from, ..
-            } => {
-                pages.read(from + at, bytes);
+                }
                 true
             }
-        }
+        };
+        all && done == len
     }
     /// Stores `bytes` from the start.
     fn scatter(&self, c: &Context<'_>, bytes: &[u8]) -> Result<(), Errno> {
         match self {
             Memory::Guest(segments) => scatter(c, segments, bytes),
-            Memory::Pinned { pages, at, len } => {
-                pages.write(*at, &bytes[..bytes.len().min(*len)]);
+            Memory::Pinned { .. } => {
+                let bytes = &bytes[..bytes.len().min(self.total())];
+                self.store(c.mem, 0, bytes);
                 Ok(())
             }
         }
@@ -3747,10 +3779,10 @@ impl Memory<'_> {
                         .map_err(|_| Errno::EFAULT)?;
                 }
             }
-            Memory::Pinned { pages, at, len } => {
+            Memory::Pinned { .. } => {
                 let start = bytes.len();
-                bytes.resize(start + len, 0);
-                pages.read(*at, &mut bytes[start..]);
+                bytes.resize(start + self.total(), 0);
+                self.load(c.mem, 0, &mut bytes[start..]);
             }
         }
         Ok(())
@@ -5604,11 +5636,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.mem
                 .check_write(GuestAddr(a[0]), 8)
                 .map_err(|_| Errno::EFAULT)?;
-            let ends = crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
-            let creds = &c.process.credentials;
-            ends[0].set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
             let [first, second] = c.files.install_pair(
-                ends.map(|end| end as Arc<dyn FileHandle>),
+                new_pipe(c, flags)?,
                 flags & crate::events::CLOEXEC != 0,
                 c.group.nofile(),
             )?;
@@ -6993,6 +7022,8 @@ pub(crate) struct StandardFile {
 }
 /// `O_DIRECT`.
 pub(crate) const O_DIRECT: u32 = 0o40000;
+/// `O_NOTIFICATION_PIPE`, which is `O_EXCL`.
+const O_NOTIFICATION_PIPE: u32 = 0o200;
 /// `O_NOATIME`.
 pub(crate) const O_NOATIME: u32 = 0o1000000;
 /// Whether an open file description has Linux's `FMODE_CAN_ODIRECT`,

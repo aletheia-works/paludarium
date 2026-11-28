@@ -1679,12 +1679,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。知っている操作、登録、setup と
   `io_uring_enter` のフラグも Linux 7.0 のものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
-  `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
-  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
+  `epoll_ctl` をまとめるのに使います）と `_EPOLL_WAIT`、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
+  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`_READV_FIXED`、`_WRITEV_FIXED`、
+  `IORING_OP_FILES_UPDATE`、
   `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、ファイルの要求
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
-  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE` と
+  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`_PIPE`、`IORING_OP_SPLICE` と
   `_TEE`、それにソケットの要求
   `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` はこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
@@ -1948,7 +1949,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_NOP_FIXED_BUFFER` の NOP は、完了を投稿するまでバッファーを持ちます。失敗した登録は
   タグを投稿しません。`IORING_OP_READ_FIXED` と `_WRITE_FIXED` は、ファイルを
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
-  範囲がはみ出せば `EFAULT` です。
+  範囲がはみ出せば `EFAULT` です。`IORING_OP_READV_FIXED` と `_WRITEV_FIXED` は、エントリーを
+  準備するときに `iovec` を読みます（`kmalloc` が一度に場所を作れる 4 MiB 分より多ければ `ENOMEM`、
+  次に 1024 より多ければ `EINVAL`、`EFAULT`、負の長さは `EINVAL`）。ファイルのあと、どの
+  バッファーも登録したものの中にあって 1 バイト以上なければならず（`EFAULT`）、合計は
+  `MAX_RW_COUNT` までです（`EINVAL`）。バイトは `readv` と `writev` と同じく転送します。
+
+- `IORING_OP_EPOLL_WAIT` は、`fd` が指す epoll のイベントを `len` 個まで `addr` に、
+  タイムアウトなしの `epoll_wait` と同じく取ります。`off`、`rw_flags`、`buf_index`、
+  `splice_fd_in` は 0 でなければならず（`EINVAL`）、次に、Linux の `ep_check_params` と同じく、
+  ファイル（`EBADF`）、1 から `INT_MAX / 12` までの個数（`EINVAL`）、イベントの場所が
+  ユーザー空間にあること（`EFAULT`）、epoll であること（`EINVAL`）を調べます。用意のできた
+  イベントがなければ、epoll が読めるようになるまで待ってから取ります。書けない場所は、
+  イベントの用意ができてから `EFAULT` です。取った個数を返します。
+
+- `IORING_OP_PIPE` は、`pipe_flags`（`O_CLOEXEC`、`O_NONBLOCK`、`O_DIRECT`。ほかのフラグや、
+  `fd`、`off`、`addr3` は `EINVAL`）で `pipe2` と同じくパイプを作り、両端の番号を `addr` に
+  書きます。`file_index` がなければ、空いている最も小さい 2 つの記述子です（`EMFILE`）。
+  あれば登録したスロットで、`O_CLOEXEC` は取れません（`EINVAL`）。
+  `IORING_FILE_INDEX_ALLOC` は、最後に取ったところから探して空いた 2 つを取り（`ENFILE`）、
+  スロットを指せばそれとその次を、それぞれ `IORING_OP_OPENAT` と同じく埋めます（`ENXIO`、
+  `EINVAL`）。2 つ目のスロットが失敗するか、番号を書けなければ（`EFAULT`）、記述子を返すか
+  スロットを空にします。
 
 - `IORING_SETUP_R_DISABLED` で作ったリングは、`IORING_REGISTER_ENABLE_RINGS` で有効にするまで
   `io_uring_enter` を断ります（`EBADFD`）。`IORING_SETUP_SINGLE_ISSUER` なら、有効にした

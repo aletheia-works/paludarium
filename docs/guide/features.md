@@ -1909,16 +1909,17 @@ kernel.
   kernel the differential tests run on, and so are the operations,
   registrations and setup and `io_uring_enter` flags it knows of. Its
   operations are `IORING_OP_NOP`,
-  `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
-  the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
-  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
+  `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with) and
+  `_EPOLL_WAIT`, the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`,
+  `_WRITEV`, `_FSYNC`, `_READ_FIXED`, `_WRITE_FIXED`, `_READV_FIXED` and
+  `_WRITEV_FIXED`, `IORING_OP_FILES_UPDATE`,
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
   `IORING_OP_ASYNC_CANCEL`, the timeouts `IORING_OP_TIMEOUT`,
   `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, the polls `IORING_OP_POLL_ADD` and
   `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
-  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
-  `IORING_OP_SPLICE` and `_TEE`, and the socket requests
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT`, `_FTRUNCATE` and
+  `_PIPE`, `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations, up to Linux
   7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`, as on a Linux
@@ -2252,6 +2253,33 @@ kernel.
   posts no tag. `IORING_OP_READ_FIXED` and
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
+  `IORING_OP_READV_FIXED` and `_WRITEV_FIXED` read their `iovec`s as the
+  entry is prepared (`ENOMEM` for more than `kmalloc` makes room for at
+  once, 4 MiB of them, then `EINVAL` for more than 1024, `EFAULT`, and
+  `EINVAL` for a negative length), then, after the file, each buffer must
+  lie in the registered one and have some bytes (`EFAULT`), and they may
+  have at most `MAX_RW_COUNT` in all (`EINVAL`). They move the bytes as
+  `readv` and `writev` do.
+
+- `IORING_OP_EPOLL_WAIT` takes the events of the epoll its `fd` names, at
+  most `len` of them, to `addr`, as `epoll_wait` does with no timeout: its
+  `off`, `rw_flags`, `buf_index` and `splice_fd_in` must be 0 (`EINVAL`);
+  then the file (`EBADF`), the count, from 1 to `INT_MAX / 12` (`EINVAL`),
+  the events' room in the user half (`EFAULT`) and an epoll (`EINVAL`) are
+  checked, as Linux's `ep_check_params` does. With none ready it waits until
+  the epoll is readable, then takes them; room it cannot write is `EFAULT`
+  once some are ready. It gives how many it took.
+
+- `IORING_OP_PIPE` makes a pipe as `pipe2` does with its `pipe_flags`
+  (`O_CLOEXEC`, `O_NONBLOCK` and `O_DIRECT`; others, or an `fd`, `off` or
+  `addr3`, are `EINVAL`) and writes its ends' numbers to `addr`. Without a
+  `file_index` they are the two lowest free descriptors (`EMFILE`). With
+  one, they are registered slots, which may not be `O_CLOEXEC` (`EINVAL`):
+  `IORING_FILE_INDEX_ALLOC` takes two free ones, looking on from the last
+  one taken (`ENFILE`), and a slot takes it and the one after it, each as
+  `IORING_OP_OPENAT` would fill it (`ENXIO`, `EINVAL`). A second slot that
+  fails, or numbers it cannot write (`EFAULT`), give the descriptors back
+  or empty the slots.
 
 - A ring made with `IORING_SETUP_R_DISABLED` refuses `io_uring_enter`
   (`EBADFD`) until `IORING_REGISTER_ENABLE_RINGS` enables it, whose thread

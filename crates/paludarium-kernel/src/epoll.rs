@@ -358,6 +358,58 @@ pub(crate) fn control(
     epoll.control(op, fd as u32, target.file, events, data)
 }
 
+/// The events of `epoll` that are ready, at most `max`, written to `at` as
+/// `epoll_wait` writes them: the buffer is checked (`EFAULT`) before any is
+/// taken, so that none is lost; `None` when none is ready.
+fn write_events(
+    c: &Context<'_>,
+    epoll: &EpollInstance,
+    at: u64,
+    max: usize,
+) -> Result<Option<u64>, Errno> {
+    c.mem
+        .check_write(GuestAddr(at), max * 12)
+        .map_err(|_| Errno::EFAULT)?;
+    let events = epoll.collect(max);
+    if events.is_empty() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(events.len() * 12);
+    for (mask, data) in &events {
+        bytes.extend_from_slice(&mask.to_le_bytes());
+        bytes.extend_from_slice(&data.to_le_bytes());
+    }
+    c.mem
+        .write(GuestAddr(at), &bytes)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(Some(events.len() as u64))
+}
+
+/// `epoll_sendevents`, for io_uring's `IORING_OP_EPOLL_WAIT`: `max` from 1
+/// to `EP_MAX_EVENTS` (`EINVAL`), the events' room in the user half
+/// (`EFAULT`) and an epoll file (`EINVAL`), as `ep_check_params` checks
+/// them; then, only if some are ready, they are written as `epoll_wait`
+/// writes them. `None` when none is: the request waits.
+pub(crate) fn send_events(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    at: u64,
+    max: i32,
+) -> Result<Option<u64>, Errno> {
+    if max <= 0 || max > i32::MAX / 12 {
+        return Err(Errno::EINVAL);
+    }
+    crate::sockets::access_ok(at, max as usize * 12)?;
+    let epoll = file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<EpollInstance>())
+        .ok_or(Errno::EINVAL)?;
+    if epoll.poll().0 & IN == 0 {
+        return Ok(None);
+    }
+    write_events(c, epoll, at, max as usize)
+}
+
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = (|| {
         let number = c.number;
@@ -437,21 +489,8 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .ok_or(Errno::EINVAL)?;
             loop {
                 let ticket = c.files.readiness.token.value();
-                // Validate before consuming ET/ONESHOT state.
-                c.mem
-                    .check_write(GuestAddr(a[1]), max as usize * 12)
-                    .map_err(|_| Errno::EFAULT)?;
-                let events = epoll.collect(max as usize);
-                if !events.is_empty() {
-                    let mut bytes = Vec::with_capacity(events.len() * 12);
-                    for (mask, data) in &events {
-                        bytes.extend_from_slice(&mask.to_le_bytes());
-                        bytes.extend_from_slice(&data.to_le_bytes());
-                    }
-                    c.mem
-                        .write(GuestAddr(a[1]), &bytes)
-                        .map_err(|_| Errno::EFAULT)?;
-                    return Ok(events.len() as u64);
+                if let Some(count) = write_events(c, epoll, a[1], max as usize)? {
+                    return Ok(count);
                 }
                 if deadline.is_some_and(|end| {
                     c.host

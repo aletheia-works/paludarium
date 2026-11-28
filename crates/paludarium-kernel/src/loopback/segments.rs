@@ -144,6 +144,9 @@ struct Packet {
     echo: u64,
     /// Its SACK blocks, a D-SACK first.
     sacks: Option<Box<[(u64, u64)]>>,
+    /// A reset of a socket gone, which carries no option
+    /// (`tcp_v4_send_reset`).
+    optionless: bool,
 }
 
 /// A SYN's TCP header (`tcp_syn_options`: MSS, SACK permitted, timestamps
@@ -159,7 +162,7 @@ impl Packet {
     fn tcp_len(&self) -> u32 {
         let header = if self.syn {
             SYN_HEADER
-        } else if self.reset && self.at == 0 {
+        } else if self.optionless {
             TCP_HEADER
         } else {
             let blocks = self.sacks.as_ref().map_or(0, |s| s.len() as u32);
@@ -831,6 +834,7 @@ impl Flows {
             at: self.now,
             echo: s.recent,
             sacks: None,
+            optionless: false,
         }
     }
     /// Whether something one side sent is lost and will be sent again.
@@ -1391,6 +1395,7 @@ impl Flows {
             at: now,
             echo: s.recent,
             sacks,
+            optionless: false,
         };
         self.sent[side].push(packet.tcp_len());
         self.wire.push_back(packet);
@@ -1560,6 +1565,7 @@ impl Flows {
             at: 0,
             echo: 0,
             sacks: None,
+            optionless: true,
         };
         self.sent[side].push(packet.tcp_len());
         self.wire.push_back(packet);
